@@ -1,4 +1,5 @@
 mod api;
+mod dev_bench;
 mod hardware;
 mod serial;
 mod service;
@@ -34,6 +35,18 @@ enum Command {
     Install,
     /// Stop and remove the background OS service.
     Uninstall,
+    /// Start the already-installed background service. Separate from
+    /// `install` (which registers *and* starts) so a service that's been
+    /// stopped — or that failed to come up at boot — can be started again
+    /// without re-registering it.
+    Start,
+    /// Stop the running background service, leaving it installed so it
+    /// still starts at the next boot.
+    Stop,
+    /// Print which serial port embarch-dev-bench is on, using the same
+    /// SEGGER-VID detection `GET /dev-bench/port` serves — a human's way to
+    /// check the bench is visible without an HTTP client or a running service.
+    DetectDevBench,
 }
 
 #[tokio::main]
@@ -51,6 +64,22 @@ async fn main() -> anyhow::Result<()> {
         Command::Uninstall => {
             service::uninstall()?;
             println!("embarch-core service stopped and removed.");
+        }
+        Command::Start => {
+            service::start()?;
+            println!("embarch-core service started.");
+        }
+        Command::Stop => {
+            service::stop()?;
+            println!("embarch-core service stopped.");
+        }
+        Command::DetectDevBench => {
+            let port = dev_bench::detect()?;
+            println!("{}", port.port_name);
+            println!(
+                "  detected_by: {}\n  serial: {:?}\n  product: {:?}\n  interface: {:?}",
+                port.detected_by, port.serial_number, port.product, port.interface
+            );
         }
     }
 

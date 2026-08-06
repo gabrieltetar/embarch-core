@@ -91,6 +91,35 @@ fn set_windows_service_environment(service_name: &str, token: &str) -> Result<()
     Ok(())
 }
 
+/// Start the already-installed background service.
+///
+/// Exists so `embarch-umbrella`'s `up` doesn't have to re-derive per-OS
+/// service control (`sc` vs `systemctl` vs `launchctl`) in a second codebase
+/// — the `service-manager` crate already encapsulates exactly that, and this
+/// is the binary that already depends on it (embarch-umbrella/design.md §3
+/// decisions 4/7).
+///
+/// Not idempotent in any guaranteed way: starting an already-running service
+/// is an error on some backends and a no-op on others, and that difference is
+/// the crate's to hide or not, not something to paper over here with a
+/// racy is-it-running check.
+pub fn start() -> Result<()> {
+    let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
+    manager()?
+        .start(ServiceStartCtx { label })
+        .context("failed to start the embarch-core service (is it installed?)")?;
+    Ok(())
+}
+
+/// Stop the running background service, leaving it installed.
+pub fn stop() -> Result<()> {
+    let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
+    manager()?
+        .stop(ServiceStopCtx { label })
+        .context("failed to stop the embarch-core service (is it installed and running?)")?;
+    Ok(())
+}
+
 /// Stop and remove the background service.
 pub fn uninstall() -> Result<()> {
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;

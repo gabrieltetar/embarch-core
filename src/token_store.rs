@@ -75,10 +75,23 @@ fn resolve_token_at_path(path: &Path) -> Result<String> {
 /// `SetNamedSecurityInfoW` with a narrow user base, which is a worse bet for
 /// a security-relevant, currently-untestable-on-this-machine operation than
 /// well-documented, stable OS tooling.
+///
+/// Grants are by SID (`*S-...`), not by account/group name. Granting by the
+/// bare `%USERNAME%` string was tried first and found broken on a real
+/// machine whose hostname equals the username (`gabriel\gabriel`): `icacls`
+/// resolved the bare name to an unrelated/unresolvable principal instead of
+/// the actual account, silently locking Core out of the token file it had
+/// just created (confirmed by a same-session restart failing to re-read the
+/// file `icacls` claimed to have just granted it access to). `SYSTEM` and
+/// `Administrators` are passed as their well-known constant SIDs for the
+/// same reason — no name resolution left for any of the three principals to
+/// get wrong.
 #[cfg(windows)]
 fn restrict_token_file_permissions(path: &Path) -> Result<()> {
-    let username = std::env::var("USERNAME")
-        .context("USERNAME environment variable is not set")?;
+    const SID_SYSTEM: &str = "S-1-5-18";
+    const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
+
+    let user_sid = current_user_sid()?;
     let path_str = path
         .to_str()
         .context("token file path is not valid UTF-8")?;
@@ -87,11 +100,11 @@ fn restrict_token_file_permissions(path: &Path) -> Result<()> {
         .arg(path_str)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{username}:F"))
+        .arg(format!("*{user_sid}:F"))
         .arg("/grant:r")
-        .arg("SYSTEM:F")
+        .arg(format!("*{SID_SYSTEM}:F"))
         .arg("/grant:r")
-        .arg("Administrators:F")
+        .arg(format!("*{SID_ADMINISTRATORS}:F"))
         .status()
         .context("failed to invoke icacls")?;
 
@@ -100,6 +113,34 @@ fn restrict_token_file_permissions(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves the SID of the account running this process via `whoami /user`,
+/// rather than trusting `%USERNAME%` to resolve unambiguously through
+/// `icacls`'s own name lookup (see `restrict_token_file_permissions`'s doc
+/// comment for why that broke). CSV output (`/fo csv /nh`) is parsed instead
+/// of the default table so field order is stable regardless of the system's
+/// display language.
+#[cfg(windows)]
+fn current_user_sid() -> Result<String> {
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .context("failed to invoke whoami /user")?;
+
+    if !output.status.success() {
+        anyhow::bail!("whoami /user exited with status {}", output.status);
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("whoami /user output was not valid UTF-8")?;
+    stdout
+        .trim()
+        .rsplit(',')
+        .next()
+        .map(|s| s.trim_matches('"').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .context("could not parse SID from whoami /user output")
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{hardware, serial};
+use crate::{dev_bench, hardware, serial};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -28,6 +28,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/flash", post(flash_handler))
         .route("/reset", post(reset_handler))
         .route("/serial-log", get(serial_log_handler))
+        .route("/dev-bench/port", get(dev_bench_port_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -194,4 +195,31 @@ async fn serial_log_handler(
         port: q.port,
         lines,
     }))
+}
+
+// ---- GET /dev-bench/port ----------------------------------------------------
+
+/// Which serial port `embarch-dev-bench` is on (`dev_bench.rs`).
+///
+/// Takes no `hw_lock`: this only reads USB descriptors the OS already
+/// enumerated, opening nothing — same as `/status`'s probe listing.
+///
+/// "Not plugged in" answers `404`, not `500`: it's an expected state of the
+/// bench, not a Core failure, and `embarch-api` needs to distinguish it from a
+/// genuinely broken detection (an ambiguous match, or an unreadable USB bus),
+/// which still comes back as `500` with the full error chain.
+async fn dev_bench_port_handler() -> Result<Json<dev_bench::DevBenchPort>, (StatusCode, String)> {
+    let detected = tokio::task::spawn_blocking(dev_bench::detect)
+        .await
+        .map_err(internal_err)?;
+
+    match detected {
+        Ok(port) => Ok(Json(port)),
+        Err(e) if e.downcast_ref::<dev_bench::NotFound>().is_some() => {
+            let msg = format!("{e:?}");
+            tracing::info!("{msg}");
+            Err((StatusCode::NOT_FOUND, msg))
+        }
+        Err(e) => Err(internal_err(e)),
+    }
 }

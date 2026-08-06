@@ -2,7 +2,7 @@
 
 The OS-level service that owns the debug probe (flash / reset) and the
 serial console log. This is *Core* — it has no idea the EmbArch API or
-Claude Code exist. It just exposes four bearer-token-authed HTTP endpoints
+Claude Code exist. It just exposes five bearer-token-authed HTTP endpoints
 and holds the hardware connection so nothing else has to fight over the
 USB port.
 
@@ -18,19 +18,22 @@ embarch-api --HTTP+Bearer--> embarch-core --probe-rs/serialport--> hardware
 ```
 
 Core is reached two ways: over HTTP by [`embarch-api`](https://github.com/gabrieltetar/embarch-api),
-and directly via its own CLI (`run`/`install`/`uninstall`) for local operation
-and service management. Both paths converge on the same hardware/serial
-modules — there's no separate code path for "CLI mode."
+and directly via its own CLI (`run`/`install`/`uninstall`/`detect-dev-bench`)
+for local operation and service management. Both paths converge on the same
+hardware/serial modules — there's no separate code path for "CLI mode."
 
 ## Layout
 
 ```
 src/
-├── main.rs        — CLI (clap): `run`, `install`, `uninstall`; resolves the
-│                    token via token_store, builds AppState, starts Axum
+├── main.rs        — CLI (clap): `run`, `install`, `uninstall`,
+│                    `detect-dev-bench`; resolves the token via token_store,
+│                    builds AppState, starts Axum
 ├── api.rs         — Axum router, handlers, bearer-token auth middleware
 ├── hardware.rs    — probe-rs: list probes, flash, reset
 ├── serial.rs      — serialport: read the UART console log
+├── dev_bench.rs   — serialport: find embarch-dev-bench's port (SEGGER VID +
+│                    product/serial/interface match); enumeration only
 ├── service.rs     — service-manager: register/remove as a background service
 └── token_store.rs — resolves/generates/persists the machine-wide EMBARCH_TOKEN file
 ```
@@ -45,6 +48,24 @@ All routes require `Authorization: Bearer <token>` (see **Auth** below).
 | POST   | `/flash`      | `{"chip": "...", "firmware_path": "...", "format": "elf"}` |
 | POST   | `/reset`      | `{"chip": "..."}`                                          |
 | GET    | `/serial-log` | `?port=...&baud=115200&duration_ms=2000`                   |
+| GET    | `/dev-bench/port` | —                                                      |
+
+`/dev-bench/port` answers which serial port
+[`embarch-dev-bench`](https://github.com/gabrieltetar/embarch-dev-bench) is on,
+by matching SEGGER's USB VID `0x1366` (the DK's on-board J-Link — dev-bench's
+own SoC has no USB peripheral) plus a product-string / serial-number /
+interface-index heuristic. `404` means no port matched, which is just "the
+bench isn't plugged in"; `500` means detection itself failed or was ambiguous.
+Env overrides, in precedence order:
+
+| Variable | Effect |
+|---|---|
+| `EMBARCH_DEV_BENCH_PORT` | Skip detection, use this port name |
+| `EMBARCH_DEV_BENCH_SERIAL` | Require this J-Link serial number |
+| `EMBARCH_DEV_BENCH_PRODUCT` | Product-string needle (default `jlink`; empty = VID only) |
+| `EMBARCH_DEV_BENCH_INTERFACE` | Require this USB interface number |
+
+`embarch-core detect-dev-bench` runs the same detection from the CLI.
 
 `chip` must be a probe-rs target name (e.g. `STM32F407VG`, `nRF52840_xxAA`,
 `esp32c3`) — Core doesn't validate it beyond whatever `probe.attach()` itself
