@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
-#[command(name = "embarch-core")]
+#[command(name = "embarch-core", version)]
 #[command(about = "EmbArch Core — the OS-level service that talks to debug/flash hardware")]
 struct Cli {
     #[command(subcommand)]
