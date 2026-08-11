@@ -1,0 +1,93 @@
+# Release CI for embarch-core (embarch-umbrella/milestone-6.md §3.7).
+#
+# Builds the four targets embarch-umbrella/design.md §3 decision 14 names —
+# native on their own runner where GitHub provides one, `cross` only for
+# aarch64-unknown-linux-gnu, where none does — and attaches each as a release
+# asset. This is embarch-core's *own* release, one component's binary; the
+# combined suite archive all three components go into is assembled
+# separately, in embarch-umbrella's assemble-suite.yml, from tagged releases
+# like this one.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  BIN: embarch-core
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # No free aarch64-linux GitHub-hosted runner exists, and this is
+          # the one target where cross-compiling also means linking a C
+          # library (libudev, via probe-rs/serialport) — see Cross.toml.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          # GitHub's macos-14 runner is natively Apple Silicon, so this is a
+          # native build, not a cross-compile — and unsigned, which the user
+          # guide has to mention (milestone-6.md §3.7, §5 open questions).
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # windows-latest already ships the VS Build Tools "Desktop development
+      # with C++" workload this crate's MSVC link needs
+      # (embarch-core/design.md §7) — nothing extra to install there.
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BIN}-${{ matrix.target }}"
+          bin="${BIN}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then bin="${BIN}.exe"; fi
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/${bin}" "dist/${name}/"
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "${name}.zip" "${name}" >/dev/null
+            echo "asset=dist/${name}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar czf "${name}.tar.gz" "${name}"
+            echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.asset }}
+          fail_on_unmatched_files: true

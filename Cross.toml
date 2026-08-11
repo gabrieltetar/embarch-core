@@ -1,0 +1,16 @@
+# Only `aarch64-unknown-linux-gnu` needs `cross` (a Docker-based build) at
+# all — the other three release targets are native builds on their own OS's
+# GitHub-hosted runner (milestone-6.md §3.7). This is the one target where
+# neither is true: no free aarch64-linux GitHub runner exists, so it has to
+# be cross-compiled from the x86_64 Linux runner that builds
+# aarch64-unknown-linux-gnu, and it's the only target where that
+# cross-compilation also needs a C library: `probe-rs` (via `nusb`) and
+# `serialport` both pull in `libudev-sys`, which links against libudev.
+# `cross`'s stock image doesn't carry the aarch64 dev headers for it, so this
+# installs them before the build runs, inside the cross container.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install --assume-yes libudev-dev:arm64 pkg-config",
+]
