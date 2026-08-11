@@ -55,6 +55,16 @@ jobs:
         with:
           tool: cross
 
+      # The native x86_64-unknown-linux-gnu leg is the *other* place this
+      # crate's libudev dependency (probe-rs/serialport, via libudev-sys)
+      # bites: ubuntu-latest doesn't ship libudev-dev by default, unlike a
+      # real Linux dev machine (found the hard way — v0.1.0's first release
+      # run failed here while the cross-compiled aarch64 leg, which installs
+      # it explicitly via Cross.toml, succeeded).
+      - name: Install libudev (native Linux build only)
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
