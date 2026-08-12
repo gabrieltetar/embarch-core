@@ -133,3 +133,113 @@ pub fn uninstall() -> Result<()> {
 
     Ok(())
 }
+
+/// Windows-only: the actual Service Control Manager handshake. `install()`
+/// above registers `run` as the service's command, same as on Linux/macOS —
+/// but unlike systemd (`Type=simple`) or launchd, a Windows service *must*
+/// call back into `StartServiceCtrlDispatcherW` promptly after launch and
+/// report `SERVICE_RUNNING`, or SCM kills the start attempt after a 30-second
+/// timeout (Win32 error 1053, System log event 7009/7000). `run()` never did
+/// that — it just started the HTTP server like a plain console program,
+/// which worked fine when a human ran it directly and failed every time SCM
+/// launched it. Caught for real installing Core as an actual boot service on
+/// this machine for the first time (embarch-umbrella/milestone-6.md §3.8).
+#[cfg(windows)]
+pub mod windows {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::{define_windows_service, service_dispatcher, Error as WsError};
+
+    use super::SERVICE_LABEL;
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    /// `Some(result)` when this process really was launched by SCM: blocks
+    /// for the service's whole lifetime, then returns how it exited. `None`
+    /// when it wasn't — a human running `embarch-core.exe run` directly at a
+    /// console, same as on any other OS — which is
+    /// `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` (raw OS error 1063) from
+    /// `StartServiceCtrlDispatcherW`, the one failure this treats as "not
+    /// SCM" rather than a real error to report.
+    pub fn try_dispatch() -> Option<anyhow::Result<()>> {
+        match service_dispatcher::start(SERVICE_LABEL, ffi_service_main) {
+            Ok(()) => Some(Ok(())),
+            Err(WsError::Winapi(e)) if e.raw_os_error() == Some(1063) => None,
+            Err(e) => Some(Err(e.into())),
+        }
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        if let Err(e) = run_service() {
+            tracing::error!("embarch-core windows service exited with an error: {e:#}");
+        }
+    }
+
+    fn service_status(state: ServiceState, exit_code: ServiceExitCode) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if matches!(state, ServiceState::Running) {
+                ServiceControlAccept::STOP
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code,
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        }
+    }
+
+    fn run_service() -> anyhow::Result<()> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown_tx = Mutex::new(Some(shutdown_tx));
+
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Stop => {
+                    if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register(SERVICE_LABEL, event_handler)?;
+
+        // The handshake SCM's 30-second start timeout is actually waiting
+        // for — everything before this line has to stay fast.
+        status_handle.set_service_status(service_status(ServiceState::Running, ServiceExitCode::Win32(0)))?;
+
+        // A fresh runtime, not a nested one: `try_dispatch` is called from
+        // plain (non-async) `main`, before any Tokio runtime exists, so
+        // there's nothing to nest inside.
+        let result = tokio::runtime::Runtime::new()?.block_on(crate::serve(
+            "0.0.0.0".to_string(),
+            crate::DEFAULT_PORT,
+            async {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        status_handle.set_service_status(service_status(
+            ServiceState::Stopped,
+            match &result {
+                Ok(()) => ServiceExitCode::Win32(0),
+                Err(_) => ServiceExitCode::ServiceSpecific(1),
+            },
+        ))?;
+
+        result
+    }
+}
