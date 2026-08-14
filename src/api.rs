@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{dev_bench, hardware, serial};
+use crate::{chip_resolve, dev_bench, hardware, serial};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -29,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/reset", post(reset_handler))
         .route("/serial-log", get(serial_log_handler))
         .route("/dev-bench/port", get(dev_bench_port_handler))
+        .route("/resolve-chip", post(resolve_chip_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -195,6 +196,40 @@ async fn serial_log_handler(
         port: q.port,
         lines,
     }))
+}
+
+// ---- POST /resolve-chip ----------------------------------------------------
+
+/// Zephyr SoC name → probe-rs chip target string (`chip_resolve.rs`,
+/// `design.md` §3 decision 8). Pure lookup against probe-rs's own target
+/// registry — no hardware touched, so this takes no `hw_lock`, same posture
+/// as `/status`'s probe listing and `/dev-bench/port`.
+#[derive(Deserialize)]
+struct ResolveChipRequest {
+    soc: String,
+}
+
+#[derive(Serialize)]
+struct ResolveChipResponse {
+    chip: String,
+}
+
+async fn resolve_chip_handler(
+    Json(req): Json<ResolveChipRequest>,
+) -> Result<Json<ResolveChipResponse>, (StatusCode, String)> {
+    let soc = req.soc.clone();
+    let result = tokio::task::spawn_blocking(move || chip_resolve::resolve(&soc))
+        .await
+        .map_err(internal_err)?;
+
+    match result {
+        Ok(chip) => Ok(Json(ResolveChipResponse { chip })),
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::info!("{msg}");
+            Err((StatusCode::NOT_FOUND, msg))
+        }
+    }
 }
 
 // ---- GET /dev-bench/port ----------------------------------------------------

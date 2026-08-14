@@ -1,4 +1,5 @@
 mod api;
+mod chip_resolve;
 mod dev_bench;
 mod hardware;
 mod serial;
