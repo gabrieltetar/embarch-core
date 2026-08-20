@@ -38,6 +38,13 @@ const SOC_TO_CHIP: &[(&str, &str)] = &[
     ("nrf9161", "nRF9161_xxAA"),
     ("nrf54l15", "nRF54L15"),
     ("nrf54lm20a", "nRF54LM20A"),
+    // ESP32-C5: interim substitute dev-bench board while the real nRF54L15DK
+    // is RMA'd (`embarch-dev-bench/design.md`'s ESP JTAG decision, reversing
+    // that doc's decision 13). probe-rs's own target name is lowercase
+    // `esp32c5`, unlike the Nordic entries' `nRF*` casing above — this table
+    // preserves each target's own real probe-rs spelling rather than
+    // normalizing a convention across vendors.
+    ("esp32c5", "esp32c5"),
 ];
 
 /// The SoC named didn't resolve — either it's not in `SOC_TO_CHIP` at all, or
@@ -105,6 +112,12 @@ mod tests {
         let err = resolve("esp32c3").unwrap_err();
         assert!(err.0 == "esp32c3");
         assert!(err.to_string().contains("esp32c3"));
+    }
+
+    #[test]
+    fn resolves_esp32c5() {
+        assert_eq!(resolve("esp32c5").unwrap(), "esp32c5");
+        assert_eq!(resolve("ESP32C5").unwrap(), "esp32c5");
     }
 
     #[test]

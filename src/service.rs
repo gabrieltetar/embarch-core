@@ -1,9 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
     ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use crate::elevate;
 
 const SERVICE_LABEL: &str = "com.embarch.core";
 
@@ -17,6 +20,8 @@ fn manager() -> Result<Box<dyn ServiceManager>> {
 /// Register embarch-core as a background OS service (pointing back at this
 /// same binary with the `run` subcommand) and start it.
 pub fn install() -> Result<()> {
+    elevate::ensure_elevated_or_fallback()?;
+
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
     let mgr = manager()?;
 
@@ -104,6 +109,8 @@ fn set_windows_service_environment(service_name: &str, token: &str) -> Result<()
 /// the crate's to hide or not, not something to paper over here with a
 /// racy is-it-running check.
 pub fn start() -> Result<()> {
+    elevate::ensure_elevated_or_fallback()?;
+
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
     manager()?
         .start(ServiceStartCtx { label })
@@ -113,6 +120,8 @@ pub fn start() -> Result<()> {
 
 /// Stop the running background service, leaving it installed.
 pub fn stop() -> Result<()> {
+    elevate::ensure_elevated_or_fallback()?;
+
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
     manager()?
         .stop(ServiceStopCtx { label })
@@ -122,6 +131,8 @@ pub fn stop() -> Result<()> {
 
 /// Stop and remove the background service.
 pub fn uninstall() -> Result<()> {
+    elevate::ensure_elevated_or_fallback()?;
+
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
     let mgr = manager()?;
 
@@ -132,6 +143,101 @@ pub fn uninstall() -> Result<()> {
         .context("failed to uninstall embarch-core service")?;
 
     Ok(())
+}
+
+/// Replace the installed service's binary with `new_exe` and restart it —
+/// the motivating case for self-elevation (`design.md` §3 decision 3):
+/// updating an already-installed Core previously had no supported path at
+/// all, only manual stop/copy/start surgery in a hand-opened elevated
+/// shell.
+///
+/// **Must be run via the currently-installed copy itself** — like
+/// `install` (which registers `std::env::current_exe()` as the service
+/// body), this operates on `current_exe()`, not a separately-discovered
+/// service path. Windows won't allow overwriting a running process's own
+/// image file in place, even after the *service* instance is stopped —
+/// this `update` invocation is itself a second, distinct running instance
+/// of that same file — so the current binary is renamed out of the way
+/// first (renaming a running exe is allowed on Windows) before the new one
+/// is copied into its place, the standard self-update idiom. Works
+/// identically, if not strictly necessary, on Unix.
+///
+/// Rolls back to the previous binary — and tries to get the service
+/// running again on it — if the new one fails to start.
+///
+/// The renamed-aside backup from *this* run is deliberately not removed on
+/// success: the process running this code is itself still executing from
+/// that exact file (this `update` invocation was launched from the
+/// currently-installed exe, same as `install`), so Windows won't allow
+/// deleting it yet. Cleaned up at the start of the *next* `update` call
+/// instead, by which point this process is long gone — confirmed live: a
+/// `.bak` file really does linger after a successful update until then.
+pub fn update(new_exe: &Path) -> Result<()> {
+    elevate::ensure_elevated_or_fallback()?;
+
+    if !new_exe.is_file() {
+        bail!("new binary not found: {}", new_exe.display());
+    }
+
+    let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
+    let current_exe = std::env::current_exe()
+        .context("could not determine the installed binary's own path")?;
+
+    // Best-effort stop — it might already be stopped, or `update` might be
+    // run before the service was ever started.
+    let _ = manager()?.stop(ServiceStopCtx { label: label.clone() });
+
+    let backup = backup_path(&current_exe);
+
+    // Clean up a *previous* run's backup, if one is still sitting here — it
+    // couldn't be removed at the end of that run (see the comment below:
+    // the process doing the removing is itself still executing from that
+    // exact file), but by now that process is long gone, so it's safe to
+    // remove here instead. Best-effort: a real error here shouldn't block
+    // installing the actually-requested new binary.
+    let _ = std::fs::remove_file(&backup);
+
+    std::fs::rename(&current_exe, &backup).with_context(|| {
+        format!(
+            "failed to move the current binary from {} to {} ahead of replacing it",
+            current_exe.display(),
+            backup.display()
+        )
+    })?;
+
+    if let Err(e) = std::fs::copy(new_exe, &current_exe) {
+        let _ = std::fs::rename(&backup, &current_exe); // best-effort rollback
+        return Err(e).with_context(|| {
+            format!(
+                "failed to install {} as {}; rolled back",
+                new_exe.display(),
+                current_exe.display()
+            )
+        });
+    }
+
+    match manager()?.start(ServiceStartCtx { label: label.clone() }) {
+        Ok(()) => {
+            // Not removing `backup` here — see the doc comment above: this
+            // process is still executing from it right now, so the removal
+            // would just fail. Next `update` call cleans it up instead.
+            Ok(())
+        }
+        Err(e) => {
+            // The new binary is bad or incompatible — roll back and try to
+            // get the service running again on the known-good previous one.
+            let _ = std::fs::remove_file(&current_exe);
+            let _ = std::fs::rename(&backup, &current_exe);
+            let _ = manager()?.start(ServiceStartCtx { label });
+            Err(e).context("new binary failed to start as the service; rolled back to the previous one")
+        }
+    }
+}
+
+fn backup_path(exe: &Path) -> PathBuf {
+    let mut name = exe.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    exe.with_file_name(name)
 }
 
 /// Windows-only: the actual Service Control Manager handshake. `install()`

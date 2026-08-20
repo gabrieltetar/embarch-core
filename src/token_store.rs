@@ -1,19 +1,25 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Resolves the canonical machine-wide token file path for this OS:
-/// `%ProgramData%\embarch\token` on Windows, `/var/lib/embarch/token` on
-/// Linux/macOS.
+/// Resolves the machine-wide local data directory embarch-core owns outright:
+/// `%ProgramData%\embarch` on Windows, `/var/lib/embarch` on Linux/macOS. The
+/// token file below and `study.rs`'s `study_results/<study_id>/` tree both
+/// live under this same root — the one place that convention is decided.
 #[cfg(windows)]
-fn token_file_path() -> Result<PathBuf> {
+pub fn local_data_dir() -> Result<PathBuf> {
     let program_data =
         std::env::var("ProgramData").context("ProgramData environment variable is not set")?;
-    Ok(PathBuf::from(program_data).join("embarch").join("token"))
+    Ok(PathBuf::from(program_data).join("embarch"))
 }
 
 #[cfg(unix)]
+pub fn local_data_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from("/var/lib/embarch"))
+}
+
+/// The canonical machine-wide token file path: `local_data_dir()/token`.
 fn token_file_path() -> Result<PathBuf> {
-    Ok(PathBuf::from("/var/lib/embarch/token"))
+    Ok(local_data_dir()?.join("token"))
 }
 
 /// Resolves the token used to authenticate incoming requests: an explicit

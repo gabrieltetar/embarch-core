@@ -1,15 +1,17 @@
 mod api;
 mod chip_resolve;
 mod dev_bench;
+mod dev_bench_link;
+mod elevate;
 mod hardware;
 mod serial;
 mod service;
+mod study;
 mod token_store;
 
 use clap::{Parser, Subcommand};
 use std::future::Future;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::path::PathBuf;
 
 /// Shared with `service::windows`, which has no CLI args of its own to read
 /// a `--port` from (SCM launches the installed service with just `run`, no
@@ -54,6 +56,14 @@ enum Command {
     /// Stop the running background service, leaving it installed so it
     /// still starts at the next boot.
     Stop,
+    /// Replace the installed service's binary with a new one and restart
+    /// it. Must be run via the currently-installed copy itself (see
+    /// `service::update`'s own doc comment for why) — self-elevates like
+    /// every other subcommand here.
+    Update {
+        /// Path to the new embarch-core binary to install in place of this one.
+        new_exe: PathBuf,
+    },
     /// Print which serial port embarch-dev-bench is on, using the same
     /// SEGGER-VID detection `GET /dev-bench/port` serves — a human's way to
     /// check the bench is visible without an HTTP client or a running service.
@@ -95,6 +105,10 @@ fn main() -> anyhow::Result<()> {
             service::stop()?;
             println!("embarch-core service stopped.");
         }
+        Command::Update { new_exe } => {
+            service::update(&new_exe)?;
+            println!("embarch-core service updated and restarted.");
+        }
         Command::DetectDevBench => {
             let port = dev_bench::detect()?;
             println!("{}", port.port_name);
@@ -119,10 +133,7 @@ pub(crate) async fn serve(
 ) -> anyhow::Result<()> {
     let token = token_store::resolve_token()?;
 
-    let state = api::AppState {
-        token,
-        hw_lock: Arc::new(Mutex::new(())),
-    };
+    let state = api::AppState::new(token);
 
     let app = api::build_router(state);
 

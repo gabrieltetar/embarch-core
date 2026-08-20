@@ -1,15 +1,21 @@
 //! Auto-detection of `embarch-dev-bench`'s serial port.
 //!
-//! Implements `embarch-dev-bench/design.md` §3 decision 12: dev-bench does not
-//! own a USB descriptor of its own (the nRF54L15 SoC has no USB device
-//! peripheral at all), so the port Core sees is enumerated by the DK's
-//! on-board SEGGER J-Link chip. Detection is therefore "SEGGER's VID plus a
-//! product-string/serial-number heuristic", not a custom VID/PID match.
+//! Implements `embarch-dev-bench/design.md` §3 decision 12: a board whose SoC
+//! has no USB device peripheral of its own (the nRF54L15) is seen only
+//! through its on-board SEGGER J-Link's VCOM, so detection there is "SEGGER's
+//! VID plus a product-string/serial-number heuristic," not a custom VID/PID
+//! match. Milestone 2 added a second real case with the opposite shape: the
+//! ESP32-C5 *does* have a native USB Serial/JTAG peripheral, enumerating
+//! directly under Espressif's own VID with no J-Link involved at all —
+//! confirmed empirically against real hardware (`USB\VID_303A&PID_1001&MI_00`
+//! on Windows), not guessed from Espressif's public VID assignment alone.
+//! Both VIDs feed the same heuristic below; only the product-string default
+//! is SEGGER-specific (§ [`select`]'s own comment on why).
 //!
 //! No hardware is opened here — this only reads USB descriptors already
 //! enumerated by the OS. Actually opening the port and running the
-//! `Hello`/`HelloAck` handshake belongs to the (not yet implemented)
-//! `study.rs` bridge; this module just answers "which port is it?".
+//! `Hello`/`HelloAck` handshake belongs to `study.rs`'s bridge; this module
+//! just answers "which port is it?".
 //!
 //! Precedence mirrors `token_store::resolve_token`'s explicit-env-var-wins
 //! shape: `EMBARCH_DEV_BENCH_PORT` short-circuits detection entirely, and the
@@ -22,6 +28,17 @@ use serialport::{SerialPortInfo, SerialPortType};
 /// SEGGER's USB vendor ID — every on-board J-Link (and every standalone one)
 /// enumerates its VCOM interfaces under this VID.
 pub const SEGGER_VID: u16 = 0x1366;
+
+/// Espressif Systems' USB vendor ID — the ESP32-C5's native USB Serial/JTAG
+/// peripheral (and every other Espressif chip with one) enumerates directly
+/// under this VID, no separate debug-probe chip involved
+/// (`embarch-dev-bench/design.md` decision 26/§10, `embarch-core/design.md`
+/// §10). Confirmed empirically on the real ESP32-C5-WROOM-1 DK: Windows
+/// reports `USB\VID_303A&PID_1001&MI_00` for its CDC-ACM serial interface —
+/// PID isn't matched on (mirroring the SEGGER case below, which never checks
+/// PID either), since Espressif reuses `0x303A` with a different PID per
+/// chip/descriptor and this heuristic shouldn't need updating for each one.
+pub const ESPRESSIF_VID: u16 = 0x303A;
 
 /// Default product-string needle, in `normalize`d form. Deliberately matches
 /// both Linux's bare `J-Link` and Windows' `JLink CDC UART Port` friendly
@@ -47,7 +64,8 @@ pub const ENV_INTERFACE: &str = "EMBARCH_DEV_BENCH_INTERFACE";
 #[derive(Debug, Clone, Serialize)]
 pub struct DevBenchPort {
     pub port_name: String,
-    /// `"env-override"` or `"segger-vid-match"` — which rule produced this.
+    /// `"env-override"`, `"segger-vid-match"`, or `"espressif-vid-match"` —
+    /// which rule produced this.
     pub detected_by: &'static str,
     pub vendor_id: Option<u16>,
     pub product_id: Option<u16>,
@@ -56,16 +74,26 @@ pub struct DevBenchPort {
     pub interface: Option<u8>,
 }
 
+/// Which recognized-VID rule matched a candidate, for [`DevBenchPort::detected_by`].
+fn detected_by_for_vid(vid: u16) -> &'static str {
+    match vid {
+        SEGGER_VID => "segger-vid-match",
+        ESPRESSIF_VID => "espressif-vid-match",
+        _ => "vid-match", // unreachable given how candidates are filtered, but no vid to blow up on
+    }
+}
+
 /// No port matched. Distinct from every other detection failure so callers can
 /// treat "dev-bench isn't plugged in" (a normal, expected state) differently
 /// from "the heuristic is ambiguous" (a configuration problem) — `api.rs` maps
 /// this one to `404`.
 #[derive(Debug)]
 pub struct NotFound {
-    /// Ports carrying SEGGER's VID before the serial/product/interface filters
-    /// narrowed them — a non-zero count means a SEGGER probe *is* attached and
-    /// the narrowing filters excluded it, which is a very different fix.
-    pub segger_ports_seen: usize,
+    /// Ports carrying a recognized VID (SEGGER's or Espressif's) before the
+    /// serial/product/interface filters narrowed them — a non-zero count
+    /// means a recognized probe/board *is* attached and the narrowing
+    /// filters excluded it, which is a very different fix.
+    pub candidate_vid_ports_seen: usize,
     pub total_ports_seen: usize,
 }
 
@@ -73,13 +101,13 @@ impl std::fmt::Display for NotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "no embarch-dev-bench serial port found ({} serial port(s) visible, {} with SEGGER's VID {:#06x})",
-            self.total_ports_seen, self.segger_ports_seen, SEGGER_VID
+            "no embarch-dev-bench serial port found ({} serial port(s) visible, {} with a recognized VID ({SEGGER_VID:#06x} SEGGER / {ESPRESSIF_VID:#06x} Espressif))",
+            self.total_ports_seen, self.candidate_vid_ports_seen
         )?;
-        if self.segger_ports_seen > 0 {
+        if self.candidate_vid_ports_seen > 0 {
             write!(
                 f,
-                " — a SEGGER probe is attached but was excluded by {ENV_SERIAL}/{ENV_PRODUCT}/{ENV_INTERFACE}; relax or correct them"
+                " — a matching probe/board is attached but was excluded by {ENV_SERIAL}/{ENV_PRODUCT}/{ENV_INTERFACE}; relax or correct them"
             )?;
         } else {
             write!(
@@ -104,6 +132,12 @@ pub struct Filter {
     /// sides. A port reporting *no* product string is not excluded — an absent
     /// descriptor field is unknown, not disproof.
     pub product_needle: Option<String>,
+    /// Whether `product_needle` is `DEFAULT_PRODUCT_NEEDLE`, auto-picked
+    /// because `ENV_PRODUCT` was unset, rather than something the operator
+    /// set explicitly. The default is SEGGER-specific (`"jlink"`) and is
+    /// scoped to SEGGER-origin candidates only in [`select`]; an explicit
+    /// value narrows every candidate regardless of VID, same as always.
+    pub product_needle_is_default: bool,
     pub interface: Option<u8>,
 }
 
@@ -112,10 +146,14 @@ impl Filter {
     /// `ENV_PRODUCT` means "use `DEFAULT_PRODUCT_NEEDLE`"; an explicitly empty
     /// one means "don't filter on the product string at all".
     pub fn from_env() -> Result<Self> {
+        let mut product_needle_is_default = false;
         let product_needle = match std::env::var(ENV_PRODUCT) {
             Ok(v) if v.trim().is_empty() => None,
             Ok(v) => Some(normalize(&v)),
-            Err(_) => Some(DEFAULT_PRODUCT_NEEDLE.to_string()),
+            Err(_) => {
+                product_needle_is_default = true;
+                Some(DEFAULT_PRODUCT_NEEDLE.to_string())
+            }
         };
 
         let interface = match env_nonempty(ENV_INTERFACE) {
@@ -128,6 +166,7 @@ impl Filter {
         Ok(Self {
             serial: env_nonempty(ENV_SERIAL),
             product_needle,
+            product_needle_is_default,
             interface,
         })
     }
@@ -159,7 +198,7 @@ fn as_candidate(info: &SerialPortInfo) -> Option<DevBenchPort> {
 
     Some(DevBenchPort {
         port_name: info.port_name.clone(),
-        detected_by: "segger-vid-match",
+        detected_by: detected_by_for_vid(usb.vid),
         vendor_id: Some(usb.vid),
         product_id: Some(usb.pid),
         serial_number: usb.serial_number.clone(),
@@ -175,19 +214,28 @@ pub fn select(ports: &[SerialPortInfo], filter: &Filter) -> Result<DevBenchPort>
     let mut candidates: Vec<DevBenchPort> = ports
         .iter()
         .filter_map(as_candidate)
-        .filter(|c| c.vendor_id == Some(SEGGER_VID))
+        .filter(|c| matches!(c.vendor_id, Some(SEGGER_VID) | Some(ESPRESSIF_VID)))
         .collect();
-    let segger_ports_seen = candidates.len();
+    let candidate_vid_ports_seen = candidates.len();
 
     if let Some(serial) = &filter.serial {
         let want = normalize(serial);
         candidates.retain(|c| c.serial_number.as_deref().map(normalize) == Some(want.clone()));
     }
     if let Some(needle) = &filter.product_needle {
+        // `DEFAULT_PRODUCT_NEEDLE` ("jlink") is a SEGGER-specific default —
+        // Espressif's own USB Serial/JTAG descriptor has no equivalent
+        // distinguishing product string (the real ESP32-C5 enumerated with
+        // Windows' generic "USB Serial Device" friendly name), so applying
+        // the *unset, auto-picked* default there would wrongly exclude every
+        // real Espressif candidate. An operator-set `EMBARCH_DEV_BENCH_PRODUCT`
+        // still narrows every candidate regardless of VID, same as always —
+        // only the default's scope changed.
         candidates.retain(|c| {
-            c.product
-                .as_deref()
-                .is_none_or(|p| normalize(p).contains(needle))
+            (filter.product_needle_is_default && c.vendor_id != Some(SEGGER_VID))
+                || c.product
+                    .as_deref()
+                    .is_none_or(|p| normalize(p).contains(needle))
         });
     }
     if let Some(interface) = filter.interface {
@@ -210,9 +258,15 @@ pub fn select(ports: &[SerialPortInfo], filter: &Filter) -> Result<DevBenchPort>
         // recoverable case: take the lowest interface index, which is the
         // primary VCOM — the one the DK's UART0 is bridged to. Two *different*
         // probes is genuinely ambiguous and refuses to guess.
-        let one_probe = candidates
-            .iter()
-            .all(|c| c.serial_number == candidates[0].serial_number);
+        // Same VID *and* same serial number — matching on serial alone
+        // treated two candidates from entirely different device families
+        // (e.g. a SEGGER J-Link and an Espressif board, once both VIDs were
+        // recognized) as "one probe" whenever neither happened to report a
+        // serial number, silently picking one instead of flagging real
+        // ambiguity.
+        let one_probe = candidates.iter().all(|c| {
+            c.vendor_id == candidates[0].vendor_id && c.serial_number == candidates[0].serial_number
+        });
         let interfaces_known = candidates.iter().all(|c| c.interface.is_some());
 
         if !(one_probe && interfaces_known) {
@@ -234,7 +288,7 @@ pub fn select(ports: &[SerialPortInfo], filter: &Filter) -> Result<DevBenchPort>
 
     if candidates.is_empty() {
         return Err(anyhow::Error::new(NotFound {
-            segger_ports_seen,
+            candidate_vid_ports_seen,
             total_ports_seen: ports.len(),
         }));
     }
@@ -331,6 +385,7 @@ mod tests {
         Filter {
             serial: None,
             product_needle: Some(DEFAULT_PRODUCT_NEEDLE.to_string()),
+            product_needle_is_default: true,
             interface: None,
         }
     }
@@ -399,7 +454,7 @@ mod tests {
 
         let err = select(&ports, &default_filter()).unwrap_err();
         let not_found = err.downcast_ref::<NotFound>().expect("NotFound");
-        assert_eq!(not_found.segger_ports_seen, 0);
+        assert_eq!(not_found.candidate_vid_ports_seen, 0);
         assert_eq!(not_found.total_ports_seen, 1);
     }
 
@@ -421,7 +476,7 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<NotFound>()
                 .expect("NotFound")
-                .segger_ports_seen,
+                .candidate_vid_ports_seen,
             1
         );
     }
@@ -547,5 +602,62 @@ mod tests {
         let missing = explicit("/dev/ttyUSB9", &ports);
         assert_eq!(missing.port_name, "/dev/ttyUSB9");
         assert_eq!(missing.vendor_id, None);
+    }
+
+    #[test]
+    fn an_espressif_vid_port_is_picked_without_a_product_string_match() {
+        // The real ESP32-C5-WROOM-1 DK's Windows product string is a generic
+        // "USB Serial Device" — nothing "jlink"-shaped — so the default
+        // needle (SEGGER-only) must not exclude it.
+        let ports = vec![usb(
+            "COM12",
+            ESPRESSIF_VID,
+            Some("USB Serial Device"),
+            None,
+            Some(0),
+        )];
+
+        let found = select(&ports, &default_filter()).unwrap();
+        assert_eq!(found.port_name, "COM12");
+        assert_eq!(found.detected_by, "espressif-vid-match");
+        assert_eq!(found.vendor_id, Some(ESPRESSIF_VID));
+    }
+
+    #[test]
+    fn an_espressif_port_with_no_product_string_at_all_is_also_picked() {
+        let ports = vec![usb("/dev/ttyACM0", ESPRESSIF_VID, None, None, Some(0))];
+        assert_eq!(
+            select(&ports, &default_filter()).unwrap().port_name,
+            "/dev/ttyACM0"
+        );
+    }
+
+    #[test]
+    fn a_segger_probe_and_an_espressif_board_together_are_ambiguous() {
+        // Two genuinely different devices with no serial number to
+        // disambiguate on — this must refuse to guess, not silently pick one.
+        let ports = vec![
+            usb("/dev/ttyACM0", SEGGER_VID, Some("J-Link"), None, Some(0)),
+            usb("/dev/ttyACM1", ESPRESSIF_VID, Some("USB Serial Device"), None, Some(0)),
+        ];
+
+        let err = select(&ports, &default_filter()).unwrap_err();
+        assert!(format!("{err}").contains("ambiguous"));
+    }
+
+    #[test]
+    fn an_explicit_product_needle_still_narrows_an_espressif_candidate() {
+        // The asymmetry is only in the *default* — an operator-set
+        // EMBARCH_DEV_BENCH_PRODUCT narrows every candidate, same as before.
+        let ports = vec![
+            usb("COM12", ESPRESSIF_VID, Some("USB Serial Device"), None, Some(0)),
+            usb("COM13", ESPRESSIF_VID, Some("Something Else"), None, Some(1)),
+        ];
+        let filter = Filter {
+            product_needle: Some(normalize("Something Else")),
+            product_needle_is_default: false,
+            ..default_filter()
+        };
+        assert_eq!(select(&ports, &filter).unwrap().port_name, "COM13");
     }
 }
