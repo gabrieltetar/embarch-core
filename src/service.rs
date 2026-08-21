@@ -329,8 +329,11 @@ pub mod windows {
 
         // A fresh runtime, not a nested one: `try_dispatch` is called from
         // plain (non-async) `main`, before any Tokio runtime exists, so
-        // there's nothing to nest inside.
-        let result = tokio::runtime::Runtime::new()?.block_on(crate::serve(
+        // there's nothing to nest inside. `crate::build_runtime` (not a bare
+        // `Runtime::new()`) — see its own doc comment: this exact path is
+        // where the real, `--release`, production `STATUS_STACK_OVERFLOW`
+        // crash happened.
+        let result = crate::build_runtime()?.block_on(crate::serve(
             "0.0.0.0".to_string(),
             crate::DEFAULT_PORT,
             async {

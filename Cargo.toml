@@ -19,6 +19,20 @@ embarch-study-designer = { path = "../embarch-study-designer", features = ["core
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
 # features with embarch-study-designer's own "serde"-enabled dependency.
 heapless = "0.8"
+# embarch-topology/design.md decisions 2, 4, 8: dev-bench port detection,
+# hardware-ID readback, enrollment storage, and live board-identity
+# validate() all moved out of this crate's own board_gate.rs/
+# known_boards.rs/hardware_id.rs/dev_bench.rs into this shared crate.
+# `hardware` is the feature that pulls in probe-rs/serialport — the one
+# consumer that needs it; embarch-api/embarch-umbrella depend on the same
+# crate without it. `default-features = false` opts out of that crate's own
+# `software` feature (Core never calls `embarch_topology::software`,
+# confirmed via grep) — its default-on `reqwest` dependency transitively
+# pulls in `aws-lc-sys`, a real C-toolchain-needing build dependency this
+# crate's own Windows/cross-compilation story has no reason to pay for
+# (found via `cargo tree` while wiring this in; `embarch-dev-workflow.md`
+# §4 already flags this exact class of risk for a different crate).
+embarch-topology = { path = "../embarch-topology", default-features = false, features = ["hardware"] }
 # `use-std` is what actually gets `to_stdvec_cobs`/`from_bytes_cobs` — the
 # `Vec<u8>`-returning COBS helpers `dev_bench_link.rs` uses, rather than the
 # `no_std` slice-only API. postcard depends on `cobs` internally and exposes
@@ -35,7 +49,11 @@ serialport = { version = "4.9.0", features = ["usbportinfo-interface"] }
 service-manager = "0.11.0"
 tempfile = "3.24"
 tokio = { version = "1.53.0", features = ["full"] }
+# known_boards.toml (design.md §3 decision 22) — same version embarch-api
+# already pins, no reason for the two to drift.
+toml = "1.1"
 tracing = "0.1.44"
+tracing-appender = "0.2"
 tracing-subscriber = "0.3.23"
 
 [target."cfg(windows)".dependencies]
