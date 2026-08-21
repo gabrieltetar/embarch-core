@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
-use crate::{chip_resolve, dev_bench, hardware, serial, study};
+use crate::{chip_resolve, hardware, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -53,6 +53,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dev-bench/port", get(dev_bench_port_handler))
         .route("/dev-bench/hello", get(study::hello_handler))
         .route("/resolve-chip", post(resolve_chip_handler))
+        .route("/probes/enroll", post(enroll_probe_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
@@ -124,6 +125,13 @@ struct FlashRequest {
     /// both the JSON and multipart bodies, `parse_base_address` below.
     #[serde(default)]
     base_address: Option<String>,
+    /// Disambiguates which attached debug probe to use when more than one
+    /// is (`design.md` §3 decision 9, `hardware::open_probe`) — matched
+    /// against `ProbeInfo.serial_number`. Omitted behaves as before when
+    /// exactly one probe is attached; more than one with this omitted is
+    /// now a named `500` rather than a silent, possibly-wrong pick.
+    #[serde(default)]
+    probe_serial: Option<String>,
 }
 
 fn default_format() -> String {
@@ -161,6 +169,7 @@ struct FlashArgs {
     path: PathBuf,
     format: String,
     base_address: Option<u64>,
+    probe_serial: Option<String>,
     _uploaded: Option<tempfile::NamedTempFile>,
 }
 
@@ -200,6 +209,7 @@ async fn flash_handler(
             path: PathBuf::from(req.firmware_path),
             format: req.format,
             base_address,
+            probe_serial: req.probe_serial,
             _uploaded: None,
         }
     };
@@ -212,11 +222,12 @@ async fn flash_handler(
         path,
         format,
         base_address,
+        probe_serial,
         _uploaded,
     } = args;
 
     tokio::task::spawn_blocking(move || {
-        let result = hardware::flash(&chip, &path, &format, base_address);
+        let result = hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref());
         drop(_uploaded); // outlives the flash call; dropped (deleted) here, not before
         result
     })
@@ -236,13 +247,15 @@ fn bad_multipart_field<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 
 /// Fields: `chip` (required), `format` (optional, same default as the JSON
 /// body), `base_address` (optional, same hex-or-decimal parsing as the JSON
-/// body — only meaningful for `format = "bin"`), and a `firmware` file part
-/// (required) — the artifact's raw bytes, written to a temp file since
-/// `hardware::flash` reads from a path.
+/// body — only meaningful for `format = "bin"`), `probe_serial` (optional,
+/// same as the JSON body), and a `firmware` file part (required) — the
+/// artifact's raw bytes, written to a temp file since `hardware::flash`
+/// reads from a path.
 async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs, (StatusCode, String)> {
     let mut chip: Option<String> = None;
     let mut format: Option<String> = None;
     let mut base_address_raw: Option<String> = None;
+    let mut probe_serial: Option<String> = None;
     let mut uploaded: Option<tempfile::NamedTempFile> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(bad_multipart_field)? {
@@ -250,6 +263,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
             Some("chip") => chip = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("format") => format = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("base_address") => base_address_raw = Some(field.text().await.map_err(bad_multipart_field)?),
+            Some("probe_serial") => probe_serial = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("firmware") => {
                 let bytes = field.bytes().await.map_err(bad_multipart_field)?;
                 let mut temp = tempfile::Builder::new()
@@ -279,6 +293,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
         path,
         format,
         base_address,
+        probe_serial,
         _uploaded: Some(uploaded),
     })
 }
@@ -288,6 +303,9 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
 #[derive(Deserialize)]
 struct ResetRequest {
     chip: String,
+    /// Same disambiguation as `FlashRequest::probe_serial` above.
+    #[serde(default)]
+    probe_serial: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -301,8 +319,9 @@ async fn reset_handler(
 ) -> Result<Json<ResetResponse>, (StatusCode, String)> {
     let _guard = state.hw_lock.lock().await;
     let chip = req.chip;
+    let probe_serial = req.probe_serial;
 
-    tokio::task::spawn_blocking(move || hardware::reset(&chip))
+    tokio::task::spawn_blocking(move || hardware::reset(&chip, probe_serial.as_deref()))
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
@@ -390,9 +409,56 @@ async fn resolve_chip_handler(
     }
 }
 
+// ---- POST /probes/enroll ---------------------------------------------------
+
+/// The only sanctioned way to populate/update `embarch-topology`'s
+/// enrollment storage (`design.md` §3 decision 22;
+/// `embarch_topology::hardware::enroll`, formerly this crate's own
+/// `board_gate::enroll`). Takes `hw_lock` like `/flash`/`/reset` — it
+/// attaches to a real chip over the same physical connection those do, and
+/// shouldn't be allowed to race either of them.
+#[derive(Deserialize)]
+struct EnrollProbeRequest {
+    role: String,
+    chip: String,
+}
+
+#[derive(Serialize)]
+struct EnrollProbeResponse {
+    probe_serial: String,
+    role: String,
+    chip: String,
+    hardware_id: String,
+    confirmed_at_utc_ms: u64,
+}
+
+async fn enroll_probe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EnrollProbeRequest>,
+) -> Result<Json<EnrollProbeResponse>, (StatusCode, String)> {
+    let _guard = state.hw_lock.lock().await;
+
+    let role = req.role;
+    let chip = req.chip;
+
+    let board = tokio::task::spawn_blocking(move || embarch_topology::hardware::enroll(&role, &chip))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+
+    Ok(Json(EnrollProbeResponse {
+        probe_serial: board.probe_serial,
+        role: board.role,
+        chip: board.chip,
+        hardware_id: board.hardware_id,
+        confirmed_at_utc_ms: board.confirmed_at_utc_ms,
+    }))
+}
+
 // ---- GET /dev-bench/port ----------------------------------------------------
 
-/// Which serial port `embarch-dev-bench` is on (`dev_bench.rs`).
+/// Which serial port `embarch-dev-bench` is on
+/// (`embarch_topology::hardware::resolve_dev_bench_port`).
 ///
 /// Takes no `hw_lock`: this only reads USB descriptors the OS already
 /// enumerated, opening nothing — same as `/status`'s probe listing.
@@ -401,14 +467,15 @@ async fn resolve_chip_handler(
 /// bench, not a Core failure, and `embarch-api` needs to distinguish it from a
 /// genuinely broken detection (an ambiguous match, or an unreadable USB bus),
 /// which still comes back as `500` with the full error chain.
-async fn dev_bench_port_handler() -> Result<Json<dev_bench::DevBenchPort>, (StatusCode, String)> {
-    let detected = tokio::task::spawn_blocking(dev_bench::detect)
+async fn dev_bench_port_handler(
+) -> Result<Json<embarch_topology::hardware::DevBenchPort>, (StatusCode, String)> {
+    let detected = tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port)
         .await
         .map_err(internal_err)?;
 
     match detected {
         Ok(port) => Ok(Json(port)),
-        Err(e) if e.downcast_ref::<dev_bench::NotFound>().is_some() => {
+        Err(e) if e.downcast_ref::<embarch_topology::hardware::DevBenchNotFound>().is_some() => {
             let msg = format!("{e:?}");
             tracing::info!("{msg}");
             Err((StatusCode::NOT_FOUND, msg))

@@ -22,7 +22,6 @@ use embarch_study_designer::{
 };
 
 use crate::api::{internal_err, AppState};
-use crate::dev_bench;
 use crate::dev_bench_link::DevBenchLink;
 use crate::token_store;
 
@@ -72,7 +71,8 @@ pub struct StudyAcceptedResponse {
 /// design.md §5.1 steps 2-3: every `PostHocValidation.source.step_index` must
 /// be in range, and `steps_crc` must match what `study.steps` recomputes to.
 /// Factored out from the handler so it's testable with no HTTP plumbing —
-/// the same posture as `dev_bench.rs`'s `select()`.
+/// the same posture `embarch_topology::hardware`'s own port-selection logic
+/// takes.
 fn validate_study(study: &Study) -> Result<(), String> {
     for validation in study.validations.iter() {
         if validation.source.step_index as usize >= study.steps.len() {
@@ -209,6 +209,43 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
     .map_err(|e| format!("dev-bench handshake task panicked: {e:?}"))?
 }
 
+/// The `design.md` §3 decision 22 board-identity gate, applied to
+/// dev-bench's own connection — this path never calls `hardware::open_probe`
+/// at all (it's a plain serial port, not a probe-rs debug session), so it
+/// can't reuse `hardware.rs`'s own probe-selection logic the way
+/// `hardware::flash`/`reset` do.
+///
+/// **Keyed by role, not by the link's own USB serial number, since
+/// 2026-08-21** (`embarch-dev-bench/design.md` decision 26's update):
+/// originally keyed on the USB serial the link port itself reported, back
+/// when that port was the ESP32-C5's native USB-Serial/JTAG peripheral —
+/// which enumerates as both a serial port *and* a probe-rs debug probe over
+/// the same physical connection, so its own serial was a valid enrollment
+/// key. That stopped holding once dev-bench's runtime link moved to a
+/// second, dedicated USB-UART bridge chip: a plain UART bridge has no
+/// JTAG/SWD capability, so it can never be a `POST /probes/enroll` candidate
+/// and its serial can never be enrolled.
+/// `embarch_topology::hardware::validate_role` (formerly this crate's own
+/// `board_gate::enforce_for_role`) looks up dev-bench's already-enrolled
+/// entry by role instead and re-verifies identity over its still-attached
+/// native USB/JTAG connection — the wire carrying `DevBenchMessage` traffic
+/// and the wire identity gets confirmed over no longer need to be the same
+/// one, as long as both reach the same physical chip (see that function's
+/// own doc comment for what this still doesn't close). Runs inside
+/// `spawn_blocking`: the gate attaches to real hardware and reads memory,
+/// exactly the blocking probe-rs calls every other hardware-touching
+/// handler in this crate already wraps.
+async fn enforce_dev_bench_gate() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        embarch_topology::hardware::validate_role(embarch_topology::hardware::DEV_BENCH_ROLE)
+    })
+    .await
+    .map_err(|e| format!("board-identity gate task panicked: {e:?}"))?
+    .map_err(|e| format!("{e:?}"))?;
+
+    Ok(())
+}
+
 // ---- GET /dev-bench/hello ---------------------------------------------------
 
 /// Opens the dev-bench link just long enough to run the `Hello`/`HelloAck`
@@ -234,14 +271,18 @@ pub async fn hello_handler(
         }
     }
 
-    let port = match tokio::task::spawn_blocking(dev_bench::detect).await {
+    let port = match tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port).await {
         Ok(Ok(port)) => port,
-        Ok(Err(e)) if e.downcast_ref::<dev_bench::NotFound>().is_some() => {
+        Ok(Err(e)) if e.downcast_ref::<embarch_topology::hardware::DevBenchNotFound>().is_some() => {
             return Err((StatusCode::NOT_FOUND, format!("{e:?}")));
         }
         Ok(Err(e)) => return Err(internal_err(e)),
         Err(e) => return Err(internal_err(e)),
     };
+
+    enforce_dev_bench_gate()
+        .await
+        .map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
 
     let (_link, info) = open_and_handshake(port.port_name)
         .await
@@ -281,9 +322,9 @@ pub async fn post_study_handler(
         *state.study_lock.lock().unwrap() = None;
     };
 
-    let port = match tokio::task::spawn_blocking(dev_bench::detect).await {
+    let port = match tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port).await {
         Ok(Ok(port)) => port,
-        Ok(Err(e)) if e.downcast_ref::<dev_bench::NotFound>().is_some() => {
+        Ok(Err(e)) if e.downcast_ref::<embarch_topology::hardware::DevBenchNotFound>().is_some() => {
             release_lock();
             return Err((StatusCode::NOT_FOUND, format!("{e:?}")));
         }
@@ -296,6 +337,11 @@ pub async fn post_study_handler(
             return Err(internal_err(e));
         }
     };
+
+    if let Err(msg) = enforce_dev_bench_gate().await {
+        release_lock();
+        return Err((StatusCode::BAD_GATEWAY, msg));
+    }
 
     let mut link = match open_and_handshake(port.port_name).await {
         Ok((link, _info)) => link,
@@ -752,6 +798,10 @@ mod tests {
             captured_data: None,
             power_samples_ref: None,
             waveform_ref: None,
+            // embarch-study-designer/design.md §3 decisions 31/32 — new
+            // fields this test fixture doesn't need to populate.
+            gatt_services: None,
+            gatt_activity: None,
         }];
 
         finish_job(&jobs, "abc", &dir, &study, step_results);
