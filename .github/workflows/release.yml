@@ -42,8 +42,37 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
     runs-on: ${{ matrix.os }}
+    # Cargo.toml depends on both embarch-study-designer and embarch-topology
+    # as sibling path dependencies (embarch-doc/DOC-PROTOCOL.md §2's layout:
+    # every sub-project sits as a sibling of embarch-doc, not a Cargo
+    # workspace — embarch-topology/design.md §5's cross-repo-dependency
+    # question, resolved this way rather than inventing a registry/vendoring
+    # step). `../embarch-study-designer`/`../embarch-topology` only resolve
+    # if this repo's own checkout *also* sits in a same-named sibling
+    # directory, not at the workspace root — hence every checkout below
+    # gets an explicit `path:`, and every later step runs with
+    # `working-directory: embarch-core`. Before this pass, only this repo
+    # itself was checked out (at the workspace root, where a relative
+    # `../embarch-study-designer` can't resolve at all) — a real, latent gap
+    # this pass found and fixed: it predates embarch-topology, since the
+    # embarch-study-designer path dependency was added after this
+    # workflow's last actually-green run (2026-08-12, before the
+    # 2026-08-19 commit that added it).
+    defaults:
+      run:
+        working-directory: embarch-core
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: embarch-core
+      - uses: actions/checkout@v4
+        with:
+          repository: gabrieltetar/embarch-study-designer
+          path: embarch-study-designer
+      - uses: actions/checkout@v4
+        with:
+          repository: gabrieltetar/embarch-topology
+          path: embarch-topology
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,6 +94,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
+      # Unverified: `cross` builds inside a Docker container and needs to see
+      # the sibling `../embarch-study-designer`/`../embarch-topology`
+      # checkouts, not just this crate's own directory. Newer `cross`
+      # versions detect a Cargo workspace via `cargo metadata` and mount
+      # enough of the filesystem to cover path dependencies outside the
+      # crate root, but this hasn't been confirmed against a real run on
+      # this exact layout — flagging rather than silently assuming it works
+      # (this repo's own `embarch-dev-workflow.md`-style "don't claim
+      # verified without a real run" posture).
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
@@ -90,10 +128,15 @@ jobs:
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             7z a "${name}.zip" "${name}" >/dev/null
-            echo "asset=dist/${name}.zip" >> "$GITHUB_OUTPUT"
+            # `working-directory: embarch-core` (this job's default) only
+            # applies to `run:` steps, not the `uses:` step below — its
+            # `files:` glob resolves from $GITHUB_WORKSPACE, so this output
+            # needs the `embarch-core/` prefix even though this step itself
+            # ran from inside that directory.
+            echo "asset=embarch-core/dist/${name}.zip" >> "$GITHUB_OUTPUT"
           else
             tar czf "${name}.tar.gz" "${name}"
-            echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+            echo "asset=embarch-core/dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload release asset
