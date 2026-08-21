@@ -25,8 +25,14 @@ heapless = "0.8"
 # known_boards.rs/hardware_id.rs/dev_bench.rs into this shared crate.
 # `hardware` is the feature that pulls in probe-rs/serialport — the one
 # consumer that needs it; embarch-api/embarch-umbrella depend on the same
-# crate without it.
-embarch-topology = { path = "../embarch-topology", features = ["hardware"] }
+# crate without it. `default-features = false` opts out of that crate's own
+# `software` feature (Core never calls `embarch_topology::software`,
+# confirmed via grep) — its default-on `reqwest` dependency transitively
+# pulls in `aws-lc-sys`, a real C-toolchain-needing build dependency this
+# crate's own Windows/cross-compilation story has no reason to pay for
+# (found via `cargo tree` while wiring this in; `embarch-dev-workflow.md`
+# §4 already flags this exact class of risk for a different crate).
+embarch-topology = { path = "../embarch-topology", default-features = false, features = ["hardware"] }
 # `use-std` is what actually gets `to_stdvec_cobs`/`from_bytes_cobs` — the
 # `Vec<u8>`-returning COBS helpers `dev_bench_link.rs` uses, rather than the
 # `no_std` slice-only API. postcard depends on `cobs` internally and exposes
