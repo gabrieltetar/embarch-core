@@ -136,18 +136,34 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+// Polled, not pushed (see the polling loop near the bottom of this script):
+// `GET /status` already re-enumerates USB probes fresh on every call — cheap
+// descriptor enumeration, not an attach — so a human plugging or unplugging
+// a board while this page is open sees it appear/disappear within one poll
+// interval, with no new backend endpoint needed. `probe-rs` has no hotplug
+// *event* stream to push from instead; polling a call this cheap is the
+// simpler answer, not a placeholder for a "real" push mechanism later.
+let lastAttachedKey = null;
+
 async function refreshAttached() {
   const pool = document.getElementById("probes-pool");
   try {
     const resp = await authedFetch("/status");
-    if (!resp.ok) { pool.innerHTML = '<span class="error">' + resp.status + " " + escapeHtml(await resp.text()) + "</span>"; return; }
+    if (!resp.ok) { pool.innerHTML = '<span class="error">' + resp.status + " " + escapeHtml(await resp.text()) + "</span>"; lastAttachedKey = null; return; }
     const data = await resp.json();
-    attachedProbes = data.probes || [];
-    if (attachedProbes.length === 0) { pool.innerHTML = "<i>no debug probes detected</i>"; return; }
+    const probes = data.probes || [];
+    // Skip re-rendering (and dropping mid-drag/selection state) when
+    // nothing actually changed — every poll would otherwise rebuild the
+    // DOM even while a card is mid-drag.
+    const key = JSON.stringify(probes.map(p => [p.identifier, p.serial_number]));
+    if (key === lastAttachedKey) { return; }
+    lastAttachedKey = key;
+    attachedProbes = probes;
+    if (probes.length === 0) { pool.innerHTML = "<i>no debug probes detected</i>"; return; }
     pool.innerHTML = "";
-    for (const p of attachedProbes) {
+    for (const p of probes) {
       const card = document.createElement("div");
-      card.className = "probe-card";
+      card.className = "probe-card" + (p.serial_number === selectedSerial ? " selected" : "");
       card.draggable = true;
       card.dataset.serial = p.serial_number || "";
       card.textContent = p.identifier + " (" + (p.serial_number || "no serial") + ")";
@@ -163,6 +179,7 @@ async function refreshAttached() {
     }
   } catch (e) {
     pool.innerHTML = '<span class="error">' + escapeHtml(String(e)) + "</span>";
+    lastAttachedKey = null;
   }
 }
 
@@ -258,6 +275,10 @@ document.getElementById("token-save").addEventListener("click", () => {
 });
 
 refreshAll();
+// Live updates: see refreshAttached's own comment on why this is a poll,
+// not a push. 1.5s is fast enough that plugging a board reads as "the page
+// noticed," without hammering Core on a purely local, single-user page.
+setInterval(refreshAll, 1500);
 </script>
 </body>
 </html>
