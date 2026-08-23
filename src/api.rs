@@ -446,6 +446,13 @@ async fn resolve_chip_handler(
 struct EnrollProbeRequest {
     role: String,
     chip: String,
+    /// Picks which currently-attached probe to enroll when more than one
+    /// is present — `/enroll`'s own drag-and-drop UI always sends this
+    /// (§3 decision 15), since it lets a human enroll two visibly-
+    /// different boards without unplugging either. Omitted, `enroll`
+    /// falls back to its original "exactly one attached" requirement.
+    #[serde(default)]
+    probe_serial: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -465,8 +472,11 @@ async fn enroll_probe_handler(
 
     let role = req.role;
     let chip = req.chip;
+    let probe_serial = req.probe_serial;
 
-    let board = tokio::task::spawn_blocking(move || embarch_topology::hardware::enroll(&role, &chip))
+    let board = tokio::task::spawn_blocking(move || {
+        embarch_topology::hardware::enroll(&role, &chip, probe_serial.as_deref())
+    })
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
@@ -726,7 +736,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("Enroll the currently-attached probe"));
+        assert!(String::from_utf8_lossy(&body).contains("drag onto a role below"));
     }
 
     #[tokio::test]
