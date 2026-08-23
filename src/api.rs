@@ -29,17 +29,26 @@ pub struct AppState {
     pub hw_lock: Arc<Mutex<()>>,
     pub study_lock: study::StudyLock,
     pub study_jobs: study::JobRegistry,
+    /// Live push for `GET /study/{study_id}/events` (SSE) — every
+    /// `StudyEvent` `study.rs` produces goes through this one process-wide
+    /// channel, same "only one study in flight" assumption `study_lock`
+    /// already makes. Capacity is a small backlog, not a full history — a
+    /// subscriber that falls behind gets an explicit `lagged` notice
+    /// (`study::study_events_handler`) rather than silently missing events.
+    pub study_events: tokio::sync::broadcast::Sender<study::StudyEvent>,
 }
 
 impl AppState {
-    /// Constructs the two `/study*`-only fields fresh — kept here so
-    /// `main.rs`'s `serve` doesn't need to know either type's internals.
+    /// Constructs the `/study*`-only fields fresh — kept here so
+    /// `main.rs`'s `serve` doesn't need to know any of their internals.
     pub fn new(token: String) -> Self {
+        let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         Self {
             token,
             hw_lock: Arc::new(Mutex::new(())),
             study_lock: Arc::new(StdMutex::new(None)),
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
+            study_events,
         }
     }
 }
@@ -56,6 +65,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enroll", post(enroll_probe_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
+        .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))

@@ -8,17 +8,21 @@
 
 use axum::extract::{Json, Path, State};
 use axum::http::{header::CONTENT_TYPE, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt as _;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
-    limits::MAX_STEPS_PER_STUDY, steps_crc, DevBenchMessage, Sample, StepResult, StreamChannel,
-    Study, StudyResult, STUDY_DESIGNER_SCHEMA_VERSION,
+    steps_crc, DevBenchMessage, Sample, StepResult, StreamChannel, Study, STUDY_DESIGNER_SCHEMA_VERSION,
 };
 
 use crate::api::{internal_err, AppState};
@@ -46,8 +50,19 @@ pub type JobRegistry = Arc<StdMutex<HashMap<String, StudyJob>>>;
 /// is in flight.
 pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
-/// What `GET /study/{study_id}` answers.
-#[derive(Debug, Clone, Serialize)]
+/// Live-progress state kept in the job registry. **Never holds a full
+/// `StudyResult`** — measured at ~1.3 MB purely from `embarch-study-
+/// designer`'s no_std worst-case capacity fields (`heapless::Vec<StepResult,
+/// 64>` × `StepResult`'s own `gatt_activity` capacity), a value that's
+/// genuinely unsafe to clone by value on a normal thread stack, which is
+/// exactly what every `GET /study/{study_id}` call used to do
+/// (`embarch-study-designer/design.md` §7's stack-overflow finding). A
+/// completed study's actual result lives only in `events.json` on disk
+/// (written incrementally by [`EventsJsonWriter`] as each step arrives, not
+/// assembled from this struct) — [`get_study_handler`] reads it back from
+/// there, the same pattern `power_data_handler`/`waveform_data_handler`
+/// already use for `data.csv`/`waveform.csv`.
+#[derive(Debug, Clone)]
 pub struct StudyJob {
     /// `"running" | "completed" | "failed"` (`"pending"` is never actually
     /// used: an entry is only ever created once the dev-bench handshake has
@@ -56,7 +71,20 @@ pub struct StudyJob {
     pub status: String,
     pub current_step: Option<u32>,
     pub total_steps: Option<u32>,
-    pub result: Option<StudyResult>,
+    pub reason: Option<String>,
+}
+
+/// What `GET /study/{study_id}` actually answers over HTTP — same shape
+/// callers already depended on (`status`/`current_step`/`total_steps`/
+/// `result`/`reason`), just no longer backed by a resident `StudyResult`:
+/// `result` is filled in by reading `events.json` off disk at request time,
+/// only once `status` is `"completed"`.
+#[derive(Serialize)]
+pub struct StudyJobResponse {
+    pub status: String,
+    pub current_step: Option<u32>,
+    pub total_steps: Option<u32>,
+    pub result: Option<serde_json::Value>,
     pub reason: Option<String>,
 }
 
@@ -64,6 +92,40 @@ pub struct StudyJob {
 pub struct StudyAcceptedResponse {
     study_id: String,
     status: &'static str,
+}
+
+/// One live event pushed to every subscriber of `GET /study/{study_id}/
+/// events` (SSE) the instant Core processes it off the dev-bench link —
+/// never buffered until the study finishes. Mirrors `embarch-topology`'s own
+/// durable-log-plus-live-push shape (`embarch-topology/design.md` §3
+/// decision 12: write it to disk *and* push it live if anyone's watching)
+/// applied here to study progress instead of a topology mismatch. Every
+/// variant carries `study_id` so a subscriber that reconnects across studies
+/// can tell them apart, even though today only one study is ever in flight
+/// at a time (`StudyLock`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind")]
+pub enum StudyEvent {
+    /// A step just completed — the same `StepResult` [`EventsJsonWriter`]
+    /// just appended to `events.json`, pushed live rather than only
+    /// discoverable by polling `GET /study/{study_id}` afterward. A single
+    /// `StepResult` is at most tens of KB (bounded by `limits::
+    /// MAX_PAYLOAD_LEN`/`MAX_GATT_ACTIVITY_RECORDS`) — nowhere near the
+    /// ~1.3 MB whole-study worst case, but still `clippy::
+    /// large_enum_variant`-large next to this enum's other, small variants,
+    /// so it's boxed rather than inline: one heap allocation per step
+    /// (`MAX_STEPS_PER_STUDY` = 64 at most per study) is a non-issue: the
+    /// point of boxing here is keeping `StudyEvent` itself small to move
+    /// around and clone, not avoiding a stack overflow the way the fields
+    /// this whole rework removed from `StudyJob` did.
+    StepCompleted { study_id: String, step_index: u32, result: Box<StepResult> },
+    /// One batch of power/waveform samples, pushed the instant Core decodes
+    /// it off the wire — the same samples [`write_sample`] is appending to
+    /// `data.csv`/`waveform.csv` in the same pass, not held back until the
+    /// step or study finishes.
+    SampleBatch { study_id: String, step_index: u32, channel: StreamChannel, samples: Vec<Sample> },
+    /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
+    StatusChanged { study_id: String, status: String, reason: Option<String> },
 }
 
 // ---- pure validation (no HTTP, no hardware — unit-testable directly) ------
@@ -125,11 +187,20 @@ fn update_job<F: FnOnce(&mut StudyJob)>(jobs: &JobRegistry, study_id: &str, f: F
     }
 }
 
-fn fail_job(jobs: &JobRegistry, study_id: &str, reason: String) {
+fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, reason: String) {
     tracing::error!(study_id, %reason, "study failed");
     update_job(jobs, study_id, |job| {
         job.status = "failed".to_string();
-        job.reason = Some(reason);
+        job.reason = Some(reason.clone());
+    });
+    // No subscribers is the common case (nobody's watching `/events` right
+    // now) — `send` erroring just means that, not a real failure, so the
+    // result is intentionally discarded, same posture `embarch-topology`'s
+    // own live-push takes (design.md §3 decision 12).
+    let _ = events_tx.send(StudyEvent::StatusChanged {
+        study_id: study_id.to_string(),
+        status: "failed".to_string(),
+        reason: Some(reason),
     });
 }
 
@@ -379,7 +450,6 @@ pub async fn post_study_handler(
                 status: "running".to_string(),
                 current_step: None,
                 total_steps: Some(total_steps),
-                result: None,
                 reason: None,
             },
         );
@@ -387,19 +457,23 @@ pub async fn post_study_handler(
 
     let jobs = state.study_jobs.clone();
     let study_lock = state.study_lock.clone();
+    let events_tx = state.study_events.clone();
     let study_id_for_task = study_id.clone();
 
     tokio::spawn(async move {
         let jobs_for_panic = jobs.clone();
+        let events_tx_for_panic = events_tx.clone();
         let study_id_for_panic = study_id_for_task.clone();
 
-        let outcome =
-            tokio::task::spawn_blocking(move || run_study_to_completion(link, study, study_id_for_task, jobs))
-                .await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_study_to_completion(link, study, study_id_for_task, jobs, events_tx)
+        })
+        .await;
 
         if let Err(join_err) = outcome {
             fail_job(
                 &jobs_for_panic,
+                &events_tx_for_panic,
                 &study_id_for_panic,
                 format!("background study task panicked: {join_err:?}"),
             );
@@ -418,24 +492,43 @@ pub async fn post_study_handler(
 /// updating the job registry and `data.csv`/`waveform.csv`/`events.json` as
 /// it goes (design.md §5.1 steps 8+, §5.2). Entirely blocking — called from
 /// `spawn_blocking` by [`post_study_handler`].
-fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: String, jobs: JobRegistry) {
+fn run_study_to_completion(
+    mut link: DevBenchLink,
+    study: Study,
+    study_id: String,
+    jobs: JobRegistry,
+    events_tx: broadcast::Sender<StudyEvent>,
+) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
         Err(e) => {
-            fail_job(&jobs, &study_id, format!("failed to resolve the study results directory: {e:?}"));
+            fail_job(&jobs, &events_tx, &study_id, format!("failed to resolve the study results directory: {e:?}"));
             return;
         }
     };
     if let Err(e) = std::fs::create_dir_all(&results_dir) {
         fail_job(
             &jobs,
+            &events_tx,
             &study_id,
             format!("failed to create results directory {}: {e:?}", results_dir.display()),
         );
         return;
     }
 
-    let mut step_results: Vec<StepResult> = Vec::new();
+    // Streams `events.json` to disk as each `StepResult` arrives, rather
+    // than accumulating them and assembling a `StudyResult` only at the
+    // end — see `EventsJsonWriter`'s own doc comment for why that
+    // accumulate-then-build step is exactly what used to overflow the
+    // stack (`embarch-study-designer/design.md` §7).
+    let mut writer = match EventsJsonWriter::start(&results_dir, study.name.as_str()) {
+        Ok(w) => w,
+        Err(e) => {
+            fail_job(&jobs, &events_tx, &study_id, format!("failed to open events.json for writing: {e:?}"));
+            return;
+        }
+    };
+
     let mut current_stream: Option<(u32, StreamChannel)> = None;
     let mut next_expected: usize = 0;
     let mut deadline = next_deadline(&study, next_expected, Instant::now());
@@ -443,14 +536,27 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
     loop {
         match link.recv(deadline) {
             Ok(Some(DevBenchMessage::StepResult { step_index, result })) => {
-                step_results.push(result);
+                if let Err(e) = writer.write_step(&result) {
+                    fail_job(
+                        &jobs,
+                        &events_tx,
+                        &study_id,
+                        format!("failed to write step {step_index}'s result to events.json: {e:?}"),
+                    );
+                    return;
+                }
+                let _ = events_tx.send(StudyEvent::StepCompleted {
+                    study_id: study_id.clone(),
+                    step_index,
+                    result: Box::new(result),
+                });
                 next_expected = step_index as usize + 1;
                 update_job(&jobs, &study_id, |job| job.current_step = Some(step_index));
                 deadline = next_deadline(&study, next_expected, Instant::now());
             }
             Ok(Some(DevBenchMessage::StudyDone { completed })) => {
                 tracing::info!(study_id, completed, "study run finished (StudyDone)");
-                finish_job(&jobs, &study_id, &results_dir, &study, step_results);
+                finish_job(&jobs, &events_tx, &study_id, writer);
                 return;
             }
             Ok(Some(DevBenchMessage::StreamStart { step_index, channel })) => {
@@ -463,6 +569,7 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
             }
             Ok(Some(DevBenchMessage::StreamChunk { sample })) => {
                 write_sample(&results_dir, &study, current_stream, sample);
+                broadcast_sample_batch(&events_tx, &study_id, current_stream, &[sample]);
             }
             Ok(Some(DevBenchMessage::StreamChunkBatch {
                 base_utc_ms,
@@ -471,6 +578,7 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
                 channel_id,
                 values,
             })) => {
+                let mut samples = Vec::with_capacity(values.len());
                 for (i, value) in values.iter().enumerate() {
                     let sample = Sample {
                         rx_utc_ms: base_utc_ms + (i as u64) * (sample_interval_ms as u64),
@@ -479,7 +587,9 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
                         channel_id,
                     };
                     write_sample(&results_dir, &study, current_stream, sample);
+                    samples.push(sample);
                 }
+                broadcast_sample_batch(&events_tx, &study_id, current_stream, &samples);
             }
             Ok(Some(DevBenchMessage::LogLine { text })) => {
                 tracing::debug!(study_id, "dev-bench: {text}");
@@ -493,6 +603,7 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
             Ok(None) => {
                 fail_job(
                     &jobs,
+                    &events_tx,
                     &study_id,
                     format!(
                         "step timed out — no message received from dev-bench before the deadline \
@@ -502,11 +613,30 @@ fn run_study_to_completion(mut link: DevBenchLink, study: Study, study_id: Strin
                 return;
             }
             Err(e) => {
-                fail_job(&jobs, &study_id, format!("dev-bench connection error: {e:?}"));
+                fail_job(&jobs, &events_tx, &study_id, format!("dev-bench connection error: {e:?}"));
                 return;
             }
         }
     }
+}
+
+/// Broadcasts one batch of samples the instant they're decoded off the wire
+/// — a no-op (not an error) if `current_stream` is `None`, matching
+/// `write_sample`'s own "drop it, log it" posture for a sample with no open
+/// `StreamStart`.
+fn broadcast_sample_batch(
+    events_tx: &broadcast::Sender<StudyEvent>,
+    study_id: &str,
+    current_stream: Option<(u32, StreamChannel)>,
+    samples: &[Sample],
+) {
+    let Some((step_index, channel)) = current_stream else { return };
+    let _ = events_tx.send(StudyEvent::SampleBatch {
+        study_id: study_id.to_string(),
+        step_index,
+        channel,
+        samples: samples.to_vec(),
+    });
 }
 
 /// Decodes one `Sample` onto whichever of `data.csv` (`Power`) or
@@ -552,46 +682,96 @@ fn write_sample(results_dir: &FsPath, study: &Study, current_stream: Option<(u32
     }
 }
 
-/// `StudyDone`'s happy path (design.md §5.1 step 8): build the final
-/// `StudyResult`, write `events.json`, and mark the job `"completed"`.
-/// `completed: false` (a study that stopped early on a failing step with
-/// `continue_on_fail: false`) is still a normal protocol completion, not a
-/// watchdog/connection failure — `"failed"` status is reserved for those.
-fn finish_job(jobs: &JobRegistry, study_id: &str, results_dir: &FsPath, study: &Study, step_results: Vec<StepResult>) {
-    let mut steps: heapless::Vec<StepResult, MAX_STEPS_PER_STUDY> = heapless::Vec::new();
-    for step_result in step_results {
-        // Bounded by study.steps.len() <= MAX_STEPS_PER_STUDY (study.steps is
-        // itself that exact heapless::Vec), so this can never overflow.
-        let _ = steps.push(step_result);
-    }
-
-    let result = StudyResult {
-        study_name: study.name.clone(),
-        steps,
-        // Post-hoc validation evaluation (design.md §4.6/decision 19, the
-        // `core-validation` feature's SignalCheck machinery) is a real
-        // feature this crate enables but does not yet call — left empty and
-        // out of scope for this milestone; see the final report.
-        validations: heapless::Vec::new(),
-    };
-
-    if let Err(e) = write_events_json(results_dir, &result) {
-        tracing::error!("failed to write events.json for study {study_id}: {e:?}");
-    }
-
-    update_job(jobs, study_id, |job| {
-        job.status = "completed".to_string();
-        job.result = Some(result);
-    });
+/// Streams `events.json` to disk one `StepResult` at a time, as each
+/// arrives — the file is never assembled from a fully-materialized
+/// `StudyResult` held in memory. `embarch-study-designer/design.md` §7
+/// measured that type at **~1.3 MB**, purely from its `no_std` worst-case-
+/// capacity fields (`heapless::Vec<StepResult, 64>`, each `StepResult`
+/// itself carrying up to 32 `GattActivityRecord`s at up to 512 bytes each) —
+/// safe to serialize element-by-element (each `StepResult` alone is at most
+/// tens of KB), genuinely unsafe to construct whole on a normal thread
+/// stack, which is exactly what building one and handing it to
+/// `serde_json::to_writer` used to do, and exactly what overflowed
+/// `study::tests::finish_job_marks_completed_and_stores_the_result_even_when_stopped_early`
+/// (and, in production, every `GET /study/{study_id}` call that cloned a
+/// completed job out of the registry).
+///
+/// Writes to a `.partial` file, only renamed to the real `events.json` on a
+/// genuine [`EventsJsonWriter::finish`] — an aborted/failed study leaves the
+/// `.partial` file behind as a diagnostic artifact rather than a completed
+/// result, the same posture `data.csv`/`waveform.csv` already have for a
+/// crash mid-study (`embarch-study-designer/design.md` §3 decision 16).
+struct EventsJsonWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    wrote_any_step: bool,
 }
 
-fn write_events_json(results_dir: &FsPath, result: &StudyResult) -> anyhow::Result<()> {
-    use anyhow::Context;
+impl EventsJsonWriter {
+    fn start(results_dir: &FsPath, study_name: &str) -> anyhow::Result<Self> {
+        use anyhow::Context;
 
-    let path = results_dir.join("events.json");
-    let file = std::fs::File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
-    serde_json::to_writer_pretty(file, result).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+        let partial_path = results_dir.join("events.json.partial");
+        let final_path = results_dir.join("events.json");
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&partial_path)
+                .with_context(|| format!("failed to create {}", partial_path.display()))?,
+        );
+        write!(file, "{{\"study_name\":{},\"steps\":[", serde_json::to_string(study_name)?)
+            .with_context(|| format!("failed to write the opening of {}", partial_path.display()))?;
+        Ok(Self { file, partial_path, final_path, wrote_any_step: false })
+    }
+
+    fn write_step(&mut self, result: &StepResult) -> anyhow::Result<()> {
+        if self.wrote_any_step {
+            write!(self.file, ",")?;
+        }
+        serde_json::to_writer(&mut self.file, result)?;
+        self.wrote_any_step = true;
+        Ok(())
+    }
+
+    /// Closes the `steps` array, writes empty `validations` — post-hoc
+    /// validation (design.md §3 decision 19, the `core-validation` feature's
+    /// `SignalCheck` machinery) is a real feature this crate enables but
+    /// doesn't call yet, unchanged from before this streaming rework — and
+    /// atomically renames `.partial` to the real `events.json`.
+    fn finish(mut self) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        write!(self.file, "],\"validations\":[]}}")?;
+        self.file.flush().with_context(|| format!("failed to flush {}", self.partial_path.display()))?;
+        drop(self.file);
+        std::fs::rename(&self.partial_path, &self.final_path).with_context(|| {
+            format!("failed to finalize {} as {}", self.partial_path.display(), self.final_path.display())
+        })?;
+        Ok(())
+    }
+}
+
+/// `StudyDone`'s happy path (design.md §5.1 step 8): finalize `events.json`
+/// (every step in it was already streamed to disk as it arrived — this only
+/// closes the file out) and mark the job `"completed"`. `completed: false`
+/// (a study that stopped early on a failing step with `continue_on_fail:
+/// false`) is still a normal protocol completion, not a watchdog/connection
+/// failure — `"failed"` status is reserved for those.
+fn finish_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, writer: EventsJsonWriter) {
+    if let Err(e) = writer.finish() {
+        // Every step already made it to the `.partial` file — only the
+        // finalize-and-rename step failed, so this is reported as a failure
+        // rather than silently claiming "completed" over a result that
+        // never got its final name.
+        fail_job(jobs, events_tx, study_id, format!("failed to finalize events.json: {e:?}"));
+        return;
+    }
+
+    update_job(jobs, study_id, |job| job.status = "completed".to_string());
+    let _ = events_tx.send(StudyEvent::StatusChanged {
+        study_id: study_id.to_string(),
+        status: "completed".to_string(),
+        reason: None,
+    });
 }
 
 // ---- GET /study/{study_id} --------------------------------------------------
@@ -599,14 +779,106 @@ fn write_events_json(results_dir: &FsPath, result: &StudyResult) -> anyhow::Resu
 pub async fn get_study_handler(
     State(state): State<AppState>,
     Path(study_id): Path<String>,
-) -> Result<Json<StudyJob>, (StatusCode, String)> {
-    let jobs = state.study_jobs.lock().unwrap();
-    match jobs.get(&study_id) {
-        Some(job) => Ok(Json(job.clone())),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            format!("no study job found for study_id '{study_id}' (never existed, or Core has restarted since)"),
-        )),
+) -> Result<Json<StudyJobResponse>, (StatusCode, String)> {
+    let job = {
+        let jobs = state.study_jobs.lock().unwrap();
+        match jobs.get(&study_id) {
+            Some(job) => job.clone(),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("no study job found for study_id '{study_id}' (never existed, or Core has restarted since)"),
+                ))
+            }
+        }
+    };
+
+    // Only a `"completed"` study has a finished `events.json` to read back
+    // — `result` reads it from disk rather than from a resident copy (see
+    // `StudyJob`'s own doc comment for why one is never kept in memory). A
+    // read failure here degrades to `result: None` rather than failing the
+    // whole request — the job's own status/reason are still real and worth
+    // returning even if the file is somehow missing or unreadable.
+    let result = if job.status == "completed" {
+        match read_events_json(&study_id).await {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::error!("study {study_id} is completed but events.json couldn't be read back: {e:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(StudyJobResponse {
+        status: job.status,
+        current_step: job.current_step,
+        total_steps: job.total_steps,
+        result,
+        reason: job.reason,
+    }))
+}
+
+async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
+    let dir = study_results_dir(study_id)?;
+    let bytes = tokio::fs::read(dir.join("events.json")).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+// ---- GET /study/{study_id}/events (SSE, live push) --------------------------
+
+/// Live-push companion to polling `GET /study/{study_id}`: every
+/// [`StudyEvent`] is forwarded to a connected client the instant Core
+/// broadcasts it — a step completing, a sample batch arriving, or the
+/// study's own status changing — rather than requiring the client to poll
+/// and hope it didn't miss something in between. Mirrors `embarch-
+/// topology`'s own live-push shape (design.md §3 decision 12) applied here
+/// to study progress. Only one study is ever in flight at a time
+/// (`StudyLock`), so a single process-wide broadcast channel (`AppState::
+/// study_events`) is enough — no per-study subscription bookkeeping.
+///
+/// A slow subscriber that falls behind the channel's buffer gets an
+/// `event: lagged` frame naming how many messages it missed, rather than
+/// silently resuming as if nothing was lost.
+///
+/// The channel itself is process-wide (`AppState::study_events`), but this
+/// handler filters to events matching the `study_id` in the URL — so
+/// watching one study's `/events` never surfaces a *different* study's
+/// traffic even though, today, `StudyLock` never actually lets two run
+/// concurrently to make that observable.
+pub async fn study_events_handler(
+    State(state): State<AppState>,
+    Path(study_id): Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.study_events.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        let study_id = study_id.clone();
+        async move {
+            match msg {
+                Ok(event) if event_study_id(&event) == study_id => Some(Ok::<_, Infallible>(
+                    Event::default()
+                        .json_data(&event)
+                        .unwrap_or_else(|e| Event::default().event("encode-error").data(format!("{e:?}"))),
+                )),
+                // A different study's event, or this subscriber lagged
+                // behind the channel's buffer — the latter is reported
+                // rather than silently skipped.
+                Ok(_) => None,
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    Some(Ok(Event::default().event("lagged").data(n.to_string())))
+                }
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn event_study_id(event: &StudyEvent) -> &str {
+    match event {
+        StudyEvent::StepCompleted { study_id, .. }
+        | StudyEvent::SampleBatch { study_id, .. }
+        | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
 
@@ -638,7 +910,8 @@ async fn serve_study_csv(study_id: &str, filename: &str, kind: &str) -> Result<R
 mod tests {
     use super::*;
     use embarch_study_designer::{
-        Action, BleRole, DataChannel, ExpectedValue, PostHocCheck, PostHocValidation, ValidationSource,
+        limits::MAX_STEPS_PER_STUDY, Action, BleRole, DataChannel, ExpectedValue, PostHocCheck, PostHocValidation,
+        ValidationSource,
     };
     use heapless::Vec as HVec;
 
@@ -744,13 +1017,7 @@ mod tests {
     }
 
     fn running_job(total_steps: u32) -> StudyJob {
-        StudyJob {
-            status: "running".to_string(),
-            current_step: None,
-            total_steps: Some(total_steps),
-            result: None,
-            reason: None,
-        }
+        StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(total_steps), reason: None }
     }
 
     #[test]
@@ -772,28 +1039,9 @@ mod tests {
         assert!(jobs.lock().unwrap().get("missing").is_none());
     }
 
-    #[test]
-    fn fail_job_sets_status_and_reason() {
-        let jobs = empty_registry();
-        jobs.lock().unwrap().insert("abc".to_string(), running_job(3));
-
-        fail_job(&jobs, "abc", "dev-bench connection error: dropped".to_string());
-
-        let job = jobs.lock().unwrap().get("abc").unwrap().clone();
-        assert_eq!(job.status, "failed");
-        assert_eq!(job.reason.as_deref(), Some("dev-bench connection error: dropped"));
-    }
-
-    #[test]
-    fn finish_job_marks_completed_and_stores_the_result_even_when_stopped_early() {
-        let jobs = empty_registry();
-        jobs.lock().unwrap().insert("abc".to_string(), running_job(2));
-        let study = study_with_steps(&[1_000, 2_000]);
-        let dir = std::env::temp_dir().join(format!("embarch-study-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let step_results = vec![StepResult {
-            step_name: heapless::String::try_from("step-0").unwrap(),
+    fn test_step_result(name: &str) -> StepResult {
+        StepResult {
+            step_name: heapless::String::try_from(name).unwrap(),
             outcome: embarch_study_designer::Outcome::Pass,
             captured_data: None,
             power_samples_ref: None,
@@ -802,15 +1050,121 @@ mod tests {
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
             gatt_activity: None,
-        }];
+        }
+    }
 
-        finish_job(&jobs, "abc", &dir, &study, step_results);
+    #[test]
+    fn fail_job_sets_status_and_reason() {
+        let jobs = empty_registry();
+        jobs.lock().unwrap().insert("abc".to_string(), running_job(3));
+        let (events_tx, _rx) = broadcast::channel(16);
+
+        fail_job(&jobs, &events_tx, "abc", "dev-bench connection error: dropped".to_string());
+
+        let job = jobs.lock().unwrap().get("abc").unwrap().clone();
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.reason.as_deref(), Some("dev-bench connection error: dropped"));
+    }
+
+    #[test]
+    fn fail_job_broadcasts_a_status_changed_event() {
+        let jobs = empty_registry();
+        jobs.lock().unwrap().insert("abc".to_string(), running_job(3));
+        let (events_tx, mut rx) = broadcast::channel(16);
+
+        fail_job(&jobs, &events_tx, "abc", "boom".to_string());
+
+        match rx.try_recv().unwrap() {
+            StudyEvent::StatusChanged { study_id, status, reason } => {
+                assert_eq!(study_id, "abc");
+                assert_eq!(status, "failed");
+                assert_eq!(reason.as_deref(), Some("boom"));
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the real stack overflow this streaming rework
+    /// fixes (`embarch-study-designer/design.md` §7): the old version of
+    /// this test built a full `StudyResult` (~1.3 MB, all no_std worst-case
+    /// capacity) and cloned a `StudyJob` holding one — both routinely
+    /// overflowed a normal thread stack. `EventsJsonWriter` never
+    /// constructs that type at all now; this only ever touches individual
+    /// `StepResult`s (tens of KB at most) and the small `StudyJob`/
+    /// `StudyEvent` types.
+    #[test]
+    fn finish_job_marks_completed_and_streams_the_result_to_disk() {
+        let jobs = empty_registry();
+        jobs.lock().unwrap().insert("abc".to_string(), running_job(2));
+        let (events_tx, mut rx) = broadcast::channel(16);
+        let dir = std::env::temp_dir().join(format!("embarch-study-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut writer = EventsJsonWriter::start(&dir, "test-study").unwrap();
+        writer.write_step(&test_step_result("step-0")).unwrap();
+
+        finish_job(&jobs, &events_tx, "abc", writer);
 
         let job = jobs.lock().unwrap().get("abc").unwrap().clone();
         assert_eq!(job.status, "completed");
-        assert!(job.result.is_some());
-        assert_eq!(job.result.unwrap().steps.len(), 1);
+
+        // events.json is real, finalized (not left as `.partial`), and has
+        // the exact shape callers expect — proof the manual streamed-JSON
+        // construction produces the same thing the old whole-struct
+        // `serde_json::to_writer` call did. Checked via `serde_json::Value`,
+        // deliberately never `embarch_study_designer::StudyResult` itself:
+        // deserializing *into* that type reconstructs its full no_std
+        // worst-case capacity the same way constructing one used to —
+        // proven by this exact assertion overflowing the stack the first
+        // time this test was written, before being changed to this. It's
+        // the type itself that's unsafe to materialize host-side, not just
+        // the one code path that used to build it — `get_study_handler`
+        // deliberately reads `events.json` back as a `Value` for the same
+        // reason.
         assert!(dir.join("events.json").exists());
+        assert!(!dir.join("events.json.partial").exists());
+        let bytes = std::fs::read(dir.join("events.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["study_name"], "test-study");
+        assert_eq!(result["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(result["steps"][0]["step_name"], "step-0");
+        assert!(result["validations"].as_array().unwrap().is_empty());
+
+        match rx.try_recv().unwrap() {
+            StudyEvent::StatusChanged { study_id, status, .. } => {
+                assert_eq!(study_id, "abc");
+                assert_eq!(status, "completed");
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn events_json_writer_leaves_only_the_partial_file_until_finished() {
+        let dir = std::env::temp_dir().join(format!("embarch-study-writer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut writer = EventsJsonWriter::start(&dir, "s").unwrap();
+        writer.write_step(&test_step_result("a")).unwrap();
+        writer.write_step(&test_step_result("b")).unwrap();
+        assert!(dir.join("events.json.partial").exists());
+        assert!(!dir.join("events.json").exists());
+
+        writer.finish().unwrap();
+        assert!(!dir.join("events.json.partial").exists());
+
+        // Deliberately checked as a `Value`, not deserialized into
+        // `embarch_study_designer::StudyResult` — see the sibling test's
+        // comment for why that specific assertion is exactly the overflow
+        // this rework fixes, not just a style choice.
+        let bytes = std::fs::read(dir.join("events.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(result["steps"][0]["step_name"], "a");
+        assert_eq!(result["steps"][1]["step_name"], "b");
 
         std::fs::remove_dir_all(&dir).ok();
     }

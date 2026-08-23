@@ -49,6 +49,12 @@ serialport = { version = "4.9.0", features = ["usbportinfo-interface"] }
 service-manager = "0.11.0"
 tempfile = "3.24"
 tokio = { version = "1.53.0", features = ["full"] }
+# `GET /study/{study_id}/events` (SSE live push, study.rs) — wraps a
+# `tokio::sync::broadcast::Receiver` into a `Stream` axum's SSE response can
+# consume directly, and gives `StreamExt::map`/combinators over it without
+# pulling in all of `futures`.
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # known_boards.toml (design.md §3 decision 22) — same version embarch-api
 # already pins, no reason for the two to drift.
 toml = "1.1"
