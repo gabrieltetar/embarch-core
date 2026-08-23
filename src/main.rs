@@ -2,6 +2,7 @@ mod api;
 mod chip_resolve;
 mod dev_bench_link;
 mod elevate;
+mod enroll_page;
 mod hardware;
 mod serial;
 mod service;

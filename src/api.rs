@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
-use crate::{chip_resolve, hardware, serial, study};
+use crate::{chip_resolve, enroll_page, hardware, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -53,8 +53,21 @@ impl AppState {
     }
 }
 
+/// The one deliberately unauthenticated route: `/enroll`'s static HTML/JS
+/// page (§ below). It carries no secrets of its own — every actual API call
+/// its own JavaScript makes (`/status`, `/probes/enrolled`, `/probes/
+/// enroll`) still goes through `auth_middleware` exactly as before, with
+/// the token the page asks a human to paste in once. Kept as its own
+/// unlayered sub-router rather than special-casing a path string inside
+/// `auth_middleware` itself — the exemption is visible right here at the
+/// router-construction call site, not buried in a string comparison deep
+/// inside the auth check every other route also runs through.
+fn public_routes() -> Router<AppState> {
+    Router::new().route("/enroll", get(enroll_page::enroll_page_handler))
+}
+
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/status", get(status_handler))
         .route("/flash", post(flash_handler))
         .route("/reset", post(reset_handler))
@@ -63,13 +76,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dev-bench/hello", get(study::hello_handler))
         .route("/resolve-chip", post(resolve_chip_handler))
         .route("/probes/enroll", post(enroll_probe_handler))
+        .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    public_routes().merge(protected).with_state(state)
 }
 
 /// Simple bearer-token check. This is deliberately not OAuth or anything
@@ -465,6 +480,21 @@ async fn enroll_probe_handler(
     }))
 }
 
+// ---- GET /probes/enrolled ---------------------------------------------------
+
+/// Every currently-enrolled board — pure read of `embarch-topology`'s own
+/// storage, no hardware touched, no `hw_lock` needed (same posture as
+/// `/dev-bench/port`'s enumeration below). Added alongside the `/enroll`
+/// static UI page so it has something to show without a human needing to
+/// run `embarch-topology list` in a separate terminal.
+async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::hardware::EnrolledBoard>>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(embarch_topology::hardware::list_enrolled)
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)
+        .map(Json)
+}
+
 // ---- GET /dev-bench/port ----------------------------------------------------
 
 /// Which serial port `embarch-dev-bench` is on
@@ -672,5 +702,63 @@ mod tests {
         let err = parse_base_address("not-a-number").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("not-a-number"));
+    }
+
+    // ---- build_router's public/protected split (`/enroll`'s auth exemption) ----
+    //
+    // `/enroll`'s own page has nothing secret in it, but everything it
+    // calls (`/status`, `/probes/enrolled`, `/probes/enroll`) must stay
+    // exactly as protected as before — these tests exist so that boundary
+    // is verified, not just eyeballed at the `build_router` call site.
+
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    fn test_router() -> Router {
+        build_router(AppState::new("test-token".to_string()))
+    }
+
+    #[tokio::test]
+    async fn enroll_page_is_reachable_with_no_authorization_header_at_all() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/enroll").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("Enroll the currently-attached probe"));
+    }
+
+    #[tokio::test]
+    async fn status_still_requires_the_bearer_token_after_the_router_split() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn probes_enrolled_still_requires_the_bearer_token_after_the_router_split() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/probes/enrolled").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_succeeds_with_the_correct_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
