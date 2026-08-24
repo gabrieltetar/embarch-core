@@ -94,15 +94,21 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
-      # Unverified: `cross` builds inside a Docker container and needs to see
-      # the sibling `../embarch-study-designer`/`../embarch-topology`
-      # checkouts, not just this crate's own directory. Newer `cross`
-      # versions detect a Cargo workspace via `cargo metadata` and mount
-      # enough of the filesystem to cover path dependencies outside the
-      # crate root, but this hasn't been confirmed against a real run on
-      # this exact layout — flagging rather than silently assuming it works
-      # (this repo's own `embarch-dev-workflow.md`-style "don't claim
-      # verified without a real run" posture).
+      # `cross` builds inside a Docker container and needs to see the
+      # sibling `../embarch-study-designer`/`../embarch-topology` checkouts,
+      # not just this crate's own directory. Confirmed via cross-rs's own
+      # docs/history (2026-08-24, no Docker available in this dev sandbox to
+      # run it for real): cross-rs/cross#684 (merged, shipped v0.2.2+, this
+      # workflow's `taiki-e/install-action@v2` installs a current release)
+      # auto-mounts any path dependency `cargo metadata` can see — no formal
+      # `[workspace]` required, just a plain `path = "../..."` dependency,
+      # exactly this repo's `Cargo.toml`. **Still not confirmed by an actual
+      # tagged-release CI run on this real layout** — that's the only way to
+      # be fully certain (`embarch-dev-workflow.md`-style "don't claim
+      # verified without a real run" posture) — but the theoretical doubt
+      # this comment used to flag is resolved; a real release run is the
+      # remaining, much cheaper-to-clear step, not an open question about
+      # whether the mechanism exists at all.
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
