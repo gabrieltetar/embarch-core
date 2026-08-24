@@ -18,8 +18,10 @@ fn manager() -> Result<Box<dyn ServiceManager>> {
 }
 
 /// Register embarch-core as a background OS service (pointing back at this
-/// same binary with the `run` subcommand) and start it.
-pub fn install() -> Result<()> {
+/// same binary with the `run` subcommand, `--bind` baked into the registered
+/// start command so it survives reboots without anyone having to re-run
+/// this) and start it.
+pub fn install(bind: &str) -> Result<()> {
     elevate::ensure_elevated_or_fallback()?;
 
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
@@ -41,7 +43,7 @@ pub fn install() -> Result<()> {
     mgr.install(ServiceInstallCtx {
         label: label.clone(),
         program: exe,
-        args: vec![OsString::from("run")],
+        args: vec![OsString::from("run"), OsString::from("--bind"), OsString::from(bind)],
         contents: None,
         username: None,
         working_directory: None,
@@ -253,7 +255,7 @@ fn backup_path(exe: &Path) -> PathBuf {
 #[cfg(windows)]
 pub mod windows {
     use std::ffi::OsString;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use windows_service::service::{
@@ -267,6 +269,15 @@ pub mod windows {
 
     define_windows_service!(ffi_service_main, service_main);
 
+    /// Stashes `try_dispatch`'s `bind`/`port` for `run_service` to read.
+    /// Needed only because `define_windows_service!` fixes `service_main`'s
+    /// signature (`Vec<OsString>`, `service_main`'s own `_arguments` is SCM's
+    /// copy of them, not exposed in a form worth re-parsing) — a `OnceLock`
+    /// set immediately before `service_dispatcher::start` is the standard way
+    /// around that, not a real global-mutable-state concern (single-writer,
+    /// before the one reader can possibly run).
+    static BIND_PORT: OnceLock<(String, u16)> = OnceLock::new();
+
     /// `Some(result)` when this process really was launched by SCM: blocks
     /// for the service's whole lifetime, then returns how it exited. `None`
     /// when it wasn't — a human running `embarch-core.exe run` directly at a
@@ -274,7 +285,18 @@ pub mod windows {
     /// `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` (raw OS error 1063) from
     /// `StartServiceCtrlDispatcherW`, the one failure this treats as "not
     /// SCM" rather than a real error to report.
-    pub fn try_dispatch() -> Option<anyhow::Result<()>> {
+    ///
+    /// `bind`/`port` are `Command::Run`'s own already-parsed values — the
+    /// same ones a non-Windows `run()` call gets — not re-derived here.
+    /// **Real bug this fixed, 2026-08-24:** `run_service` used to hardcode
+    /// `"0.0.0.0"`/`DEFAULT_PORT` directly, silently discarding whatever
+    /// `--bind`/`--port` the service was actually registered with (this
+    /// crate's own `service::install`, and by extension every topology
+    /// `embarch-umbrella setup` might pass) — the live Windows Core has been
+    /// binding `0.0.0.0` unconditionally the whole time, decision 6's
+    /// loopback-default amendment notwithstanding.
+    pub fn try_dispatch(bind: String, port: u16) -> Option<anyhow::Result<()>> {
+        let _ = BIND_PORT.set((bind, port)); // can't fail: single call site, before the dispatcher's own thread starts
         match service_dispatcher::start(SERVICE_LABEL, ffi_service_main) {
             Ok(()) => Some(Ok(())),
             Err(WsError::Winapi(e)) if e.raw_os_error() == Some(1063) => None,
@@ -327,19 +349,25 @@ pub mod windows {
         // for — everything before this line has to stay fast.
         status_handle.set_service_status(service_status(ServiceState::Running, ServiceExitCode::Win32(0)))?;
 
+        // `try_dispatch` stashed `Command::Run`'s own already-parsed
+        // `bind`/`port` in `BIND_PORT` immediately before starting this
+        // dispatcher — falling back to the same defaults `main.rs` itself
+        // uses is only a safety net for a call path that shouldn't exist
+        // (`service_main` only ever runs after `try_dispatch` set it).
+        let (bind, port) = BIND_PORT
+            .get()
+            .cloned()
+            .unwrap_or_else(|| (crate::DEFAULT_BIND.to_string(), crate::DEFAULT_PORT));
+
         // A fresh runtime, not a nested one: `try_dispatch` is called from
         // plain (non-async) `main`, before any Tokio runtime exists, so
         // there's nothing to nest inside. `crate::build_runtime` (not a bare
         // `Runtime::new()`) — see its own doc comment: this exact path is
         // where the real, `--release`, production `STATUS_STACK_OVERFLOW`
         // crash happened.
-        let result = crate::build_runtime()?.block_on(crate::serve(
-            "0.0.0.0".to_string(),
-            crate::DEFAULT_PORT,
-            async {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        let result = crate::build_runtime()?.block_on(crate::serve(bind, port, async {
+            let _ = shutdown_rx.await;
+        }));
 
         status_handle.set_service_status(service_status(
             ServiceState::Stopped,

@@ -15,10 +15,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-/// Shared with `service::windows`, which has no CLI args of its own to read
-/// a `--port` from (SCM launches the installed service with just `run`, no
-/// flags) — one constant instead of two places that could disagree.
+/// Shared with `service::windows`'s fallback (`run_service` uses this only if
+/// `BIND_PORT` was somehow never set — a call path that shouldn't exist in
+/// practice, since `try_dispatch` always sets it first) — one constant
+/// instead of two places that could disagree.
 pub(crate) const DEFAULT_PORT: u16 = 4884;
+
+/// Loopback-only (design.md §3 decision 6's amendment, 2026-08-15): reachable
+/// only from processes on this same machine unless something explicitly
+/// widens it. Shared between `Run`'s and `Install`'s own `--bind` flags so
+/// they can't drift apart.
+pub(crate) const DEFAULT_BIND: &str = "127.0.0.1";
 
 /// Filename prefix for the daily-rolling log file (§3 decision 16,
 /// `embarch-core/design.md`) — shared between `init_tracing`, which sets the
@@ -47,16 +54,28 @@ enum Command {
     /// launched this process as a service in the first place (a human at a
     /// console, same as everywhere else) — see `service::windows`.
     Run {
-        /// Bind address. Use 0.0.0.0 (the default) so this is reachable
-        /// from WSL2 or a LAN, not just from processes on this same box.
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Bind address. Loopback-only by default (design.md §3 decision 6's
+        /// amendment) — reachable only from this same machine unless widened
+        /// explicitly. `embarch-umbrella setup` passes an explicit `--bind`
+        /// to `install` for the one topology (WSL2⟷Windows, or a genuinely
+        /// remote Core) that actually needs a wider address.
+        #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
     /// Install embarch-core as a background OS service (Windows Service
     /// via sc.exe, or systemd on Linux) and start it immediately.
-    Install,
+    Install {
+        /// Bind address the installed service runs with — baked into its
+        /// registered start command (survives reboots without umbrella
+        /// having to re-run this), not just this one invocation. Same
+        /// loopback-only default as `run`; `embarch-umbrella setup` passes
+        /// `recommended_bind_address(TopologyClass)`'s answer explicitly for
+        /// wsl-host/remote (design.md §3 decision 6's amendment).
+        #[arg(long, default_value = DEFAULT_BIND)]
+        bind: String,
+    },
     /// Stop and remove the background OS service.
     Uninstall,
     /// Start the already-installed background service. Separate from
@@ -136,14 +155,14 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run { bind, port } => {
             #[cfg(windows)]
-            if let Some(result) = service::windows::try_dispatch() {
+            if let Some(result) = service::windows::try_dispatch(bind.clone(), port) {
                 return result;
             }
             build_runtime()?.block_on(run(bind, port))?;
         }
-        Command::Install => {
-            service::install()?;
-            println!("embarch-core installed and started as a background service.");
+        Command::Install { bind } => {
+            service::install(&bind)?;
+            println!("embarch-core installed and started as a background service, bound to {bind}.");
         }
         Command::Uninstall => {
             service::uninstall()?;
