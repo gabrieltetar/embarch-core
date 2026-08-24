@@ -2,7 +2,7 @@ use axum::{
     extract::{FromRequest, Json, Multipart, Query, Request, State},
     http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -78,6 +78,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enroll", post(enroll_probe_handler))
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
+        .route("/validate", post(validate_handler))
+        .route("/alerts", get(alerts_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
@@ -567,6 +569,140 @@ async fn dev_bench_port_handler(
     }
 }
 
+// ---- POST /validate ---------------------------------------------------
+
+/// Explicit, non-destructive live re-check of an already-enrolled board's
+/// identity (`embarch_topology::hardware::validate_role`, design.md §3
+/// decision 28) — the exact same check `flash`/`reset`/the dev-bench
+/// handshake already run mid-attach (decisions 8, 22), callable on its own,
+/// any time, without an actual `flash`/`reset`/`run_study` call to trigger
+/// it. Takes `hw_lock` like `/flash`/`/reset` — it opens the same physical
+/// probe connection those do, and shouldn't be allowed to race either.
+#[derive(Deserialize)]
+struct ValidateRequest {
+    role: String,
+}
+
+#[derive(Serialize)]
+struct ValidateOkResponse {
+    ok: bool,
+    role: String,
+    probe_serial: String,
+    chip: String,
+    hardware_id: String,
+    confirmed_at_utc_ms: u64,
+}
+
+/// Mirrors `embarch_topology::hardware::TopologyMismatch`'s fields — a
+/// separate response type, rather than serializing that struct directly, so
+/// this endpoint's own JSON contract doesn't silently shift if that crate's
+/// internal error type ever gains/renames a field (`EnrollProbeResponse`'s
+/// own precedent for the same reasoning against `EnrolledBoard`).
+#[derive(Serialize)]
+struct ValidateMismatchResponse {
+    ok: bool,
+    role: String,
+    probe_serial: String,
+    chip: String,
+    recorded_hardware_id: String,
+    live_hardware_id: Option<String>,
+    reason: String,
+    fix_it_url: String,
+}
+
+async fn validate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ValidateRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let _guard = state.hw_lock.lock().await;
+    let role = req.role;
+
+    let result = tokio::task::spawn_blocking(move || embarch_topology::hardware::validate_role(&role))
+        .await
+        .map_err(internal_err)?;
+
+    match result {
+        Ok(board) => Ok((
+            StatusCode::OK,
+            Json(ValidateOkResponse {
+                ok: true,
+                role: board.role,
+                probe_serial: board.probe_serial,
+                chip: board.chip,
+                hardware_id: board.hardware_id,
+                confirmed_at_utc_ms: board.confirmed_at_utc_ms,
+            }),
+        )
+            .into_response()),
+        Err(e) => {
+            // A topology mismatch is an expected, structured outcome of a
+            // non-destructive check — not a Core failure — so it's a `409
+            // Conflict` (matching `/study`'s own use of that status for "a
+            // real, named condition the caller can act on"), with the full
+            // structured fields as its JSON body, never collapsed into
+            // plain-text `500` prose the way an unrelated I/O error still is
+            // below.
+            if let Some(m) = e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
+                let msg = format!("{e:?}");
+                tracing::info!("{msg}");
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(ValidateMismatchResponse {
+                        ok: false,
+                        role: m.role.clone(),
+                        probe_serial: m.probe_serial.clone(),
+                        chip: m.chip.clone(),
+                        recorded_hardware_id: m.recorded_hardware_id.clone(),
+                        live_hardware_id: m.live_hardware_id.clone(),
+                        reason: m.reason.clone(),
+                        fix_it_url: m.fix_it_url.clone(),
+                    }),
+                )
+                    .into_response());
+            }
+            // No board enrolled under this role yet — an ordinary "not
+            // configured" state (design.md §3 decision 7), not a Core
+            // failure — `404`, matching `/dev-bench/port`'s own "unplugged
+            // bench" posture.
+            if e.downcast_ref::<embarch_topology::hardware::NotEnrolled>().is_some() {
+                let msg = format!("{e:?}");
+                tracing::info!("{msg}");
+                return Err((StatusCode::NOT_FOUND, msg));
+            }
+            Err(internal_err(e))
+        }
+    }
+}
+
+// ---- GET /alerts --------------------------------------------------------
+
+/// Recent topology-mismatch alerts from `embarch-topology`'s durable log
+/// (`embarch_topology::hardware::recent_alerts`, design.md §3 decision 28) —
+/// what a human (or an agent, after a `409` from `/validate` above) checks
+/// to see the full mismatch history, not just the one that just happened.
+/// Pure read of a local file, no hardware touched — no `hw_lock`, same
+/// posture as `/probes/enrolled`/`/dev-bench/port`'s enumeration.
+#[derive(Deserialize)]
+struct AlertsQuery {
+    #[serde(default = "default_alerts_limit")]
+    limit: usize,
+}
+
+fn default_alerts_limit() -> usize {
+    20
+}
+
+async fn alerts_handler(
+    Query(q): Query<AlertsQuery>,
+) -> Result<Json<Vec<embarch_topology::hardware::Alert>>, (StatusCode, String)> {
+    let limit = q.limit;
+    tokio::task::spawn_blocking(move || embarch_topology::hardware::recent_alerts(limit))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)
+        .map(Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +937,31 @@ mod tests {
                     .body(axum::body::Body::from(r#"{"serial":"abc"}"#))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn validate_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"role":"dut"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn alerts_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/alerts").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
