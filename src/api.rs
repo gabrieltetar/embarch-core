@@ -77,6 +77,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/resolve-chip", post(resolve_chip_handler))
         .route("/probes/enroll", post(enroll_probe_handler))
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
+        .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
@@ -505,6 +506,38 @@ async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::har
         .map(Json)
 }
 
+// ---- POST /dev-bench/link ---------------------------------------------------
+
+/// Declares dev-bench's runtime-link USB serial
+/// (`embarch_topology::hardware::set_dev_bench_link_port_serial`) — a second
+/// fact from its JTAG probe's own serial, needed once dev-bench's link and
+/// its JTAG probe are different physical USB devices (a Silabs UART bridge
+/// vs. a SEGGER probe, `embarch-topology/design.md` §3's `port.rs` doc
+/// comment). No probe-rs attach happens here — it's a plain enrollment-file
+/// write, same class of operation as `/probes/enroll`, so it takes the same
+/// `hw_lock` to avoid racing it rather than because it touches hardware
+/// itself. dev-bench must already be enrolled via `/probes/enroll` first —
+/// this only ever amends that existing row.
+#[derive(Deserialize)]
+struct SetDevBenchLinkRequest {
+    serial: String,
+}
+
+async fn set_dev_bench_link_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SetDevBenchLinkRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = state.hw_lock.lock().await;
+    let serial = req.serial;
+
+    tokio::task::spawn_blocking(move || embarch_topology::hardware::set_dev_bench_link_port_serial(&serial))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---- GET /dev-bench/port ----------------------------------------------------
 
 /// Which serial port `embarch-dev-bench` is on
@@ -752,6 +785,22 @@ mod tests {
     async fn probes_enrolled_still_requires_the_bearer_token_after_the_router_split() {
         let response = test_router()
             .oneshot(Request::builder().uri("/probes/enrolled").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dev_bench_link_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dev-bench/link")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"serial":"abc"}"#))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
