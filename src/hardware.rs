@@ -167,7 +167,8 @@ pub fn flash(
     let gated_serial = resolved_serial(probe_serial)?;
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this flash")?;
-    let probe = open_probe(probe_serial)?;
+    let mut probe = open_probe(probe_serial)?;
+    embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
 
     let mut session = probe
         .attach(chip, Permissions::default())
@@ -229,6 +230,7 @@ pub fn reset(chip: &str, probe_serial: Option<&str>) -> Result<()> {
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this reset")?;
     let mut probe = open_probe(probe_serial)?;
+    embarch_topology::hardware::check_target_powered(&mut probe).context("can't reset")?;
 
     match probe.target_reset() {
         Ok(()) => {
