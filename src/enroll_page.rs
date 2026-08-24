@@ -62,6 +62,11 @@ const PAGE: &str = r#"<!doctype html>
     text-align: center; cursor: pointer;
   }
   .drop-zone.dragover { border-color: #06c; background: #eef6ff; }
+  .drop-zone.highlight { animation: highlight-pulse 1.5s ease-in-out 3; }
+  @keyframes highlight-pulse {
+    0%, 100% { border-color: #aaa; box-shadow: none; }
+    50% { border-color: #06c; box-shadow: 0 0 0 4px #eef6ff; }
+  }
   .drop-zone h3 { margin: 0 0 0.4rem 0; }
   #assign-dialog {
     display: none; position: fixed; top: 30%; left: 50%; transform: translateX(-50%);
@@ -265,6 +270,22 @@ for (const zone of document.querySelectorAll(".drop-zone")) {
   zone.addEventListener("click", () => {
     if (selectedSerial) openAssignDialog(selectedSerial, zone.dataset.role);
   });
+}
+
+// `?role=<role>` pre-fill (embarch-topology's own UI links here with it
+// from a per-alert "re-enroll this board" action, `milestone-1.md` item 6):
+// highlight and scroll to the matching drop zone so a human landing from
+// that link immediately sees which physical role needs attention. Read
+// client-side, not via a server-side query extractor — this whole page is
+// one static `&'static str` response, so there's no per-request Rust code
+// to thread a query param through in the first place.
+const highlightRole = new URLSearchParams(location.search).get("role");
+if (highlightRole) {
+  const zone = document.querySelector('.drop-zone[data-role="' + highlightRole.replace(/"/g, "") + '"]');
+  if (zone) {
+    zone.classList.add("highlight");
+    zone.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
 }
 
 document.getElementById("token-input").value = getToken();
