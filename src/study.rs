@@ -22,7 +22,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
-    steps_crc, DevBenchMessage, Sample, StepResult, StreamChannel, Study, STUDY_DESIGNER_SCHEMA_VERSION,
+    samples_in, steps_crc, validate_taps, DevBenchMessage, GattTranscriptEntry, Sample, StepResult,
+    StreamEncoding, StreamSource, StreamTap, Study,
+    STUDY_DESIGNER_SCHEMA_VERSION,
 };
 
 use crate::api::{internal_err, AppState};
@@ -123,7 +125,18 @@ pub enum StudyEvent {
     /// it off the wire — the same samples [`write_sample`] is appending to
     /// `data.csv`/`waveform.csv` in the same pass, not held back until the
     /// step or study finishes.
-    SampleBatch { study_id: String, step_index: u32, channel: StreamChannel, samples: Vec<Sample> },
+    ///
+    /// Keyed by the tap that produced them (`stream_id` is its index in
+    /// `Study.streams`, `stream_name` its declared name) rather than by the
+    /// retired `StreamChannel` — `embarch-study-designer/design.md` §3
+    /// decision 39.
+    SampleBatch { study_id: String, stream_id: u8, stream_name: String, samples: Vec<Sample> },
+    /// One GATT transcript entry, pushed the instant Core decodes it off the
+    /// wire — the same entry [`write_transcript_entry`] is appending to
+    /// `gatt.csv` in the same pass (`embarch-study-designer/design.md` §3
+    /// decision 36). Boxed for the same reason `StepCompleted` is: a
+    /// `MAX_PAYLOAD_LEN` payload would otherwise set this whole enum's size.
+    GattTranscript { study_id: String, step_index: u32, entry: Box<GattTranscriptEntry> },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
 }
@@ -145,6 +158,22 @@ fn validate_study(study: &Study) -> Result<(), String> {
             ));
         }
     }
+
+    // design.md §3 decision 39/§4.8's own pre-flight rules — id-is-index,
+    // no blank/duplicate/reserved name, no step range that could never open.
+    // Computed by the crate, not restated here, so Core holds no second copy
+    // of the rules to drift from.
+    validate_taps(&study.streams, study.steps.len() as u32).map_err(|e| e.to_string())?;
+
+    // `embarch-study-designer/design.md` §3 decision 40: both requirements
+    // are mandatory and `"any"` is an explicit legal value, so a *blank* one
+    // is the nobody-thought-about-it case and is rejected here. An omitted
+    // one never reaches this function at all — `Study.requires` has no serde
+    // default, so it fails to deserialize.
+    //
+    // Comparing them against what is actually on the bench is a different
+    // thing and is not done here (Milestone 7 Phase B's version gate).
+    study.requires.validate().map_err(|e| e.to_string())?;
 
     let recomputed = steps_crc(&study.steps)
         .map_err(|_| "failed to recompute steps_crc (a step's encoding is unexpectedly large)".to_string())?;
@@ -424,8 +453,18 @@ pub async fn post_study_handler(
 
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
+    let streams = study.streams.clone();
     let link = match tokio::task::spawn_blocking(move || {
-        link.send(&DevBenchMessage::StudyStart { steps, steps_crc: steps_crc_value })
+        // `streams` rides along; `validations` and `requires` deliberately
+        // do not (`embarch-study-designer/design.md` §3 decisions 17, 39,
+        // 40) — dev-bench has to know which taps to open and which `id`
+        // each answers to, and has nothing to do with either of the other
+        // two.
+        link.send(&DevBenchMessage::StudyStart {
+            steps,
+            steps_crc: steps_crc_value,
+            streams,
+        })
             .map(|_| link)
     })
     .await
@@ -529,7 +568,11 @@ fn run_study_to_completion(
         }
     };
 
-    let mut current_stream: Option<(u32, StreamChannel)> = None;
+    // Which taps dev-bench currently has open, by `StreamTap.id`. Purely
+    // for reporting a chunk that arrives outside its own open window —
+    // routing a chunk needs only the tap's declared encoding, which is in
+    // the submitted `Study` and can't drift.
+    let mut open_taps: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let mut next_expected: usize = 0;
     let mut deadline = next_deadline(&study, next_expected, Instant::now());
 
@@ -559,40 +602,83 @@ fn run_study_to_completion(
                 finish_job(&jobs, &events_tx, &study_id, writer);
                 return;
             }
-            Ok(Some(DevBenchMessage::StreamStart { step_index, channel })) => {
-                current_stream = Some((step_index, channel));
-            }
-            Ok(Some(DevBenchMessage::StreamEnd { step_index, channel })) => {
-                if current_stream == Some((step_index, channel)) {
-                    current_stream = None;
+            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&study, id) {
+                Some(tap) => {
+                    tracing::info!(study_id, id, name = tap.name.as_str(), "stream tap opened");
+                    open_taps.insert(id);
+                }
+                None => tracing::warn!(
+                    study_id,
+                    id,
+                    "dev-bench opened a stream id this study never declared; ignoring it"
+                ),
+            },
+            Ok(Some(DevBenchMessage::StreamClose { id, dropped })) => {
+                open_taps.remove(&id);
+                let name = tap_for(&study, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
+                if dropped > 0 {
+                    // A capture that lost data must say so rather than be
+                    // read as complete — `embarch-study-designer/design.md`
+                    // §4.8's whole reason for carrying `dropped` on close.
+                    tracing::warn!(
+                        study_id,
+                        id,
+                        name,
+                        dropped,
+                        "stream tap closed having DROPPED records; this capture is not complete"
+                    );
+                } else {
+                    tracing::info!(study_id, id, name, "stream tap closed");
                 }
             }
-            Ok(Some(DevBenchMessage::StreamChunk { sample })) => {
-                write_sample(&results_dir, &study, current_stream, sample);
-                broadcast_sample_batch(&events_tx, &study_id, current_stream, &[sample]);
-            }
-            Ok(Some(DevBenchMessage::StreamChunkBatch {
-                base_utc_ms,
-                sample_interval_ms,
-                unit,
-                channel_id,
-                values,
-            })) => {
-                let mut samples = Vec::with_capacity(values.len());
-                for (i, value) in values.iter().enumerate() {
-                    let sample = Sample {
-                        rx_utc_ms: base_utc_ms + (i as u64) * (sample_interval_ms as u64),
-                        value: *value,
-                        unit,
-                        channel_id,
-                    };
-                    write_sample(&results_dir, &study, current_stream, sample);
-                    samples.push(sample);
+            Ok(Some(DevBenchMessage::StreamChunkBatch { id, records })) => {
+                let Some(tap) = tap_for(&study, id).cloned() else {
+                    tracing::warn!(
+                        study_id,
+                        id,
+                        "received stream bytes for an id this study never declared; dropping them"
+                    );
+                    continue;
+                };
+                if !open_taps.contains(&id) {
+                    tracing::warn!(
+                        study_id,
+                        id,
+                        name = tap.name.as_str(),
+                        "received stream bytes outside this tap's own open window; keeping them"
+                    );
                 }
-                broadcast_sample_batch(&events_tx, &study_id, current_stream, &samples);
+                for record in records.iter() {
+                    write_stream_record(
+                        &results_dir,
+                        &study,
+                        &tap,
+                        record,
+                        &study_id,
+                        &events_tx,
+                        next_expected.saturating_sub(1) as u32,
+                    );
+                }
             }
             Ok(Some(DevBenchMessage::LogLine { text })) => {
-                tracing::debug!(study_id, "dev-bench: {text}");
+                // `info!`, not `debug!`, for the ordinary case. dev-bench
+                // never chatters on this channel -- every LogLine is the
+                // firmware deliberately choosing to tell the host something
+                // it can't express as a step `Outcome` (a truncated
+                // transcript, a link RX overrun, the per-advertiser detail
+                // behind a failed BLE name match). At `debug` all of that
+                // was invisible against a service running at the default
+                // level, which is how a scan diagnostic that was being sent
+                // correctly looked like it wasn't being sent at all.
+                //
+                // Still `warn!` for a truncated transcript specifically: a
+                // capture silently claiming to be exhaustive when it isn't
+                // is exactly what decision 36 exists to prevent.
+                if text.contains("NOT exhaustive") {
+                    tracing::warn!(study_id, "dev-bench: {text}");
+                } else {
+                    tracing::info!(study_id, "dev-bench: {text}");
+                }
             }
             Ok(Some(other)) => {
                 // Hello/HelloAck/StudyStart are Core->dev-bench (or
@@ -620,50 +706,118 @@ fn run_study_to_completion(
     }
 }
 
-/// Broadcasts one batch of samples the instant they're decoded off the wire
-/// — a no-op (not an error) if `current_stream` is `None`, matching
-/// `write_sample`'s own "drop it, log it" posture for a sample with no open
-/// `StreamStart`.
-fn broadcast_sample_batch(
-    events_tx: &broadcast::Sender<StudyEvent>,
-    study_id: &str,
-    current_stream: Option<(u32, StreamChannel)>,
-    samples: &[Sample],
-) {
-    let Some((step_index, channel)) = current_stream else { return };
-    let _ = events_tx.send(StudyEvent::SampleBatch {
-        study_id: study_id.to_string(),
-        step_index,
-        channel,
-        samples: samples.to_vec(),
-    });
+/// The declared tap `id` refers to, or `None` if the study never declared it.
+/// `id` is the tap's own index in `Study.streams`
+/// (`embarch-study-designer/design.md` §4.8), enforced by that crate's
+/// `validate_taps` at submission, so this is a bounds-checked index rather
+/// than a search.
+fn tap_for(study: &Study, id: u8) -> Option<&StreamTap> {
+    study.streams.get(usize::from(id)).filter(|tap| tap.id == id)
 }
 
-/// Decodes one `Sample` onto whichever of `data.csv` (`Power`) or
-/// `waveform.csv` (`SensorWaveform`) its currently-open stream belongs to,
-/// appending `core_rx_utc_ms` (Core's own receipt-time wall clock, decision
-/// 30) as an extra column beyond what `Sample::to_csv_row` already renders.
-fn write_sample(results_dir: &FsPath, study: &Study, current_stream: Option<(u32, StreamChannel)>, sample: Sample) {
-    let Some((step_index, channel)) = current_stream else {
-        tracing::warn!("received a stream sample with no open StreamStart; dropping it");
-        return;
-    };
-    let Some(step) = study.steps.get(step_index as usize) else {
-        tracing::warn!("received a stream sample for out-of-range step_index {step_index}; dropping it");
-        return;
-    };
-    let Some(row) = sample.to_csv_row(step.name.as_str()) else {
+/// Writes one arrival-stamped record to whatever its tap's **declared**
+/// encoding says it is (`embarch-study-designer/design.md` §3 decision 39,
+/// §4.8) — the one place a stream payload acquires a meaning, and always
+/// because an engineer said so, never because Core inferred it.
+///
+/// **Interim file mapping, replaced in Milestone 7 Phase B.** Decisions 30/31
+/// (`embarch-core/design.md`) put every capture under
+/// `study_results/<id>/streams/<name>`, with the raw bytes always written
+/// before any decode is attempted. That is not built yet, so this keeps
+/// today's three fixed CSV paths — which are also what `GET
+/// /study/{id}/power-data`, `/waveform-data` and `/gatt-data` still serve —
+/// and picks between them from the tap's declared encoding and source. A tap
+/// whose encoding has no CSV form yet (`Raw`, `Text`, `OutpostTrace`) has
+/// nowhere to land until `streams/` exists, and says so rather than being
+/// silently discarded.
+#[allow(clippy::too_many_arguments)]
+fn write_stream_record(
+    results_dir: &FsPath,
+    study: &Study,
+    tap: &StreamTap,
+    record: &embarch_study_designer::StreamRecord,
+    study_id: &str,
+    events_tx: &broadcast::Sender<StudyEvent>,
+    current_step: u32,
+) {
+    match tap.encoding {
+        StreamEncoding::Samples { layout, unit, channel_id } => {
+            let sample_hz = match tap.source {
+                StreamSource::PowerFrontEnd { sample_hz } => Some(sample_hz),
+                _ => None,
+            };
+            let filename = if matches!(tap.source, StreamSource::PowerFrontEnd { .. }) {
+                "data.csv"
+            } else {
+                "waveform.csv"
+            };
+            let samples: Vec<Sample> =
+                samples_in(record, layout, unit, channel_id, sample_hz).collect();
+            for sample in &samples {
+                write_sample(results_dir, study, current_step, filename, *sample);
+            }
+            let _ = events_tx.send(StudyEvent::SampleBatch {
+                study_id: study_id.to_string(),
+                stream_id: tap.id,
+                stream_name: tap.name.as_str().to_string(),
+                samples,
+            });
+        }
+        StreamEncoding::GattTranscript => {
+            // The record's bytes are one postcard-encoded
+            // `GattTranscriptEntry`. `step_index` is whichever step is open
+            // when it arrives, which is what decision 36 defined that column
+            // to mean; the generic record carries no step of its own.
+            match postcard::from_bytes::<GattTranscriptEntry>(&record.bytes) {
+                Ok(entry) => {
+                    write_transcript_entry(results_dir, study, current_step, &entry);
+                    let _ = events_tx.send(StudyEvent::GattTranscript {
+                        study_id: study_id.to_string(),
+                        step_index: current_step,
+                        entry: Box::new(entry),
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    study_id,
+                    name = tap.name.as_str(),
+                    "a record on a GattTranscript-encoded tap didn't decode as an entry: {e:?}"
+                ),
+            }
+        }
+        StreamEncoding::Raw | StreamEncoding::Text | StreamEncoding::OutpostTrace { .. } => {
+            tracing::warn!(
+                study_id,
+                name = tap.name.as_str(),
+                bytes = record.bytes.len(),
+                "dropping stream bytes: this encoding lands in study_results/<id>/streams/,                  which Milestone 7 Phase B builds (embarch-core/design.md decisions 30/31)"
+            );
+        }
+    }
+}
+
+/// Appends one decoded `Sample` to `filename`, labelled with whichever step
+/// was open when its record arrived, plus `core_rx_utc_ms` (Core's own
+/// receipt-time wall clock, decision 30) as an extra column beyond what
+/// `Sample::to_csv_row` already renders. The row shape itself lives entirely
+/// in `embarch-study-designer` and is unchanged by the tap reshape.
+fn write_sample(
+    results_dir: &FsPath,
+    study: &Study,
+    step_index: u32,
+    filename: &str,
+    sample: Sample,
+) {
+    // An out-of-range step index labels the row with an empty step name
+    // rather than dropping a real sample — the same trade
+    // `write_transcript_entry` already makes for a transcript entry.
+    let step_name = study.steps.get(step_index as usize).map(|s| s.name.as_str()).unwrap_or("");
+    let Some(row) = sample.to_csv_row(step_name) else {
         tracing::warn!(
-            "step name '{}' doesn't fit alongside the rest of a CSV row; dropping this sample",
-            step.name
+            "step name '{step_name}' doesn't fit alongside the rest of a CSV row; dropping this sample"
         );
         return;
     };
 
-    let filename = match channel {
-        StreamChannel::Power => "data.csv",
-        StreamChannel::SensorWaveform => "waveform.csv",
-    };
     let path = results_dir.join(filename);
     let is_new = !path.exists();
 
@@ -674,6 +828,55 @@ fn write_sample(results_dir: &FsPath, study: &Study, current_stream: Option<(u32
                     tracing::error!("failed to write header to {}: {e:?}", path.display());
                 }
             }
+            if let Err(e) = writeln!(file, "{row},{}", current_utc_ms()) {
+                tracing::error!("failed to append a row to {}: {e:?}", path.display());
+            }
+        }
+        Err(e) => tracing::error!("failed to open {} for append: {e:?}", path.display()),
+    }
+}
+
+/// Appends one GATT transcript entry to `gatt.csv`
+/// (`embarch-study-designer/design.md` §3 decision 36, §4.3b), the same way
+/// [`write_sample`] appends to `data.csv`/`waveform.csv`: incrementally, as
+/// each entry arrives, so a capture survives a Core crash that writes the
+/// study itself off as `"failed"`.
+///
+/// `step_index` is whichever step was open when the record carrying this
+/// entry arrived (`embarch-study-designer/design.md` §3 decision 36's own
+/// definition of that column) — the generic stream record replacing the
+/// retired `GattTranscriptRecord` carries no step of its own.
+/// An out-of-range `step_index` still
+/// gets written, with an empty `step_name`, rather than dropped: the entry
+/// is real GATT traffic that happened, and losing it because Core couldn't
+/// label it would be the worse trade.
+fn write_transcript_entry(results_dir: &FsPath, study: &Study, step_index: u32, entry: &GattTranscriptEntry) {
+    let step_name = study.steps.get(step_index as usize).map(|s| s.name.as_str()).unwrap_or("");
+
+    let Some(row) = entry.to_csv_row(step_index, step_name) else {
+        tracing::warn!(
+            "a GATT transcript entry for step '{step_name}' doesn't fit in one CSV row; dropping it"
+        );
+        return;
+    };
+
+    let path = results_dir.join("gatt.csv");
+    let is_new = !path.exists();
+
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if is_new {
+                if let Err(e) = writeln!(file, "{},core_rx_utc_ms", GattTranscriptEntry::csv_header())
+                {
+                    tracing::error!("failed to write header to {}: {e:?}", path.display());
+                }
+            }
+            // `core_rx_utc_ms` appended by Core, not by the crate's own
+            // renderer — Core's receipt time, not part of the wire type
+            // (decision 30), same split `write_sample` already uses. It is
+            // also the only wall-clock timestamp on the row today:
+            // `rx_utc_ms` is dev-bench uptime until the clock-resync gap
+            // (design.md §7) closes.
             if let Err(e) = writeln!(file, "{row},{}", current_utc_ms()) {
                 tracing::error!("failed to append a row to {}: {e:?}", path.display());
             }
@@ -878,6 +1081,7 @@ fn event_study_id(event: &StudyEvent) -> &str {
     match event {
         StudyEvent::StepCompleted { study_id, .. }
         | StudyEvent::SampleBatch { study_id, .. }
+        | StudyEvent::GattTranscript { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -890,6 +1094,15 @@ pub async fn power_data_handler(Path(study_id): Path<String>) -> Result<Response
 
 pub async fn waveform_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
     serve_study_csv(&study_id, "waveform.csv", "waveform data").await
+}
+
+/// `embarch-study-designer/design.md` §3 decision 36: the study's whole GATT
+/// transcript, every entry across every step, uncapped — as opposed to
+/// `GET /study/{id}`'s per-step `gatt_activity`, which is a bounded inline
+/// summary. Same served-as-bytes shape as the two above, for the same
+/// reason (Core and its caller aren't guaranteed to share a filesystem).
+pub async fn gatt_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
+    serve_study_csv(&study_id, "gatt.csv", "GATT transcript").await
 }
 
 async fn serve_study_csv(study_id: &str, filename: &str, kind: &str) -> Result<Response, (StatusCode, String)> {
@@ -918,10 +1131,11 @@ mod tests {
     fn step(name: &str, timeout_ms: u32) -> embarch_study_designer::Step {
         embarch_study_designer::Step {
             name: heapless::String::try_from(name).unwrap(),
-            action: Action::BleConnect { role: BleRole::Central, target_address: None },
+            action: Action::BleConnect { role: BleRole::Central, target_address: None , target_name: None },
             timeout_ms,
             power_sample: None,
             continue_on_fail: false,
+            delay_before_ms: 0,
         }
     }
 
@@ -933,10 +1147,81 @@ mod tests {
         let steps_crc_value = steps_crc(&steps).unwrap();
         Study {
             name: heapless::String::try_from("test-study").unwrap(),
+            requires: embarch_study_designer::Requirements::any(),
             steps,
             validations: HVec::new(),
+            streams: HVec::new(),
             steps_crc: steps_crc_value,
         }
+    }
+
+    // ---- write_transcript_entry (design.md §3 decision 36) ----
+
+    fn transcript_entry(payload: &[u8]) -> GattTranscriptEntry {
+        use embarch_study_designer::{GattDirection, GattEventKind, Uuid};
+        GattTranscriptEntry {
+            rx_utc_ms: 4_242,
+            direction: GattDirection::In,
+            kind: GattEventKind::Notification,
+            service_uuid: Uuid::parse("6e400001-b5a3-f393-e0a9-e50e24dcca9e"),
+            characteristic_uuid: Uuid::parse("6e400003-b5a3-f393-e0a9-e50e24dcca9e"),
+            att_status: 0,
+            payload: heapless::Vec::from_slice(payload).unwrap(),
+        }
+    }
+
+    #[test]
+    fn write_transcript_entry_appends_rows_under_one_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_steps(&[1_000, 2_000]);
+
+        write_transcript_entry(dir.path(), &study, 0, &transcript_entry(b"ok\r\n"));
+        write_transcript_entry(dir.path(), &study, 1, &transcript_entry(b"hi"));
+
+        let csv = std::fs::read_to_string(dir.path().join("gatt.csv")).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "expected a header plus two rows, got: {csv}");
+
+        // Header is the crate's, plus the one column Core itself appends
+        // (decision 30) — Core holds no other column knowledge.
+        assert_eq!(
+            lines[0],
+            format!("{},core_rx_utc_ms", GattTranscriptEntry::csv_header())
+        );
+        // Every row must have exactly as many columns as the header, or
+        // every consumer misreads everything past the mismatch.
+        let cols = lines[0].split(',').count();
+        for row in &lines[1..] {
+            assert_eq!(row.split(',').count(), cols, "column count mismatch in: {row}");
+        }
+
+        // The step name is denormalized in from the Study, and the payload
+        // is readable as text without decoding hex by hand — the whole
+        // reason `payload_ascii` exists.
+        assert!(lines[1].contains(",step-0,"), "{}", lines[1]);
+        assert!(lines[1].contains("6f6b0d0a"), "{}", lines[1]);
+        // `,ok..,` not `ends_with(",ok..")` — Core appends its own
+        // core_rx_utc_ms column after the crate's last one.
+        assert!(lines[1].contains(",ok..,"), "{}", lines[1]);
+        assert!(lines[2].contains(",step-1,"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn write_transcript_entry_keeps_an_entry_whose_step_index_is_out_of_range() {
+        // Real GATT traffic Core can't label is still real GATT traffic:
+        // written with an empty step_name rather than dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_steps(&[1_000]);
+
+        write_transcript_entry(dir.path(), &study, 99, &transcript_entry(b"x"));
+
+        let csv = std::fs::read_to_string(dir.path().join("gatt.csv")).unwrap();
+        let row = csv.lines().nth(1).expect("a row was written");
+        assert!(row.starts_with("4242,99,,in,notification,"), "{row}");
+        assert_eq!(
+            row.split(',').count(),
+            csv.lines().next().unwrap().split(',').count()
+        );
     }
 
     // ---- validate_study ----
@@ -1044,8 +1329,6 @@ mod tests {
             step_name: heapless::String::try_from(name).unwrap(),
             outcome: embarch_study_designer::Outcome::Pass,
             captured_data: None,
-            power_samples_ref: None,
-            waveform_ref: None,
             // embarch-study-designer/design.md §3 decisions 31/32 — new
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
@@ -1185,8 +1468,8 @@ mod tests {
             channel_id: 0,
         };
 
-        write_sample(&dir, &study, Some((0, StreamChannel::Power)), sample);
-        write_sample(&dir, &study, Some((0, StreamChannel::Power)), sample);
+        write_sample(&dir, &study, 0, "data.csv", sample);
+        write_sample(&dir, &study, 0, "data.csv", sample);
 
         let contents = std::fs::read_to_string(dir.join("data.csv")).unwrap();
         let mut lines = contents.lines();
@@ -1199,17 +1482,21 @@ mod tests {
     }
 
     #[test]
-    fn write_sample_with_no_open_stream_is_dropped_not_panicked() {
-        let dir = std::env::temp_dir().join(format!("embarch-study-csv-test-nostream-{}", std::process::id()));
+    fn write_sample_for_an_out_of_range_step_is_written_with_an_empty_step_name() {
+        // A real sample that Core simply can't label is still real data.
+        // Dropping it because the label is missing is the worse trade —
+        // the same one `write_transcript_entry` already makes.
+        let dir = std::env::temp_dir().join(format!("embarch-study-csv-test-nostep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let study = study_with_steps(&[1_000]);
         let sample = Sample { rx_utc_ms: 1, value: 1.0, unit: embarch_study_designer::Unit::Raw, channel_id: 0 };
 
-        write_sample(&dir, &study, None, sample);
+        write_sample(&dir, &study, 99, "data.csv", sample);
 
-        assert!(!dir.join("data.csv").exists());
+        let contents = std::fs::read_to_string(dir.join("data.csv")).unwrap();
+        assert!(contents.lines().nth(1).unwrap().starts_with("1,,1,raw,0,"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

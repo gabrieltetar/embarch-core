@@ -82,6 +82,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
+        .route("/study/{study_id}/gatt-data", get(study::gatt_data_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -156,6 +157,13 @@ struct FlashRequest {
     /// now a named `500` rather than a silent, possibly-wrong pick.
     #[serde(default)]
     probe_serial: Option<String>,
+    /// Full chip erase before writing, rather than erasing only the sectors
+    /// the image covers (`hardware::flash`'s own doc comment has why that
+    /// distinction matters). The equivalent of `west flash --erase`.
+    /// Defaults to `false` — the previous behavior, so an existing caller
+    /// that omits it is unaffected.
+    #[serde(default)]
+    erase: bool,
 }
 
 fn default_format() -> String {
@@ -194,6 +202,7 @@ struct FlashArgs {
     format: String,
     base_address: Option<u64>,
     probe_serial: Option<String>,
+    erase: bool,
     _uploaded: Option<tempfile::NamedTempFile>,
 }
 
@@ -234,6 +243,7 @@ async fn flash_handler(
             format: req.format,
             base_address,
             probe_serial: req.probe_serial,
+            erase: req.erase,
             _uploaded: None,
         }
     };
@@ -247,11 +257,13 @@ async fn flash_handler(
         format,
         base_address,
         probe_serial,
+        erase,
         _uploaded,
     } = args;
 
     tokio::task::spawn_blocking(move || {
-        let result = hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref());
+        let result =
+            hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref(), erase);
         drop(_uploaded); // outlives the flash call; dropped (deleted) here, not before
         result
     })
@@ -280,6 +292,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
     let mut format: Option<String> = None;
     let mut base_address_raw: Option<String> = None;
     let mut probe_serial: Option<String> = None;
+    let mut erase_raw: Option<String> = None;
     let mut uploaded: Option<tempfile::NamedTempFile> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(bad_multipart_field)? {
@@ -288,6 +301,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
             Some("format") => format = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("base_address") => base_address_raw = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("probe_serial") => probe_serial = Some(field.text().await.map_err(bad_multipart_field)?),
+            Some("erase") => erase_raw = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("firmware") => {
                 let bytes = field.bytes().await.map_err(bad_multipart_field)?;
                 let mut temp = tempfile::Builder::new()
@@ -318,6 +332,20 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
         format,
         base_address,
         probe_serial,
+        // Accepts the spellings a form actually carries a boolean as; anything
+        // else is a caller error rather than a silent `false`, since silently
+        // *not* erasing is exactly the surprise this field exists to remove.
+        erase: match erase_raw.as_deref().map(str::trim) {
+            None | Some("") => false,
+            Some("true") | Some("1") | Some("yes") => true,
+            Some("false") | Some("0") | Some("no") => false,
+            Some(other) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid erase '{other}' (expected true/false)"),
+                ))
+            }
+        },
         _uploaded: Some(uploaded),
     })
 }

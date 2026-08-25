@@ -156,12 +156,24 @@ fn resolved_serial(probe_serial: Option<&str>) -> Result<String> {
 /// symbols — no `esp_app_desc` symbol, no `.flash.appdesc` section). `bin` at
 /// the same merge address `west flash` would have used is the mechanism that
 /// actually matches what Zephyr already produces.
+/// `erase` requests a **full chip erase** before writing, rather than erasing
+/// only the sectors the image covers (probe-rs's default, and what
+/// `download_file` alone does).
+///
+/// Added 2026-08-25 for the same reason `west flash --erase` exists: a
+/// sector-erase flash leaves every region the new image doesn't cover exactly
+/// as the previous firmware left it. On a Zephyr target that includes
+/// settings/NVS partitions — so BLE bonds, provisioning state, and anything
+/// else persisted by the image being replaced survive into the new one. That
+/// is usually convenient and occasionally the reason a freshly-flashed board
+/// doesn't behave like a fresh board at all.
 pub fn flash(
     chip: &str,
     firmware_path: &Path,
     format: &str,
     base_address: Option<u64>,
     probe_serial: Option<&str>,
+    erase: bool,
 ) -> Result<()> {
     let format = parse_format(format, base_address)?;
     let gated_serial = resolved_serial(probe_serial)?;
@@ -173,6 +185,54 @@ pub fn flash(
     let mut session = probe
         .attach(chip, Permissions::default())
         .with_context(|| format!("failed to attach to target '{chip}'"))?;
+
+    if erase {
+        // Deliberately NOT `DownloadOptions::do_chip_erase` (nor
+        // `flashing::erase_all`, which routes to the same place): both invoke
+        // the flash algorithm's `pc_erase_all` entry point, and on the
+        // nRF54L15 that **leaves the board unbootable**.
+        //
+        // Measured, not theorised, 2026-08-25. Same artifact, same probe, same
+        // reset afterwards, twice each: flashed without erase the DUT came up
+        // and advertised; flashed with `do_chip_erase` it went silent (its
+        // "alive" LED off), and only a `west flash --no-rebuild --erase`
+        // through Nordic's own `nrfutil` runner brought it back. probe-rs
+        // models this target as a single NVM region `0x0..0x180000` and its
+        // nRF54L sequence implements only `debug_device_unlock`, so nothing in
+        // the target description explains it — the chip-erase entry point
+        // itself is what does the damage, and what exactly it clears beyond
+        // the declared region has not been established here.
+        //
+        // Sector-erasing the declared NVM regions gives the semantics anyone
+        // actually wants from `--erase` — leftover state in flash the new
+        // image doesn't cover (a Zephyr settings/NVS partition, so BLE bonds
+        // and provisioning) is gone — without going near `pc_erase_all`.
+        // Ranges are collected first because `session` has to be borrowed
+        // mutably to erase.
+        let nvm_ranges: Vec<(u64, u64)> = session
+            .target()
+            .memory_map
+            .iter()
+            .filter_map(|region| match region {
+                probe_rs::config::MemoryRegion::Nvm(nvm) => Some((nvm.range.start, nvm.range.end)),
+                _ => None,
+            })
+            .collect();
+
+        if nvm_ranges.is_empty() {
+            anyhow::bail!(
+                "erase requested but target '{chip}' declares no NVM region to erase —                  refusing to fall back to a chip erase, which is what bricks some targets"
+            );
+        }
+
+        for (start, end) in nvm_ranges {
+            let mut progress = flashing::FlashProgress::empty();
+
+            flashing::erase(&mut session, &mut progress, start, end, false).with_context(|| {
+                format!("erasing {start:#010x}..{end:#010x} on '{chip}' failed")
+            })?;
+        }
+    }
 
     flashing::download_file(&mut session, firmware_path, format).context("flashing failed")?;
 

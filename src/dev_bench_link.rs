@@ -95,7 +95,7 @@ impl DevBenchLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embarch_study_designer::{StreamChannel, STUDY_DESIGNER_SCHEMA_VERSION};
+    use embarch_study_designer::{StreamRecord, STUDY_DESIGNER_SCHEMA_VERSION};
 
     /// The framing/encoding round trip this module is responsible for —
     /// exercised directly against `postcard`'s COBS helpers, with no serial
@@ -125,12 +125,24 @@ mod tests {
     }
 
     #[test]
-    fn stream_start_and_end_round_trip() {
-        round_trip(&DevBenchMessage::StreamStart { step_index: 3, channel: StreamChannel::Power });
-        round_trip(&DevBenchMessage::StreamEnd {
-            step_index: 3,
-            channel: StreamChannel::SensorWaveform,
-        });
+    fn stream_open_chunk_and_close_round_trip() {
+        // The generic tap trio that replaced StreamStart/StreamChunk/
+        // StreamEnd at schema v8 (`embarch-study-designer/design.md` §3
+        // decision 39). Records carry arrival-stamped bytes, never decoded
+        // values.
+        round_trip(&DevBenchMessage::StreamOpen { id: 3 });
+
+        let mut records: heapless::Vec<StreamRecord, 4> = heapless::Vec::new();
+        records
+            .push(StreamRecord {
+                rx_utc_ms: 1_753_000_000_000,
+                bytes: heapless::Vec::from_slice(b"ok\r\n").unwrap(),
+            })
+            .unwrap();
+        round_trip(&DevBenchMessage::StreamChunkBatch { id: 3, records });
+
+        round_trip(&DevBenchMessage::StreamClose { id: 3, dropped: 0 });
+        round_trip(&DevBenchMessage::StreamClose { id: 3, dropped: 12 });
     }
 
     #[test]
