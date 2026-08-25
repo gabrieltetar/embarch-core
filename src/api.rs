@@ -2,18 +2,21 @@ use axum::{
     extract::{FromRequest, Json, Multipart, Query, Request, State},
     http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
-use crate::{chip_resolve, enroll_page, hardware, serial, study};
+use crate::{chip_resolve, hardware, logs, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -53,21 +56,13 @@ impl AppState {
     }
 }
 
-/// The one deliberately unauthenticated route: `/enroll`'s static HTML/JS
-/// page (§ below). It carries no secrets of its own — every actual API call
-/// its own JavaScript makes (`/status`, `/probes/enrolled`, `/probes/
-/// enroll`) still goes through `auth_middleware` exactly as before, with
-/// the token the page asks a human to paste in once. Kept as its own
-/// unlayered sub-router rather than special-casing a path string inside
-/// `auth_middleware` itself — the exemption is visible right here at the
-/// router-construction call site, not buried in a string comparison deep
-/// inside the auth check every other route also runs through.
-fn public_routes() -> Router<AppState> {
-    Router::new().route("/enroll", get(enroll_page::enroll_page_handler))
-}
-
+/// Every route requires the bearer token — there is no unauthenticated
+/// route left (there used to be exactly one, `GET /enroll`'s static HTML/JS
+/// page; retired 2026-08-24 in favor of `embarch-ui`'s Enroll tab,
+/// `embarch-doc/embarch-ui/milestone-1.md` §4.9 — `POST /probes/enroll`
+/// itself is unaffected and still lives below).
 pub fn build_router(state: AppState) -> Router {
-    let protected = Router::new()
+    Router::new()
         .route("/status", get(status_handler))
         .route("/flash", post(flash_handler))
         .route("/reset", post(reset_handler))
@@ -80,14 +75,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
+        .route("/logs/recent", get(logs_recent_handler))
+        .route("/logs/stream", get(logs_stream_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
-
-    public_routes().merge(protected).with_state(state)
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state)
 }
 
 /// Simple bearer-token check. This is deliberately not OAuth or anything
@@ -703,6 +699,99 @@ async fn alerts_handler(
         .map(Json)
 }
 
+// ---- GET /logs/recent, GET /logs/stream --------------------------------
+//
+// embarch-ui/design.md §3 decision 7 (the Debug tab): backlog-on-open plus
+// a live tail, both mediated through Core rather than embarch-ui ever
+// reading a logfile directly — Core can run on a different machine than
+// whatever's asking (the whole reason `embarch-topology` exists). Both
+// reuse `logs.rs`'s existing daily-rolling-logfile logic (`main.rs`'s own
+// `Logs` CLI subcommand shares it too) rather than a second, size-capped
+// mechanism this decision originally proposed before noticing one already
+// existed.
+
+#[derive(Deserialize)]
+struct LogsRecentQuery {
+    #[serde(default = "default_logs_recent_tail")]
+    tail: usize,
+}
+
+fn default_logs_recent_tail() -> usize {
+    200
+}
+
+#[derive(Serialize)]
+struct LogsRecentResponse {
+    lines: Vec<String>,
+}
+
+/// Backlog on first open — the tail of Core's current daily log file, pure
+/// local read, no hardware touched. `?tail=<n>` (default 200) is the one
+/// knob; no level/component filtering server-side (design.md §5's open
+/// question, resolved this way: the client can filter/color client-side
+/// from the same plain lines `tracing_subscriber`'s own formatter already
+/// produces — reformatting Core's actual log output into structured JSON
+/// just for this would be a real change to a foundational, already-
+/// deployed piece of a live service, not something this decision needs).
+async fn logs_recent_handler(
+    Query(q): Query<LogsRecentQuery>,
+) -> Result<Json<LogsRecentResponse>, (StatusCode, String)> {
+    let tail = q.tail;
+    let lines = tokio::task::spawn_blocking(move || logs::read_recent(tail))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+    Ok(Json(LogsRecentResponse { lines }))
+}
+
+/// Live tail: polls the current log file every 750ms (`logs::FollowState`)
+/// and pushes any newly-appended lines as one SSE event per tick (a JSON
+/// array, batching whatever arrived since the last tick rather than one
+/// frame per line) — mirrors `/study/{study_id}/events`'s existing SSE
+/// shape in this same file. Poll-based rather than a custom broadcasting
+/// `tracing` layer, deliberately: the latter would mean modifying
+/// `main.rs`'s `init_tracing` — foundational, already-deployed setup for a
+/// real running service — for a debug-tooling feature; a poll loop over a
+/// tiny local file costs nothing `serial::read_log`'s own poll loop
+/// doesn't already cost elsewhere in this crate. `Sse::keep_alive` already
+/// covers idle-connection pings, so a tick with nothing new just retries
+/// after a short sleep rather than emitting an event of its own.
+async fn logs_stream_handler() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures_util::stream::unfold(logs::FollowState::new(), |mut follow| async move {
+        loop {
+            let (returned, result) = match tokio::task::spawn_blocking(move || {
+                let lines = follow.poll();
+                (follow, lines)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(_join_err) => return None, // spawn_blocking panicked — end the stream rather than loop forever
+            };
+            follow = returned;
+
+            match result {
+                Ok(lines) if !lines.is_empty() => {
+                    let payload = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
+                    return Some((Ok::<_, Infallible>(Event::default().event("lines").data(payload)), follow));
+                }
+                Ok(_) => {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                }
+                Err(e) => {
+                    // A transient read error (e.g. the file mid-rotation)
+                    // shouldn't kill the whole stream — log it server-side
+                    // and retry, the same "keep going" posture `poll_loop`
+                    // in `embarch-ui`'s own background poller takes.
+                    tracing::warn!("logs/stream poll failed: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                }
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,29 +972,17 @@ mod tests {
         assert!(err.1.contains("not-a-number"));
     }
 
-    // ---- build_router's public/protected split (`/enroll`'s auth exemption) ----
+    // ---- build_router requires the bearer token on every route ----
     //
-    // `/enroll`'s own page has nothing secret in it, but everything it
-    // calls (`/status`, `/probes/enrolled`, `/probes/enroll`) must stay
-    // exactly as protected as before — these tests exist so that boundary
-    // is verified, not just eyeballed at the `build_router` call site.
+    // There used to be one deliberate exemption (`GET /enroll`'s static
+    // page); retired 2026-08-24 (`embarch-ui/milestone-1.md` §4.9). These
+    // tests exist so "every route is protected" stays verified, not just
+    // eyeballed at the `build_router` call site.
 
-    use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     fn test_router() -> Router {
         build_router(AppState::new("test-token".to_string()))
-    }
-
-    #[tokio::test]
-    async fn enroll_page_is_reachable_with_no_authorization_header_at_all() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/enroll").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("drag onto a role below"));
     }
 
     #[tokio::test]
@@ -962,6 +1039,24 @@ mod tests {
     async fn alerts_requires_the_bearer_token() {
         let response = test_router()
             .oneshot(Request::builder().uri("/alerts").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_recent_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/logs/recent").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_stream_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/logs/stream").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

@@ -706,7 +706,6 @@ dependencies = [
  "embarch-topology",
  "futures-util",
  "heapless 0.8.0",
- "http-body-util",
  "libc",
  "postcard",
  "probe-rs",

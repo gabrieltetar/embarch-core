@@ -2,8 +2,8 @@ mod api;
 mod chip_resolve;
 mod dev_bench_link;
 mod elevate;
-mod enroll_page;
 mod hardware;
+mod logs;
 mod serial;
 mod service;
 mod study;
@@ -26,15 +26,6 @@ pub(crate) const DEFAULT_PORT: u16 = 4884;
 /// widens it. Shared between `Run`'s and `Install`'s own `--bind` flags so
 /// they can't drift apart.
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1";
-
-/// Filename prefix for the daily-rolling log file (§3 decision 16,
-/// `embarch-core/design.md`) — shared between `init_tracing`, which sets the
-/// prefix on the `tracing-appender` builder, and `print_log_tail`, which
-/// needs the same prefix to recognize which files in the log directory are
-/// its own rotated log files (as opposed to anything else that might land in
-/// that directory later) and to know where the prefix ends and the
-/// lexicographically-sortable ISO date suffix begins.
-const LOG_FILE_PREFIX: &str = "core.log";
 
 #[derive(Parser)]
 #[command(name = "embarch-core", version)]
@@ -189,7 +180,9 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Logs { tail } => {
-            print_log_tail(tail)?;
+            for line in logs::read_recent(tail)? {
+                println!("{line}");
+            }
         }
     }
 
@@ -232,77 +225,25 @@ fn init_tracing() {
 }
 
 /// Builds the `tracing-appender` daily-rolling file writer §3 decision 16
-/// specifies: `filename_prefix(LOG_FILE_PREFIX)` + `Rotation::DAILY` names
-/// each day's file `<LOG_FILE_PREFIX>.<yyyy-MM-dd>` (`RollingFileAppender`
+/// specifies: `filename_prefix(logs::LOG_FILE_PREFIX)` + `Rotation::DAILY`
+/// names each day's file `<LOG_FILE_PREFIX>.<yyyy-MM-dd>` (`RollingFileAppender`
 /// implements `MakeWriter` directly, so no `NonBlocking` wrapper/worker
 /// thread is needed — `tracing`'s call sites here are never so hot that a
 /// blocking file write matters). `max_log_files(7)` deletes the oldest
-/// matching file once an 8th day's worth exist, keeping the most recent 7.
+/// matching file once an 8th day's worth exist, keeping the most recent 7 —
+/// this same file is what `GET /logs/recent`/`GET /logs/stream` (`api.rs`)
+/// and `logs::read_recent`/`logs::FollowState` read, not a second,
+/// size-capped mechanism (`embarch-ui/design.md` §3 decision 7, corrected in
+/// place once this crate's own design.md noted the daily-rolling file
+/// already existed).
 fn build_log_file_writer() -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
     let log_dir = token_store::local_data_dir()?.join("logs");
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix(LOG_FILE_PREFIX)
+        .filename_prefix(logs::LOG_FILE_PREFIX)
         .max_log_files(7)
         .build(&log_dir)
         .with_context(|| format!("failed to initialize rolling log file appender in {}", log_dir.display()))
-}
-
-/// `Command::Logs`'s implementation: finds the current daily log file and
-/// prints its last `tail` lines. "Current" is resolved by picking the
-/// lexicographically largest filename among everything in the log directory
-/// that starts with `LOG_FILE_PREFIX.` — since `tracing-appender`'s date
-/// format is ISO (`yyyy-MM-dd`), lexicographic and chronological order agree,
-/// so this needs no date parsing of its own. Pure local file read — same
-/// no-hardware-access posture as `detect-dev-bench`.
-fn print_log_tail(tail: usize) -> anyhow::Result<()> {
-    let log_dir = token_store::local_data_dir()?.join("logs");
-
-    let candidates: Vec<PathBuf> = std::fs::read_dir(&log_dir)
-        .with_context(|| format!("failed to read log directory {}", log_dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .collect();
-
-    let latest = latest_log_file(&candidates, LOG_FILE_PREFIX)
-        .with_context(|| format!("no log files found in {}", log_dir.display()))?;
-
-    let contents = std::fs::read_to_string(latest)
-        .with_context(|| format!("failed to read log file {}", latest.display()))?;
-
-    for line in tail_lines(&contents, tail) {
-        println!("{line}");
-    }
-
-    Ok(())
-}
-
-/// Pure selection logic behind `print_log_tail`, split out so it's
-/// unit-testable against a synthesized file list, no real log directory
-/// needed — same rationale `embarch_topology::hardware`'s own port-list
-/// selection logic already established. Picks the lexicographically largest filename among
-/// `candidates` that starts with `<prefix>.`; since `tracing-appender`'s date
-/// format is ISO (`yyyy-MM-dd`), lexicographic order agrees with chronological
-/// order, so the "most recent" file needs no date parsing of its own.
-fn latest_log_file<'a>(candidates: &'a [PathBuf], prefix: &str) -> Option<&'a PathBuf> {
-    let prefix_with_sep = format!("{prefix}.");
-    candidates
-        .iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix_with_sep))
-        })
-        .max_by_key(|path| path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
-}
-
-/// The last `n` lines of `contents`, or all of it if there are fewer than
-/// `n` lines — split out from `print_log_tail` for the same reason as
-/// `latest_log_file` above.
-fn tail_lines(contents: &str, n: usize) -> Vec<&str> {
-    let lines: Vec<&str> = contents.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].to_vec()
 }
 
 /// Build the router and serve it until `shutdown` resolves. `pub(crate)` so
@@ -337,51 +278,5 @@ async fn run(bind: String, port: u16) -> anyhow::Result<()> {
     serve(bind, port, std::future::pending()).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn latest_log_file_picks_the_lexicographically_largest_iso_date() {
-        let candidates = vec![
-            PathBuf::from("/logs/core.log.2026-08-18"),
-            PathBuf::from("/logs/core.log.2026-08-20"),
-            PathBuf::from("/logs/core.log.2026-08-19"),
-        ];
-        assert_eq!(
-            latest_log_file(&candidates, "core.log"),
-            Some(&PathBuf::from("/logs/core.log.2026-08-20"))
-        );
-    }
-
-    #[test]
-    fn latest_log_file_ignores_files_with_a_different_prefix() {
-        let candidates = vec![
-            PathBuf::from("/logs/core.log.2026-08-19"),
-            PathBuf::from("/logs/some-other-file.txt"),
-            PathBuf::from("/logs/token"),
-        ];
-        assert_eq!(
-            latest_log_file(&candidates, "core.log"),
-            Some(&PathBuf::from("/logs/core.log.2026-08-19"))
-        );
-    }
-
-    #[test]
-    fn latest_log_file_is_none_when_nothing_matches() {
-        let candidates = vec![PathBuf::from("/logs/token")];
-        assert_eq!(latest_log_file(&candidates, "core.log"), None);
-    }
-
-    #[test]
-    fn tail_lines_returns_only_the_last_n() {
-        let contents = "one\ntwo\nthree\nfour\nfive";
-        assert_eq!(tail_lines(contents, 2), vec!["four", "five"]);
-    }
-
-    #[test]
-    fn tail_lines_returns_everything_when_fewer_lines_than_requested() {
-        let contents = "one\ntwo";
-        assert_eq!(tail_lines(contents, 50), vec!["one", "two"]);
-    }
-}
+// Log-selection unit tests (`latest_log_file`/`tail_lines`/`FollowState`)
+// moved to `logs.rs` alongside the code they test.
