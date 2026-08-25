@@ -95,7 +95,7 @@ impl DevBenchLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embarch_study_designer::{StreamRecord, STUDY_DESIGNER_SCHEMA_VERSION};
+    use embarch_study_designer::{StreamRecord, DEV_BENCH_WIRE_SCHEMA_VERSION};
 
     /// The framing/encoding round trip this module is responsible for —
     /// exercised directly against `postcard`'s COBS helpers, with no serial
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn hello_round_trips() {
         round_trip(&DevBenchMessage::Hello {
-            schema_version: STUDY_DESIGNER_SCHEMA_VERSION,
+            schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
             host_utc_ms: 1_753_000_000_000,
         });
     }
@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn hello_ack_round_trips() {
         round_trip(&DevBenchMessage::HelloAck {
-            schema_version: STUDY_DESIGNER_SCHEMA_VERSION,
+            schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
             compatible: true,
             firmware_version: heapless::String::try_from("nrf54l15dk-g1a2b3c").unwrap(),
         });

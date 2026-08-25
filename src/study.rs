@@ -22,9 +22,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
-    samples_in, steps_crc, validate_taps, DevBenchMessage, GattTranscriptEntry, Sample, StepResult,
-    StreamEncoding, StreamSource, StreamTap, Study,
-    STUDY_DESIGNER_SCHEMA_VERSION,
+    samples_in, steps_crc, streams_crc, validate_taps, DevBenchMessage, GattTranscriptEntry, Sample,
+    StepResult, StreamEncoding, StreamSource, StreamTap, Study, ValidationSource,
+    DEV_BENCH_WIRE_SCHEMA_VERSION,
 };
 
 use crate::api::{internal_err, AppState};
@@ -143,19 +143,34 @@ pub enum StudyEvent {
 
 // ---- pure validation (no HTTP, no hardware — unit-testable directly) ------
 
-/// design.md §5.1 steps 2-3: every `PostHocValidation.source.step_index` must
-/// be in range, and `steps_crc` must match what `study.steps` recomputes to.
-/// Factored out from the handler so it's testable with no HTTP plumbing —
-/// the same posture `embarch_topology::hardware`'s own port-selection logic
-/// takes.
+/// design.md §5.1 steps 2-3: every per-step `PostHocValidation` must name a
+/// step that exists and every tap-sourced one a tap that exists, and both of
+/// a study's seals must match what their own halves recompute to. Factored
+/// out from the handler so it's testable with no HTTP plumbing — the same
+/// posture `embarch_topology::hardware`'s own port-selection logic takes.
 fn validate_study(study: &Study) -> Result<(), String> {
     for validation in study.validations.iter() {
-        if validation.source.step_index as usize >= study.steps.len() {
-            return Err(format!(
-                "validations[].source.step_index {} is out of range for a study with {} step(s)",
-                validation.source.step_index,
-                study.steps.len()
-            ));
+        // `embarch-study-designer/design.md` §3 decision 19's 2026-08-25
+        // amendment: a stream-fed check names the tap and carries no
+        // `step_index`, so the two shapes fail for different reasons and
+        // say so differently.
+        match &validation.source {
+            ValidationSource::Step { step_index, .. } => {
+                if *step_index as usize >= study.steps.len() {
+                    return Err(format!(
+                        "validations[].source.step_index {} is out of range for a study with {} step(s)",
+                        step_index,
+                        study.steps.len()
+                    ));
+                }
+            }
+            ValidationSource::Tap { name } => {
+                if !study.streams.iter().any(|tap| tap.name == *name) {
+                    return Err(format!(
+                        "validations[].source names stream tap '{name}', which this study doesn't declare —                          a check against a tap that was never opened would silently never run"
+                    ));
+                }
+            }
         }
     }
 
@@ -182,6 +197,21 @@ fn validate_study(study: &Study) -> Result<(), String> {
             "steps_crc mismatch: submitted study.steps_crc is {}, but recomputing over study.steps gives {recomputed} — \
              the submitted steps don't match their own checksum",
             study.steps_crc
+        ));
+    }
+
+    // The sibling seal (`embarch-study-designer/design.md` §3 decision 39's
+    // 2026-08-25 amendment), checked independently of `steps_crc` above so a
+    // failure says *which* half is corrupt — the whole reason there are two
+    // seals rather than one widened one.
+    let recomputed = streams_crc(&study.streams).map_err(|_| {
+        "failed to recompute streams_crc (a tap's encoding is unexpectedly large)".to_string()
+    })?;
+    if recomputed != study.streams_crc {
+        return Err(format!(
+            "streams_crc mismatch: submitted study.streams_crc is {}, but recomputing over study.streams gives {recomputed} — \
+             the submitted taps don't match their own checksum",
+            study.streams_crc
         ));
     }
 
@@ -270,7 +300,7 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
         let mut link = DevBenchLink::open(&port_name).map_err(|e| format!("{e:?}"))?;
 
         link.send(&DevBenchMessage::Hello {
-            schema_version: STUDY_DESIGNER_SCHEMA_VERSION,
+            schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
             host_utc_ms: current_utc_ms(),
         })
         .map_err(|e| format!("failed to send Hello to dev-bench: {e:?}"))?;
@@ -280,7 +310,7 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
             Ok(Some(DevBenchMessage::HelloAck { schema_version, compatible, firmware_version })) => {
                 tracing::info!(
                     dev_bench_schema_version = schema_version,
-                    core_schema_version = STUDY_DESIGNER_SCHEMA_VERSION,
+                    core_schema_version = DEV_BENCH_WIRE_SCHEMA_VERSION,
                     %firmware_version,
                     compatible,
                     "dev-bench Hello/HelloAck handshake complete"
@@ -288,7 +318,7 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
                 if !compatible {
                     return Err(format!(
                         "dev-bench firmware (schema version {schema_version}, firmware_version '{firmware_version}') \
-                         is not compatible with Core's schema version {STUDY_DESIGNER_SCHEMA_VERSION}"
+                         is not compatible with Core's schema version {DEV_BENCH_WIRE_SCHEMA_VERSION}"
                     ));
                 }
                 let info = HelloAckInfo {
@@ -454,6 +484,7 @@ pub async fn post_study_handler(
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
     let streams = study.streams.clone();
+    let streams_crc_value = study.streams_crc;
     let link = match tokio::task::spawn_blocking(move || {
         // `streams` rides along; `validations` and `requires` deliberately
         // do not (`embarch-study-designer/design.md` §3 decisions 17, 39,
@@ -464,6 +495,7 @@ pub async fn post_study_handler(
             steps,
             steps_crc: steps_crc_value,
             streams,
+            streams_crc: streams_crc_value,
         })
             .map(|_| link)
     })
@@ -1133,7 +1165,6 @@ mod tests {
             name: heapless::String::try_from(name).unwrap(),
             action: Action::BleConnect { role: BleRole::Central, target_address: None , target_name: None },
             timeout_ms,
-            power_sample: None,
             continue_on_fail: false,
             delay_before_ms: 0,
         }
@@ -1145,13 +1176,17 @@ mod tests {
             steps.push(step(&format!("step-{i}"), *t)).unwrap();
         }
         let steps_crc_value = steps_crc(&steps).unwrap();
+        let streams: HVec<StreamTap, { embarch_study_designer::limits::MAX_STREAMS_PER_STUDY }> =
+            HVec::new();
+        let streams_crc_value = streams_crc(&streams).unwrap();
         Study {
             name: heapless::String::try_from("test-study").unwrap(),
             requires: embarch_study_designer::Requirements::any(),
             steps,
             validations: HVec::new(),
-            streams: HVec::new(),
+            streams,
             steps_crc: steps_crc_value,
+            streams_crc: streams_crc_value,
         }
     }
 
@@ -1246,12 +1281,89 @@ mod tests {
         study
             .validations
             .push(PostHocValidation {
-                source: ValidationSource { step_index: 5, channel: DataChannel::CapturedData },
+                source: ValidationSource::Step { step_index: 5, channel: DataChannel::CapturedData },
                 check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
             })
             .unwrap();
         let err = validate_study(&study).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    /// `embarch-study-designer/design.md` §3 decision 19's 2026-08-25
+    /// amendment: a tap-sourced check names a tap, and naming one the study
+    /// doesn't declare is rejected up front rather than producing a check
+    /// that silently never runs.
+    #[test]
+    fn validate_study_rejects_a_validation_naming_an_undeclared_tap() {
+        let mut study = study_with_steps(&[1_000]);
+        study
+            .validations
+            .push(PostHocValidation {
+                source: ValidationSource::Tap {
+                    name: heapless::String::try_from("outpost").unwrap(),
+                },
+                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
+            })
+            .unwrap();
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("outpost"), "{err}");
+    }
+
+    #[test]
+    fn validate_study_accepts_a_validation_naming_a_declared_tap() {
+        use embarch_study_designer::{StreamEncoding, StreamScope, StreamSource};
+
+        let mut study = study_with_steps(&[1_000]);
+        study
+            .streams
+            .push(StreamTap {
+                id: 0,
+                name: heapless::String::try_from("outpost").unwrap(),
+                source: StreamSource::Signal {
+                    name: heapless::String::try_from("outpost").unwrap(),
+                },
+                encoding: StreamEncoding::Raw,
+                scope: StreamScope::WholeStudy,
+            })
+            .unwrap();
+        study.streams_crc = streams_crc(&study.streams).unwrap();
+        study
+            .validations
+            .push(PostHocValidation {
+                source: ValidationSource::Tap {
+                    name: heapless::String::try_from("outpost").unwrap(),
+                },
+                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
+            })
+            .unwrap();
+        assert!(validate_study(&study).is_ok());
+    }
+
+    /// The two seals are checked independently, so a corrupt tap list is
+    /// reported as a `streams_crc` failure and leaves `steps_crc`'s verdict
+    /// alone — which is the property having two of them exists for.
+    #[test]
+    fn validate_study_rejects_a_streams_crc_mismatch_by_name() {
+        use embarch_study_designer::{StreamEncoding, StreamScope, StreamSource};
+
+        let mut study = study_with_steps(&[1_000]);
+        study
+            .streams
+            .push(StreamTap {
+                id: 0,
+                name: heapless::String::try_from("outpost").unwrap(),
+                source: StreamSource::Signal {
+                    name: heapless::String::try_from("outpost").unwrap(),
+                },
+                encoding: StreamEncoding::Raw,
+                scope: StreamScope::WholeStudy,
+            })
+            .unwrap();
+        // Deliberately left at the empty-list seal the helper produced.
+        assert_eq!(study.streams_crc, 0);
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("streams_crc mismatch"), "{err}");
+        assert!(!err.contains("steps_crc mismatch"), "{err}");
     }
 
     #[test]
@@ -1260,7 +1372,7 @@ mod tests {
         study
             .validations
             .push(PostHocValidation {
-                source: ValidationSource { step_index: 1, channel: DataChannel::CapturedData },
+                source: ValidationSource::Step { step_index: 1, channel: DataChannel::CapturedData },
                 check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
             })
             .unwrap();

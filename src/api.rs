@@ -73,6 +73,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enroll", post(enroll_probe_handler))
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
+        .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
         .route("/logs/recent", get(logs_recent_handler))
@@ -123,6 +124,20 @@ pub(crate) fn internal_err<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
 struct StatusResponse {
     status: &'static str,
     probes: Vec<hardware::ProbeInfo>,
+    /// The `embarch-study-designer` **host type** schema version this Core
+    /// was built against (`embarch-study-designer/design.md` §3 decision 12
+    /// and its 2026-08-25 amendment). `embarch-api` compares it against its
+    /// own compiled-in copy before submitting a `Study`, since `GET /status`
+    /// is already that hop's connection-establishment check and there is no
+    /// separate handshake call.
+    ///
+    /// The **host** constant specifically, not the dev-bench wire one: this
+    /// hop carries `Study`/`StudyResult` *whole*, including the parts
+    /// dev-bench never sees (`validations`, `requires`, `gatt`). Serving the
+    /// wire number here would let a host-side-only reshape drift these two
+    /// processes undetected — which is exactly the failure the split was
+    /// made to prevent.
+    study_designer_schema_version: u32,
 }
 
 async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> {
@@ -134,6 +149,7 @@ async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> 
     Ok(Json(StatusResponse {
         status: "ok",
         probes,
+        study_designer_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
     }))
 }
 
@@ -562,6 +578,62 @@ async fn set_dev_bench_link_handler(
         .map_err(internal_err)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- POST /signals, GET /signals --------------------------------------------
+
+/// Declares (or re-declares) where a named DUT signal currently goes —
+/// `embarch_topology::hardware::declare_signal`, that crate's
+/// `design.md` §3 decision 18 and its 2026-08-25 amendment.
+///
+/// Same shape and same posture as `POST /dev-bench/link` above, for the same
+/// reasons: it is a plain enrollment-file write rather than a hardware
+/// operation, and it takes `hw_lock` to avoid racing `/probes/enroll` and
+/// `/dev-bench/link` on the same file — not because it touches a probe.
+/// Idempotent by name (`declare_signal` overwrites an existing row), and
+/// that overwrite *is* the migration path the decision promises: moving the
+/// outpost from a `Direct` route onto dev-bench pins is one call.
+///
+/// **Core owns this write, and there is deliberately no `embarch-topology`
+/// CLI mirror**, unlike decision 17's `set-dev-bench-link`. That subcommand
+/// writes `enrollment.toml` directly and a plain-user run hits the NTFS
+/// permission wall on this suite's real primary deployment — which is why
+/// the endpoint has to exist at all. A second writer that does not work
+/// where the suite actually runs is a surface to keep in step for no one.
+/// The cost is stated rather than hidden: a bench with no Core running has
+/// no terminal path to declare a signal.
+async fn declare_signal_handler(
+    State(state): State<AppState>,
+    Json(link): Json<embarch_topology::hardware::SignalLink>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = state.hw_lock.lock().await;
+
+    tokio::task::spawn_blocking(move || embarch_topology::hardware::declare_signal(link))
+        .await
+        .map_err(internal_err)?
+        // A blank name is `declare_signal`'s own rejection, and it is a
+        // caller error rather than a Core failure — the same distinction
+        // `/dev-bench/port` draws between "not plugged in" and "detection
+        // broke".
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every declared signal link — pure read of `embarch-topology`'s own
+/// storage, no hardware touched, no `hw_lock` (same posture as
+/// `/probes/enrolled`).
+///
+/// Added alongside the write because `list_signals` has never had an HTTP
+/// caller at all and `embarch-ui`'s Topology tab needs to list rows
+/// (`embarch-ui/design.md` §3 decision 10).
+async fn list_signals_handler(
+) -> Result<Json<Vec<embarch_topology::hardware::SignalLink>>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(embarch_topology::hardware::list_signals)
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)
+        .map(Json)
 }
 
 // ---- GET /dev-bench/port ----------------------------------------------------
@@ -1042,6 +1114,34 @@ mod tests {
                     .body(axum::body::Body::from(r#"{"serial":"abc"}"#))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn declare_signal_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/signals")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"name":"outpost","origin_role":"dut","direction":"dut-to-host",
+                            "route":{"kind":"direct","port_serial":"ABC123"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_signals_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/signals").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
