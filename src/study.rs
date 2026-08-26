@@ -512,6 +512,59 @@ pub struct HelloAckInfo {
     pub probe_hardware_id: String,
 }
 
+/// How long Core keeps reading after `HelloAck` before deciding dev-bench has
+/// nothing more to say right now ([`drain_post_ack_log_lines`]).
+///
+/// Larger than [`DevBenchLink`]'s own 200ms per-read timeout on purpose, so
+/// the window is a real one rather than one read that happens to block for its
+/// whole duration.
+const POST_ACK_DRAIN_MS: u64 = 250;
+
+/// Reads whatever `LogLine`s dev-bench sends immediately after `HelloAck`, into
+/// the debug file, before this function's caller does anything else with the
+/// link.
+///
+/// **Found live, and this is the point of the whole feature.** dev-bench
+/// installs its log sink right after putting `HelloAck` on the wire and
+/// immediately flushes the boot records it held until then
+/// (`embarch-dev-bench/app/src/dev_bench_log.c`) — that flush *is* how a
+/// reboot becomes visible from Core's side. But `GET /dev-bench/hello` (the
+/// doctor's check 13) returns the moment it has the ack and drops the link, so
+/// on a freshly reset bench the first handshake wrote the boot record onto a
+/// wire nobody was reading, and every later handshake had nothing left to
+/// flush. The boot record was reliably produced and reliably lost, which is
+/// worse than not having it: the file looked like the bench had never said
+/// anything about coming up.
+///
+/// Safe to consume here because nothing else can legitimately be in flight:
+/// Core has not sent `StudyStart` yet, so a `LogLine` is the only message
+/// dev-bench has any reason to send at this point. Anything else is reported
+/// rather than silently eaten, since consuming it is unavoidable once `recv`
+/// has decoded it.
+fn drain_post_ack_log_lines(link: &mut DevBenchLink) {
+    let deadline = Instant::now() + Duration::from_millis(POST_ACK_DRAIN_MS);
+    loop {
+        match link.recv(deadline) {
+            Ok(Some(DevBenchMessage::LogLine { text })) => {
+                crate::dev_bench_log::append(None, text.as_str());
+                tracing::info!("dev-bench (at handshake): {text}");
+            }
+            // The ordinary exit: the window closed with nothing more waiting.
+            Ok(None) => break,
+            Ok(Some(other)) => {
+                tracing::warn!(
+                    "dev-bench sent {other:?} between HelloAck and StudyStart, which nothing                      in the protocol calls for; it has been consumed"
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("error draining dev-bench's post-handshake log lines: {e:?}");
+                break;
+            }
+        }
+    }
+}
+
 /// Opens `port_name`, sends `Hello`, and waits for `HelloAck`. Runs entirely
 /// inside `spawn_blocking` (all serial I/O is blocking) — `Err` carries a
 /// human-readable message describing what failed, not a status code, since
@@ -523,6 +576,7 @@ async fn open_and_handshake(
     let probe_hardware_id = enrolled.hardware_id.clone();
     let chip = enrolled.chip.clone();
     tokio::task::spawn_blocking(move || {
+        let port_for_note = port_name.clone();
         let mut link = DevBenchLink::open(&port_name).map_err(|e| format!("{e:?}"))?;
 
         link.send(&DevBenchMessage::Hello {
@@ -532,7 +586,29 @@ async fn open_and_handshake(
         .map_err(|e| format!("failed to send Hello to dev-bench: {e:?}"))?;
 
         let deadline = Instant::now() + Duration::from_millis(HANDSHAKE_TIMEOUT_MS);
-        match link.recv(deadline) {
+        // A loop, not one `recv`, because of §3 decision 37: dev-bench's log
+        // backend now runs from boot and writes on its own schedule, so a
+        // `LogLine` can legitimately arrive ahead of the ack on a bench that
+        // has already handshaked once and is logging live. Before this, any
+        // such line failed the handshake with "expected HelloAck, got
+        // LogLine" — i.e. turning the firmware's logging on would have broken
+        // every study, and it would have looked like a protocol bug.
+        //
+        // Every skipped line is still recorded (this is exactly the window
+        // where a bench explains why it just rebooted), and the deadline is
+        // the same one, so a bench that only ever logs still times out rather
+        // than looping forever.
+        let ack = loop {
+            match link.recv(deadline) {
+                Ok(Some(DevBenchMessage::LogLine { text })) => {
+                    crate::dev_bench_log::append(None, text.as_str());
+                    tracing::info!("dev-bench (pre-handshake): {text}");
+                    continue;
+                }
+                other => break other,
+            }
+        };
+        match ack {
             Ok(Some(DevBenchMessage::HelloAck {
                 schema_version,
                 compatible,
@@ -580,6 +656,17 @@ async fn open_and_handshake(
                     link_identity: describe_identity(identity).to_string(),
                     probe_hardware_id: probe_hardware_id.clone(),
                 };
+                // The debug file's own boundary marker (§3 decision 37).
+                // Without it, a bench that reset between two studies produces
+                // two runs of boot lines with nothing saying where one link
+                // ended and the next began.
+                crate::dev_bench_log::note(
+                    None,
+                    &format!(
+                        "link opened on {port_for_note} (firmware {firmware_version}, wire schema v{schema_version})"
+                    ),
+                );
+                drain_post_ack_log_lines(&mut link);
                 Ok((link, info))
             }
             Ok(Some(other)) => Err(format!("expected HelloAck from dev-bench, got {other:?} instead")),
@@ -1132,10 +1219,37 @@ fn run_study_to_completion(
                 // Still `warn!` for a truncated transcript specifically: a
                 // capture silently claiming to be exhaustive when it isn't
                 // is exactly what decision 36 exists to prevent.
-                if text.contains("NOT exhaustive") {
-                    tracing::warn!(study_id, "dev-bench: {text}");
-                } else {
-                    tracing::info!(study_id, "dev-bench: {text}");
+                //
+                // **Amended by §3 decision 37.** The reasoning above was
+                // written when every `LogLine` was a deliberate diagnostic,
+                // which is what made `info` the right level for all of them.
+                // Now the same channel also carries dev-bench's whole
+                // `CONFIG_LOG` output, and mirroring a firmware `<dbg>` line
+                // into `core.log` at `info` would drown Core's own account of
+                // the run in the bench's. So a line that carries its own
+                // level marker is mirrored at *that* level, and an unmarked
+                // line — every one this comment was originally about — keeps
+                // `info` exactly as before. Nothing is lost either way: the
+                // debug file below takes every line at full detail
+                // regardless of level.
+                crate::dev_bench_log::append(Some(&study_id), text.as_str());
+                match crate::dev_bench_log::classify(text.as_str()) {
+                    _ if text.contains("NOT exhaustive") => {
+                        tracing::warn!(study_id, "dev-bench: {text}")
+                    }
+                    crate::dev_bench_log::LineLevel::Error => {
+                        tracing::error!(study_id, "dev-bench: {text}")
+                    }
+                    crate::dev_bench_log::LineLevel::Warn => {
+                        tracing::warn!(study_id, "dev-bench: {text}")
+                    }
+                    crate::dev_bench_log::LineLevel::Debug => {
+                        tracing::debug!(study_id, "dev-bench: {text}")
+                    }
+                    crate::dev_bench_log::LineLevel::Info
+                    | crate::dev_bench_log::LineLevel::Unmarked => {
+                        tracing::info!(study_id, "dev-bench: {text}")
+                    }
                 }
 
                 // ...and into the study's own results, on the reserved
@@ -1192,6 +1306,17 @@ fn run_study_to_completion(
             Err(e) => break Err(format!("dev-bench connection error: {e:?}")),
         }
     };
+
+    // The debug file's closing boundary (§3 decision 37), written before the
+    // outcome is even decided: what makes that file readable is knowing where
+    // one link's lifetime ended, and that is true whether the study passed,
+    // failed, or timed out. `outcome` is borrowed, not consumed — the match
+    // below still owns it.
+    let closing = match &outcome {
+        Ok(_) => "study finished, link closing".to_string(),
+        Err(msg) => format!("study FAILED ({msg}), link closing"),
+    };
+    crate::dev_bench_log::note(Some(&study_id), &closing);
 
     // Whatever happened, Core's own ports close and the capture's `streams`
     // are sealed into the writer before the job's status is decided.

@@ -54,6 +54,11 @@ serde_json = "1.0.150"
 serialport = { version = "4.9.0", features = ["usbportinfo-interface"] }
 service-manager = "0.11.0"
 tempfile = "3.24"
+# `dev_bench_log.rs` stamps each dev-bench log line's arrival time in RFC 3339.
+# Already in this crate's tree via tracing-appender/tracing-subscriber (both
+# use it for rotation and timestamps), so naming it directly costs no new
+# compilation — it just stops the module borrowing a transitive dependency.
+time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.53.0", features = ["full"] }
 # `GET /study/{study_id}/events` (SSE live push, study.rs) — wraps a
 # `tokio::sync::broadcast::Receiver` into a `Stream` axum's SSE response can

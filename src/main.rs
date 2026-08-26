@@ -1,6 +1,7 @@
 mod api;
 mod chip_resolve;
 mod dev_bench_link;
+mod dev_bench_log;
 mod elevate;
 mod flash_backend;
 mod hardware;
@@ -127,6 +128,17 @@ enum Command {
     /// nowhere a human can read), without needing a second terminal open on
     /// a foreground `run`.
     Logs {
+        /// How many of the most recent lines to print.
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
+    },
+    /// Print the last N lines of the dev-bench debug log (§3 decision 37) —
+    /// what `embarch-dev-bench`'s own firmware logged over the link, including
+    /// its boot record and any fatal-error dump, with each line stamped by
+    /// arrival and by the study it belongs to. Separate from `logs` above on
+    /// purpose: that one is Core's account of a run, this one is the bench's.
+    /// Pure local file read, no hardware access.
+    DevBenchLogs {
         /// How many of the most recent lines to print.
         #[arg(long, default_value_t = 50)]
         tail: usize,
@@ -260,6 +272,13 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Logs { tail } => {
             for line in logs::read_recent(tail)? {
+                println!("{line}");
+            }
+        }
+        Command::DevBenchLogs { tail } => {
+            for line in
+                logs::read_recent_with_prefix(dev_bench_log::DEV_BENCH_LOG_FILE_PREFIX, tail)?
+            {
                 println!("{line}");
             }
         }

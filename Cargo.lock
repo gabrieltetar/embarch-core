@@ -715,6 +715,7 @@ dependencies = [
  "serialport",
  "service-manager",
  "tempfile",
+ "time",
  "tokio",
  "tokio-stream",
  "toml",

@@ -59,10 +59,20 @@ fn read_dir_candidates(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
 /// `GET /logs/recent` and `embarch-core logs`'s shared implementation:
 /// finds the current daily log file and returns its last `tail` lines.
 pub(crate) fn read_recent(tail: usize) -> Result<Vec<String>> {
+    read_recent_with_prefix(LOG_FILE_PREFIX, tail)
+}
+
+/// The same read against any of this directory's daily-rolling files, by
+/// prefix — `embarch-core dev-bench-logs` reads
+/// `dev_bench_log::DEV_BENCH_LOG_FILE_PREFIX` through this (§3 decision 37).
+/// Both files rotate identically, so one reader serves both; only the prefix
+/// differs.
+pub(crate) fn read_recent_with_prefix(prefix: &str, tail: usize) -> Result<Vec<String>> {
     let dir = log_dir()?;
     let candidates = read_dir_candidates(&dir)?;
-    let latest =
-        latest_log_file(&candidates, LOG_FILE_PREFIX).with_context(|| format!("no log files found in {}", dir.display()))?;
+    let latest = latest_log_file(&candidates, prefix).with_context(|| {
+        format!("no {prefix}.<date> files found in {} — nothing has been written there yet", dir.display())
+    })?;
     let contents = std::fs::read_to_string(latest)
         .with_context(|| format!("failed to read log file {}", latest.display()))?;
     Ok(tail_lines(&contents, tail).into_iter().map(String::from).collect())

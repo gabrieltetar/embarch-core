@@ -61,6 +61,64 @@ impl DevBenchLink {
         Ok(())
     }
 
+    /// What to say when a frame arrives and will not decode.
+    ///
+    /// **"failed to decode DevBenchMessage" on its own is close to useless,
+    /// and this was found the hard way.** A postcard error of "Hit the end of
+    /// buffer, expected more data" tells you a frame was short of what the
+    /// type needs — and says nothing about *which* message, how big it was,
+    /// or how far the two ends disagree. Diagnosing one cost a session of
+    /// isolating studies step by step to find out which action produced it.
+    /// The frame's own first byte is the variant index, which is the single
+    /// most useful fact available at this point and is free.
+    ///
+    /// A prefix rather than the whole frame: a `StepResult` carrying a full
+    /// GATT table runs to kilobytes, and a log line that long is its own
+    /// problem. Twenty-four bytes reaches past the tag, the step index and
+    /// most step names.
+    ///
+    /// Pure, and separate from `recv`, so the message is testable without a
+    /// serial port.
+    fn describe_undecodable_frame(head: &[u8], framed_len: usize) -> String {
+        let tag = match head.first() {
+            // The COBS code byte comes first, so the variant index is the
+            // *second* byte of the framed bytes — index 1, not 0. Getting
+            // this wrong would name a plausible wrong variant, which is
+            // worse than naming none.
+            Some(_) => head.get(1).copied(),
+            None => None,
+        };
+        let tag_name = tag.map(Self::describe_tag).unwrap_or("(frame too short to hold a tag)");
+        let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
+        format!(
+            "failed to decode DevBenchMessage: {framed_len} COBS-framed bytes, \
+             variant index {} ({tag_name}), first {} bytes {}",
+            tag.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string()),
+            head.len(),
+            hex.join(" ")
+        )
+    }
+
+    /// `DevBenchMessage`'s variant index -> its name. Hand-maintained
+    /// against `embarch-study-designer`'s `protocol.rs`, in the same
+    /// append-only order postcard encodes positionally — an unknown index is
+    /// named as unknown rather than guessed at, which is itself a useful
+    /// finding (a bench newer than this Core).
+    fn describe_tag(tag: u8) -> &'static str {
+        match tag {
+            0 => "Hello",
+            1 => "HelloAck",
+            2 => "StreamOpen",
+            3 => "StreamChunkBatch",
+            4 => "StreamClose",
+            5 => "LogLine",
+            6 => "StudyStart",
+            7 => "StepResult",
+            8 => "StudyDone",
+            _ => "unknown variant — a bench newer than this Core?",
+        }
+    }
+
     /// Reads and decodes one `DevBenchMessage`, blocking (via bounded,
     /// polled reads) until either a complete `0x00`-delimited frame arrives
     /// or `deadline` passes.
@@ -72,8 +130,14 @@ impl DevBenchLink {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == 0) {
                 let mut frame: Vec<u8> = self.buf.drain(..=pos).collect();
-                let msg = postcard::from_bytes_cobs(&mut frame)
-                    .context("failed to decode DevBenchMessage")?;
+                // Kept for the error path below: `from_bytes_cobs` decodes
+                // in place, so by the time it fails `frame` no longer holds
+                // what arrived on the wire.
+                let framed_len = frame.len();
+                let head: Vec<u8> = frame.iter().take(24).copied().collect();
+                let msg = postcard::from_bytes_cobs(&mut frame).with_context(|| {
+                    Self::describe_undecodable_frame(&head, framed_len)
+                })?;
                 return Ok(Some(msg));
             }
 
@@ -96,6 +160,40 @@ impl DevBenchLink {
 mod tests {
     use super::*;
     use embarch_study_designer::{StreamRecord, DEV_BENCH_WIRE_SCHEMA_VERSION};
+
+    /// The one thing the old bare "failed to decode DevBenchMessage" could
+    /// not tell you: which message, and how big. Pinned because the *offset*
+    /// of the variant index is the part that is easy to get wrong — the COBS
+    /// code byte comes first, so it is byte 1 and not byte 0, and naming a
+    /// plausible wrong variant would be worse than naming none.
+    #[test]
+    fn an_undecodable_frame_names_its_variant_and_its_size() {
+        // A real COBS-framed `StepResult` (variant 7): code byte, then the
+        // tag, then the rest.
+        let framed = [0x0du8, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76];
+        let msg = DevBenchLink::describe_undecodable_frame(&framed, 23);
+        assert!(msg.contains("23 COBS-framed bytes"), "{msg}");
+        assert!(msg.contains("variant index 7"), "{msg}");
+        assert!(msg.contains("StepResult"), "{msg}");
+        assert!(msg.contains("0d 07 01 09"), "the hex prefix is the point: {msg}");
+    }
+
+    #[test]
+    fn a_frame_too_short_to_hold_a_tag_says_so_rather_than_guessing() {
+        let msg = DevBenchLink::describe_undecodable_frame(&[0x01], 1);
+        assert!(msg.contains("frame too short"), "{msg}");
+        assert!(!msg.contains("Hello"), "must not name a variant it cannot read: {msg}");
+    }
+
+    /// A bench flashed from a newer `main` than this Core is a real and
+    /// recurring situation in this suite (`embarch-dev-workflow.md` §4a's
+    /// coupling 1), so an out-of-range variant index gets a message that
+    /// points at it instead of at the bytes.
+    #[test]
+    fn an_unknown_variant_index_points_at_a_version_skew() {
+        let msg = DevBenchLink::describe_undecodable_frame(&[0x02, 0x63], 9);
+        assert!(msg.contains("newer than this Core"), "{msg}");
+    }
 
     /// The framing/encoding round trip this module is responsible for —
     /// exercised directly against `postcard`'s COBS helpers, with no serial
