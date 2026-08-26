@@ -24,7 +24,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
     limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
-    requirement_satisfied, samples_in, steps_crc, streams_crc,
+    dev_bench_log_tap, requirement_satisfied, samples_in, steps_crc, streams_crc,
     validate_taps, DevBenchMessage, GattTranscriptEntry, Provenance, Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
     VersionOverride, VersionSource, VersionSubject,
@@ -874,6 +874,16 @@ pub async fn post_study_handler(
 /// `/flash` on it would invent contention that does not exist.
 struct Capture {
     study: Study,
+    /// Every tap this study actually has a file for: the ones it declared,
+    /// plus the synthesized reserved `dev-bench` log tap appended last
+    /// (`embarch-study-designer`'s `dev_bench_log_tap`).
+    ///
+    /// **Indexed by `StreamTap.id`, and that stays true for the reserved one
+    /// too** — its id is `study.streams.len()`, so appending it puts it at
+    /// its own index. This is the list `tap_for` and `StreamStore` both key
+    /// off; `study.streams` alone would have no entry for the log tap and
+    /// every log line would route to an undeclared id.
+    taps: Vec<StreamTap>,
     study_id: String,
     events_tx: broadcast::Sender<StudyEvent>,
     store: StdMutex<StreamStore>,
@@ -924,9 +934,16 @@ fn run_study_to_completion(
         }
     }
 
+    // Declared taps plus the reserved `dev-bench` log tap, which no study
+    // may declare (`validate_taps` rejects the name) and every study gets.
+    // Built once, here, so the store's files and `tap_for`'s lookups can
+    // never disagree about which ids exist.
+    let mut taps: Vec<StreamTap> = study.streams.iter().cloned().collect();
+    taps.push(dev_bench_log_tap(&study.streams));
+
     // `streams/` and its index, before a single byte has arrived (decision
-    // 30(b)). One file per declared tap, named by the tap.
-    let store = match StreamStore::create(&results_dir, &study.streams, stream_store::stream_max_bytes()) {
+    // 30(b)). One file per tap, named by the tap.
+    let store = match StreamStore::create(&results_dir, &taps, stream_store::stream_max_bytes()) {
         Ok(store) => store,
         Err(e) => {
             fail_job(&jobs, &events_tx, &study_id, format!("failed to create the study's streams/ directory: {e:?}"));
@@ -949,6 +966,7 @@ fn run_study_to_completion(
 
     let capture = Arc::new(Capture {
         study,
+        taps,
         study_id: study_id.clone(),
         events_tx: events_tx.clone(),
         store: StdMutex::new(store),
@@ -960,6 +978,12 @@ fn run_study_to_completion(
     // routing a chunk needs only the tap's declared encoding, which is in
     // the submitted `Study` and can't drift.
     let mut open_taps: std::collections::HashSet<u8> = std::collections::HashSet::new();
+
+    // The reserved log tap's own handle. Derived the same way both ends
+    // derive it — one past the last declared index — and read from
+    // `capture.taps`' last entry rather than recomputed, so there is exactly
+    // one place this number comes from.
+    let reserved_log_tap_id = capture.taps[capture.taps.len() - 1].id;
     // Core's own taps: a `Route::Direct` signal on a serial port Core opens
     // itself, bypassing dev-bench entirely (decision 30(a)).
     let mut signal_taps: HashMap<u8, SignalTapReader> = HashMap::new();
@@ -999,7 +1023,7 @@ fn run_study_to_completion(
                 tracing::info!(study_id, completed, "study run finished (StudyDone)");
                 break Ok(());
             }
-            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.study, id) {
+            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.taps, id) {
                 Some(tap) => {
                     tracing::info!(study_id, id, name = tap.name.as_str(), "stream tap opened");
                     open_taps.insert(id);
@@ -1012,7 +1036,7 @@ fn run_study_to_completion(
             },
             Ok(Some(DevBenchMessage::StreamClose { id, dropped })) => {
                 open_taps.remove(&id);
-                let name = tap_for(&capture.study, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
+                let name = tap_for(&capture.taps, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
                 if dropped > 0 {
                     // A capture that lost data must say so rather than be
                     // read as complete — `embarch-study-designer/design.md`
@@ -1032,7 +1056,7 @@ fn run_study_to_completion(
                 }
             }
             Ok(Some(DevBenchMessage::StreamChunkBatch { id, records })) => {
-                let Some(tap) = tap_for(&capture.study, id).cloned() else {
+                let Some(tap) = tap_for(&capture.taps, id).cloned() else {
                     tracing::warn!(
                         study_id,
                         id,
@@ -1070,6 +1094,45 @@ fn run_study_to_completion(
                     tracing::warn!(study_id, "dev-bench: {text}");
                 } else {
                     tracing::info!(study_id, "dev-bench: {text}");
+                }
+
+                // ...and into the study's own results, on the reserved
+                // `dev-bench` tap (`embarch-study-designer/design.md` §4.8).
+                // This is the asymmetry that tap exists to close: until now
+                // a LogLine reached Core's rolling log and *nothing else*,
+                // so the firmware's own account of a run was the one part of
+                // it that didn't survive in the run's directory.
+                //
+                // Core stamps arrival here rather than dev-bench stamping
+                // departure, which is the honest reading of `rx_utc_ms` for
+                // a record dev-bench never framed as one — it is when this
+                // line was received, and it is on the same clock every other
+                // Core-mediated record uses.
+                if let Some(tap) = tap_for(&capture.taps, reserved_log_tap_id).cloned() {
+                    let mut line = text.as_str().to_string();
+                    line.push('\n');
+                    let bytes = match heapless::Vec::from_slice(line.as_bytes()) {
+                        Ok(bytes) => bytes,
+                        // Longer than MAX_STREAM_CHUNK_BYTES. A LogLine is
+                        // capped well below that by MAX_LOG_LINE_LEN, so
+                        // this is unreachable rather than merely unlikely —
+                        // dropped rather than truncated, because a silently
+                        // shortened log line is the sort of thing that gets
+                        // read as the whole message.
+                        Err(()) => {
+                            tracing::warn!(
+                                study_id,
+                                "a dev-bench log line didn't fit a stream record; \
+                                 it is in Core's log only"
+                            );
+                            continue;
+                        }
+                    };
+                    write_stream_record(
+                        &capture,
+                        &tap,
+                        &StreamRecord { rx_utc_ms: current_utc_ms(), bytes },
+                    );
                 }
             }
             Ok(Some(other)) => {
@@ -1343,8 +1406,8 @@ fn read_signal_tap(
 /// (`embarch-study-designer/design.md` §4.8), enforced by that crate's
 /// `validate_taps` at submission, so this is a bounds-checked index rather
 /// than a search.
-fn tap_for(study: &Study, id: u8) -> Option<&StreamTap> {
-    study.streams.get(usize::from(id)).filter(|tap| tap.id == id)
+fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
+    taps.get(usize::from(id)).filter(|tap| tap.id == id)
 }
 
 /// Writes one arrival-stamped record to its tap's files under `streams/`.
@@ -1890,6 +1953,7 @@ async fn serve_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embarch_study_designer::RESERVED_DEV_BENCH_STREAM_NAME;
     use embarch_study_designer::{
         Action, BleRole,
     };
@@ -1909,10 +1973,16 @@ mod tests {
     /// hardware, no HTTP, and no dev-bench link — the same posture the rest
     /// of this module's tests already take.
     fn test_capture(dir: &FsPath, study: Study) -> Capture {
-        let store = StreamStore::create(dir, &study.streams, 0).unwrap();
+        // Same construction the real path uses, reserved log tap included —
+        // a fixture that skipped it would not exercise the id the log tap
+        // actually routes on.
+        let mut taps: Vec<StreamTap> = study.streams.iter().cloned().collect();
+        taps.push(dev_bench_log_tap(&study.streams));
+        let store = StreamStore::create(dir, &taps, 0).unwrap();
         let (events_tx, _rx) = broadcast::channel(64);
         Capture {
             study,
+            taps,
             study_id: "test-study-id".to_string(),
             events_tx,
             store: StdMutex::new(store),
@@ -2330,13 +2400,57 @@ mod tests {
         let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
         let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let streams = result["streams"].as_array().unwrap();
-        assert_eq!(streams.len(), 2);
+        // Three, not two: the two declared taps plus the reserved
+        // `dev-bench` log tap every study now gets, last and at its own id.
+        assert_eq!(streams.len(), 3);
         assert_eq!(streams[0]["name"], "power");
         assert_eq!(streams[0]["bytes_written"], 4);
         assert_eq!(streams[0]["truncated"], false);
         assert_eq!(streams[1]["name"], "quiet");
         assert_eq!(streams[1]["bytes_written"], 0);
         assert_eq!(streams[1]["truncated"], true);
+        // Present and reported even when dev-bench said nothing at all —
+        // a tap that produced nothing reports `bytes_written: 0` rather than
+        // going missing, same as any other.
+        assert_eq!(streams[2]["name"], RESERVED_DEV_BENCH_STREAM_NAME);
+        assert_eq!(streams[2]["bytes_written"], 0);
+        assert_eq!(streams[2]["truncated"], false);
+    }
+
+    #[test]
+    fn a_dev_bench_log_line_lands_in_the_studys_own_results_not_only_cores_log() {
+        // The asymmetry the reserved tap exists to close. Before it, a
+        // LogLine reached Core's rolling log and nothing else, so the
+        // firmware's own account of a run was the one part of that run which
+        // did not survive in the run's directory.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_steps(&[1_000]);
+        let capture = test_capture(dir.path(), study);
+
+        let reserved = capture.taps.last().unwrap().clone();
+        assert_eq!(reserved.name.as_str(), RESERVED_DEV_BENCH_STREAM_NAME);
+        // Its id is one past the last declared index — the rule both ends
+        // derive independently, asserted here rather than assumed.
+        assert_eq!(usize::from(reserved.id), capture.study.streams.len());
+        assert_eq!(tap_for(&capture.taps, reserved.id).map(|t| t.name.as_str()), Some(RESERVED_DEV_BENCH_STREAM_NAME));
+
+        let mut line = "link RX overrun".to_string();
+        line.push('\n');
+        write_stream_record(
+            &capture,
+            &reserved,
+            &StreamRecord { rx_utc_ms: 7, bytes: heapless::Vec::from_slice(line.as_bytes()).unwrap() },
+        );
+
+        // A Text tap's raw file *is* its rendering (no second copy), so the
+        // bytes are readable straight out of streams/.
+        let written = std::fs::read_dir(dir.path().join("streams"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(RESERVED_DEV_BENCH_STREAM_NAME))
+            .expect("the reserved tap has a file under streams/");
+        let body = std::fs::read_to_string(written.path()).unwrap();
+        assert!(body.contains("link RX overrun"), "got {body:?}");
     }
 
     #[test]
