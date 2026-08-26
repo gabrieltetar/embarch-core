@@ -4,7 +4,7 @@ use axum::{
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
+        .route("/signals/{name}", delete(remove_signal_handler))
+        .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
         .route("/logs/recent", get(logs_recent_handler))
@@ -86,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
+        .route("/study/{study_id}/streams", get(study::stream_index_handler))
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
@@ -699,6 +702,73 @@ async fn list_signals_handler(
         .map(Json)
 }
 
+/// Un-declares a signal — `embarch_topology::hardware::remove_signal`.
+///
+/// Added 2026-08-26 with `embarch-ui`'s signal-route rows
+/// (`embarch-ui/design.md` §3 decision 10). Not in that decision's original
+/// endpoint pair, and the reason it has to be here is the decision's own
+/// consequence: **this tab is the only human surface there is**, and
+/// `declare_signal` is idempotent by name, so without a removal the one
+/// surface that can state a wire cannot retract one. A signal declared
+/// against a bridge that was never bought would otherwise be permanent, and
+/// a `Study` naming it would keep passing `POST /study`'s pre-flight while
+/// resolving to a port that does not exist.
+///
+/// `404` when nothing was declared under that name — the same distinction
+/// `remove_signal`'s own `Ok(false)` draws, surfaced rather than flattened
+/// into a silent success, so a UI that thought a row existed learns it did
+/// not. Takes `hw_lock` for the same reason the write above does: it edits
+/// the same enrollment file.
+async fn remove_signal_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = state.hw_lock.lock().await;
+
+    let removed = tokio::task::spawn_blocking(move || embarch_topology::hardware::remove_signal(&name))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no signal is declared under that name".to_string()))
+    }
+}
+
+// ---- GET /serial-ports ------------------------------------------------------
+
+/// Every USB serial port this machine currently enumerates, unnarrowed —
+/// `embarch_topology::hardware::list_serial_ports`.
+///
+/// Exists for one caller: declaring a `Route::Direct` signal needs a
+/// `port_serial`, and `embarch-ui/design.md` §3 decision 10 says that pick
+/// comes from **Core's own enumeration** rather than being typed from memory.
+/// It has to be Core's, not the asking process's: a serial port on the
+/// machine running the UI is not a serial port on the machine running Core,
+/// which is the entire reason `embarch-ui` links no hardware crate
+/// (decision 5).
+///
+/// **Not `/dev-bench/port` with the filter off.** That endpoint answers
+/// "which port is dev-bench's link" and applies the VID gate to do it; a
+/// `Direct` route's USB-UART bridge is a wire's carrier and can carry any
+/// VID, so gating this list would hide the port it exists to name (see
+/// `embarch_topology::hardware::list_serial_ports`).
+///
+/// Takes no `hw_lock` and opens nothing: this reads USB descriptors the OS
+/// already enumerated, same posture as `/status`'s probe listing and
+/// `/dev-bench/port`. An empty list is a `200` — nothing plugged in is a real
+/// answer, not a failure.
+async fn serial_ports_handler(
+) -> Result<Json<Vec<embarch_topology::hardware::DetectedPort>>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(embarch_topology::hardware::list_serial_ports)
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)
+        .map(Json)
+}
+
 // ---- GET /dev-bench/port ----------------------------------------------------
 
 /// Which serial port `embarch-dev-bench` is on
@@ -1205,6 +1275,44 @@ mod tests {
     async fn list_signals_requires_the_bearer_token() {
         let response = test_router()
             .oneshot(Request::builder().uri("/signals").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn remove_signal_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/signals/outpost")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn serial_ports_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(Request::builder().uri("/serial-ports").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stream_index_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/study/whatever/streams")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

@@ -1929,6 +1929,101 @@ fn event_study_id(event: &StudyEvent) -> &str {
     }
 }
 
+// ---- GET /study/{study_id}/streams -----------------------------------------
+
+/// One declared tap, as `GET /study/{study_id}/streams` reports it.
+///
+/// A dedicated response type rather than serializing [`stream_store::StreamIndex`]
+/// itself — the same reasoning `EnrollProbeResponse` states against
+/// serializing `EnrolledBoard`: the on-disk index is Core's own bookkeeping
+/// (it carries file names inside a private results directory and a version
+/// number nothing outside Core reads), and this endpoint's contract should
+/// not shift the day that file gains a field.
+///
+/// `rendered` is a boolean rather than the file name for the same reason:
+/// a caller never opens the file, it asks `GET /study/{id}/stream/{name}`,
+/// and what it needs to know is whether that call will hand back a decoded
+/// rendering or the raw bytes.
+#[derive(Debug, Serialize)]
+pub struct StreamIndexEntryResponse {
+    pub id: u8,
+    pub name: String,
+    pub encoding: StreamEncoding,
+    pub alias: Option<String>,
+    /// Whether a decoded rendering exists, i.e. whether
+    /// `GET /study/{id}/stream/{name}` (without `?raw=1`) serves something
+    /// other than the raw bytes.
+    pub rendered: bool,
+    /// Why this tap's rendering is missing, incomplete, or **unnamed** — set
+    /// only when there is something to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamIndexResponse {
+    pub streams: Vec<StreamIndexEntryResponse>,
+}
+
+/// What a study's taps captured, and — the reason this route exists — **why a
+/// trace has no names when it has none**.
+///
+/// Added 2026-08-26 for `embarch-ui`'s Trace view (`embarch-ui/design.md` §3
+/// decision 10). Until it existed, `streams/index.json`'s `note` had no HTTP
+/// caller at all: `GET /study/{id}` returns `StreamRef { name, bytes_written,
+/// truncated }`, which has no room for it, and
+/// `GET /study/{id}/stream/{name}` serves the rendered CSV either way — so
+/// over HTTP **a refused trace and a named one were indistinguishable**,
+/// which is exactly the confusion decision 10's "an unnamed trace is never
+/// mistaken for a named one" exists to prevent.
+///
+/// A new route rather than a field on `StreamRef`, deliberately: `StreamRef`
+/// lives in `embarch-study-designer` and rides inside `StudyResult`, so
+/// growing it is a host schema bump for a fact that is Core-side bookkeeping
+/// and is not produced by, or meaningful to, dev-bench. The cheapest shape
+/// that carries the answer is the one that does not move a shared type.
+///
+/// Reads purely off disk, like `stream_data_handler` — a study whose job
+/// registry entry is gone (Core restarted) still answers, because the results
+/// directory is the durable record.
+pub async fn stream_index_handler(
+    Path(study_id): Path<String>,
+) -> Result<Json<StreamIndexResponse>, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(&study_id)?;
+    let index = read_stream_index(&streams_dir)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "study '{study_id}' has no captured streams (it may predate streams/, or never \
+                 have started)"
+            ),
+        )
+    })?;
+
+    Ok(Json(stream_index_response(index)))
+}
+
+/// [`stream_index_handler`]'s whole body, minus the disk read — split out so
+/// the one thing worth pinning is testable without a writable results root:
+/// that `note` survives into the response, and that `rendered` says what
+/// `GET /study/{id}/stream/{name}` will actually serve.
+fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexResponse {
+    StreamIndexResponse {
+        streams: index
+            .streams
+            .into_iter()
+            .map(|e| StreamIndexEntryResponse {
+                id: e.id,
+                name: e.name,
+                encoding: e.encoding,
+                alias: e.alias,
+                rendered: e.rendered_file.is_some(),
+                note: e.note,
+            })
+            .collect(),
+    }
+}
+
 // ---- GET /study/{study_id}/stream/{name}, and the three routes it replaces --
 
 /// `?raw=1` serves the tap's byte-for-byte capture instead of its rendering.
@@ -3238,5 +3333,68 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// The reason `GET /study/{id}/streams` exists at all: over HTTP, a
+    /// refused trace has to be distinguishable from a named one. Nothing else
+    /// on Core's surface carries that fact.
+    #[test]
+    fn the_stream_index_response_carries_why_a_trace_has_no_names() {
+        let index = stream_store::StreamIndex {
+            version: 1,
+            streams: vec![
+                stream_store::StreamIndexEntry {
+                    id: 0,
+                    name: "outpost".to_string(),
+                    raw_file: "outpost.bin".to_string(),
+                    rendered_file: Some("outpost.trace.csv".to_string()),
+                    encoding: StreamEncoding::OutpostTrace,
+                    alias: None,
+                    note: Some("decoded but NOT named: manifest build_id \"a\" != firmware build_id \"b\"".to_string()),
+                },
+                stream_store::StreamIndexEntry {
+                    id: 1,
+                    name: "power".to_string(),
+                    raw_file: "power.bin".to_string(),
+                    rendered_file: Some("power.csv".to_string()),
+                    encoding: StreamEncoding::Raw,
+                    alias: Some("power".to_string()),
+                    note: None,
+                },
+            ],
+        };
+
+        let response = stream_index_response(index);
+        let trace = &response.streams[0];
+        assert_eq!(trace.name, "outpost");
+        assert!(trace.rendered, "a rendered trace must report that it rendered");
+        assert!(
+            trace.note.as_deref().is_some_and(|n| n.contains("NOT named")),
+            "the refusal reason must reach an HTTP caller, or a UI cannot tell an unnamed trace \
+             from a named one"
+        );
+        // The unrefused tap says nothing, rather than saying "fine" — an
+        // absent note is what "nothing to report" looks like.
+        assert_eq!(response.streams[1].note, None);
+        assert_eq!(response.streams[1].alias.as_deref(), Some("power"));
+    }
+
+    /// A tap whose encoding has no rendering must not claim one, or a caller
+    /// will present raw bytes as a decoded answer.
+    #[test]
+    fn a_tap_with_no_rendering_says_so() {
+        let index = stream_store::StreamIndex {
+            version: 1,
+            streams: vec![stream_store::StreamIndexEntry {
+                id: 0,
+                name: "raw".to_string(),
+                raw_file: "raw.bin".to_string(),
+                rendered_file: None,
+                encoding: StreamEncoding::Raw,
+                alias: None,
+                note: None,
+            }],
+        };
+        assert!(!stream_index_response(index).streams[0].rendered);
     }
 }
