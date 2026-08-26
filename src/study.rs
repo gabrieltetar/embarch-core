@@ -2490,6 +2490,9 @@ mod tests {
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
             gatt_activity: None,
+            // Decision 44's `security_level`, likewise: this fixture has no
+            // link, and `None` is what a step with no connection reports.
+            security_level: None,
         }
     }
 
