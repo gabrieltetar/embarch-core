@@ -474,14 +474,36 @@ fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study
 /// The deadline for the next `DevBenchMessage` to arrive, given the index of
 /// the next `StepResult` still outstanding — `study.rs`'s host-side watchdog
 /// (design.md §3 decision 16's amendment). `next_expected` in range uses that
-/// step's own `timeout_ms`; once every step has reported in, the last step's
-/// `timeout_ms` is reused as the wait for the terminal `StudyDone`. Pure and
-/// `now`-parameterized so the deadline math is unit-testable without a clock
-/// or a real study run.
+/// step's own `delay_before_ms + timeout_ms`; once every step has reported in,
+/// the last step's `timeout_ms` alone is reused as the wait for the terminal
+/// `StudyDone`. Pure and `now`-parameterized so the deadline math is
+/// unit-testable without a clock or a real study run.
+///
+/// **`delay_before_ms` is part of the window (design.md §3 decision 33).** This
+/// function used to ignore it, which was a live defect rather than a rounding
+/// error: dev-bench honours the field by `k_sleep`ing it *before* running the
+/// step (`main.c`'s dispatch loop), so a study authoring
+/// `delay_before_ms >= timeout_ms + WATCHDOG_GRACE_MS` failed against a bench
+/// that was working perfectly. That is squarely the intended path —
+/// `delay_before_ms` exists so a stimulus's timing is authorable
+/// (`embarch-study-designer/design.md` §3 decision 42) and multi-second delays
+/// are the point of it. `timeout_ms` means "how long this step may take", never
+/// "how long until I hear back"; the delay is the other term.
+///
+/// The terminal-`StudyDone` branch deliberately does **not** add a delay: by
+/// the time every `StepResult` has arrived, the last step's own delay has
+/// already elapsed, so adding it again would widen that wait for nothing.
 fn next_deadline(study: &Study, next_expected: usize, now: Instant) -> Instant {
-    let step = study.steps.get(next_expected).or_else(|| study.steps.last());
-    let timeout_ms = step.map(|s| s.timeout_ms as u64).unwrap_or(0);
-    now + Duration::from_millis(timeout_ms) + Duration::from_millis(WATCHDOG_GRACE_MS)
+    let (delay_ms, timeout_ms) = match study.steps.get(next_expected) {
+        // A step still outstanding: dev-bench sleeps its delay, then runs it.
+        Some(step) => (step.delay_before_ms as u64, step.timeout_ms as u64),
+        // Every step reported in; only `StudyDone` is left. The last step's
+        // delay is already spent, so only its timeout carries over.
+        None => (0, study.steps.last().map(|s| s.timeout_ms as u64).unwrap_or(0)),
+    };
+    now + Duration::from_millis(delay_ms)
+        + Duration::from_millis(timeout_ms)
+        + Duration::from_millis(WATCHDOG_GRACE_MS)
 }
 
 // ---- dev-bench link: open + Hello/HelloAck handshake ----------------------
@@ -1827,7 +1849,7 @@ async fn serve_capture(
 mod tests {
     use super::*;
     use embarch_study_designer::{
-        limits::MAX_STEPS_PER_STUDY, Action, BleRole, DataChannel, ExpectedValue, PostHocCheck, PostHocValidation,
+        Action, BleRole, DataChannel, ExpectedValue, PostHocCheck, PostHocValidation,
         ValidationSource,
     };
     use heapless::Vec as HVec;
@@ -1882,7 +1904,7 @@ mod tests {
     }
 
     fn study_with_steps(timeouts: &[u32]) -> Study {
-        let mut steps: HVec<embarch_study_designer::Step, MAX_STEPS_PER_STUDY> = HVec::new();
+        let mut steps = embarch_study_designer::step_list::StepList::new();
         for (i, t) in timeouts.iter().enumerate() {
             steps.push(step(&format!("step-{i}"), *t)).unwrap();
         }
@@ -2126,6 +2148,47 @@ mod tests {
         // only waiting on the terminal StudyDone now.
         let deadline = next_deadline(&study, 2, now);
         assert_eq!(deadline, now + Duration::from_millis(5_000 + WATCHDOG_GRACE_MS));
+    }
+
+    /// The regression for design.md §3 decision 33. Against the old math
+    /// (`timeout_ms + GRACE`, delay ignored) this study's window was 3s while
+    /// dev-bench would not even *start* the step for 30s — a guaranteed
+    /// spurious lapse against a bench doing exactly what it was told.
+    #[test]
+    fn next_deadline_includes_the_upcoming_steps_delay_before_ms() {
+        let mut study = study_with_steps(&[1_000]);
+        study.steps[0].delay_before_ms = 30_000;
+        let now = Instant::now();
+        let deadline = next_deadline(&study, 0, now);
+        assert_eq!(deadline, now + Duration::from_millis(30_000 + 1_000 + WATCHDOG_GRACE_MS));
+        // The defect this replaces, stated as the thing that must not be true:
+        // a bench sleeping its authored delay must not outlive the window.
+        assert!(deadline > now + Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn next_deadline_ignores_the_last_steps_delay_once_only_study_done_is_left() {
+        // Every StepResult has arrived, so the last step's delay is already
+        // spent — re-adding it would widen the StudyDone wait for nothing.
+        let mut study = study_with_steps(&[1_000, 5_000]);
+        study.steps[1].delay_before_ms = 30_000;
+        let now = Instant::now();
+        let deadline = next_deadline(&study, 2, now);
+        assert_eq!(deadline, now + Duration::from_millis(5_000 + WATCHDOG_GRACE_MS));
+    }
+
+    /// The per-step delay must be read from the step actually being waited on,
+    /// not from the first step or from any aggregate.
+    #[test]
+    fn next_deadline_reads_the_delay_of_the_outstanding_step_only() {
+        let mut study = study_with_steps(&[1_000, 2_000]);
+        study.steps[0].delay_before_ms = 9_000;
+        study.steps[1].delay_before_ms = 500;
+        let now = Instant::now();
+        assert_eq!(
+            next_deadline(&study, 1, now),
+            now + Duration::from_millis(500 + 2_000 + WATCHDOG_GRACE_MS)
+        );
     }
 
     // ---- job registry state transitions ----

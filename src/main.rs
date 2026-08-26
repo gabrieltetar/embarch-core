@@ -90,6 +90,18 @@ enum Command {
     /// SEGGER-VID detection `GET /dev-bench/port` serves — a human's way to
     /// check the bench is visible without an HTTP client or a running service.
     DetectDevBench,
+    /// List probe-rs target names, optionally narrowed by a case-insensitive
+    /// substring — design.md §3 decision 34. Pure enumeration: no probe is
+    /// opened and no board need be attached, same posture as
+    /// `detect-dev-bench`. This is where the value for an
+    /// `embarch-api` `soc_chip_overrides` entry comes from when a SoC isn't
+    /// in the built-in table, replacing the `cargo install probe-rs-tools`
+    /// detour that onboarding used to require for exactly this.
+    ChipList {
+        /// Case-insensitive substring; omit to list every target. Substring,
+        /// not prefix — someone hunting a "54L15" should find `nRF54L15_xxAA`.
+        filter: Option<String>,
+    },
     /// Print the last N lines of embarch-core's own current daily log file
     /// (§3 decision 16) — pure local file read, no hardware access, same
     /// posture as `detect-dev-bench`. Useful for seeing what a Core running
@@ -178,6 +190,23 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "  detected_by: {}\n  serial: {:?}\n  product: {:?}\n  interface: {:?}",
                 port.detected_by, port.serial_number, port.product, port.interface
+            );
+        }
+        Command::ChipList { filter } => {
+            let names = chip_resolve::chip_list(filter.as_deref());
+            for name in &names {
+                println!("{name}");
+            }
+            // To stderr, so `chip-list | grep` and friends see only names on
+            // stdout — this subcommand's output is meant to be piped.
+            eprintln!(
+                "{} target{} listed{}.",
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                match &filter {
+                    Some(f) => format!(" matching {f:?}"),
+                    None => String::new(),
+                }
             );
         }
         Command::Logs { tail } => {

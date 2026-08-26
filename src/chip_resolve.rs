@@ -92,9 +92,106 @@ pub fn resolve(soc: &str) -> Result<String, UnmappedSoc> {
     Ok(chip.to_string())
 }
 
+/// Every probe-rs target name, optionally narrowed by a **case-insensitive
+/// substring** filter — design.md §3 decision 34's `chip-list [filter]`.
+///
+/// Pure enumeration: no probe is opened, no hardware is touched, nothing is
+/// attached to. Same posture as `detect-dev-bench`, so an unprivileged human
+/// can run it with no board plugged in and no service running.
+///
+/// **Substring, deliberately not `Registry::search_chips`.** That method
+/// prefix-matches (with `x` as a wildcard), which is the wrong shape for the
+/// job this exists to do: someone who knows their part is a "54L15" and is
+/// hunting for the string to put in a `soc_chip_overrides` entry gets nothing
+/// from a prefix search, because the name they want is `nRF54L15_xxAA`. The
+/// whole point of the fallback is that the user does *not* already know how
+/// the name starts. Note the contrast with [`resolve`] directly above, which
+/// is exact-match on purpose — there, a wrong-but-plausible match silently
+/// picks the wrong physical target; here, the human reads the list and picks.
+///
+/// Results are deduplicated and sorted, so the output is stable enough to
+/// diff across probe-rs upgrades.
+pub fn chip_list(filter: Option<&str>) -> Vec<String> {
+    let needle = filter.map(|f| f.to_lowercase());
+    let registry = Registry::from_builtin_families();
+
+    let mut names: Vec<String> = registry
+        .families()
+        .iter()
+        .flat_map(|family| family.variants.iter())
+        .map(|variant| variant.name.to_string())
+        .filter(|name| match &needle {
+            Some(n) => name.to_lowercase().contains(n.as_str()),
+            None => true,
+        })
+        .collect();
+
+    names.sort();
+    names.dedup();
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chip_list_unfiltered_returns_the_whole_registry() {
+        let all = chip_list(None);
+        // No exact count asserted — it tracks probe-rs's target database and
+        // would break on every upgrade for no benefit. The floor is the point.
+        assert!(all.len() > 100, "expected a substantial target list, got {}", all.len());
+    }
+
+    #[test]
+    fn chip_list_is_sorted_and_deduplicated() {
+        let all = chip_list(None);
+        let mut expected = all.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(all, expected);
+    }
+
+    /// The case decision 34 exists for: a human knows the part is a 54L15 and
+    /// does not know the name starts with `nRF`. A prefix search returns
+    /// nothing here, which is why this is a substring match.
+    #[test]
+    fn chip_list_matches_a_substring_not_just_a_prefix() {
+        let hits = chip_list(Some("54L15"));
+        assert!(!hits.is_empty(), "expected nRF54L15 variants");
+        assert!(
+            hits.iter().all(|h| h.to_lowercase().contains("54l15")),
+            "every hit must contain the needle: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| !h.to_lowercase().starts_with("54l15")),
+            "the point of the substring match is hits the needle does not prefix: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn chip_list_filter_is_case_insensitive() {
+        assert_eq!(chip_list(Some("nrf54l15")), chip_list(Some("NRF54L15")));
+    }
+
+    #[test]
+    fn chip_list_returns_empty_for_a_needle_that_matches_nothing() {
+        assert!(chip_list(Some("definitely-not-a-real-chip")).is_empty());
+    }
+
+    /// `chip_list` is the fallback a `soc_chip_overrides` value is read out
+    /// of, so what it prints has to be a name `resolve`'s own validation step
+    /// (`get_target_by_name`) will accept. Checked rather than assumed.
+    #[test]
+    fn chip_list_names_are_resolvable_targets() {
+        let registry = Registry::from_builtin_families();
+        for name in chip_list(Some("nRF54")) {
+            assert!(
+                registry.get_target_by_name(&name).is_ok(),
+                "chip_list offered {name}, which probe-rs will not resolve"
+            );
+        }
+    }
 
     #[test]
     fn resolves_known_soc() {
