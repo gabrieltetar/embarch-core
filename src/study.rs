@@ -1904,7 +1904,7 @@ mod tests {
     }
 
     fn study_with_steps(timeouts: &[u32]) -> Study {
-        let mut steps = embarch_study_designer::step_list::StepList::new();
+        let mut steps = embarch_study_designer::bounded::StepList::new();
         for (i, t) in timeouts.iter().enumerate() {
             steps.push(step(&format!("step-{i}"), *t)).unwrap();
         }
