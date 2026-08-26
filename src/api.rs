@@ -1280,6 +1280,35 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// **The other half of a mirror no crate can see both sides of.**
+    ///
+    /// `embarch-core-client`'s `SignalLink` is a hand-maintained mirror of
+    /// `embarch_topology::hardware::SignalLink` — it has to be, since the real
+    /// type is behind that crate's `hardware` feature and pulling that in
+    /// would link `probe-rs`/`serialport` into a client that deliberately
+    /// never does. Nothing compiles both types, so the coupling is pinned from
+    /// each side against this same literal;
+    /// `embarch-core-client`'s `a_declared_signal_serializes_to_the_shape_core_parses`
+    /// is the other assertion. If you change one, change both.
+    #[test]
+    fn the_signal_link_wire_shape_is_what_clients_send() {
+        const SIGNAL_LINK_JSON: &str = concat!(
+            r#"{"name":"outpost","origin_role":"dut","direction":"dut-to-host","#,
+            r#""route":{"kind":"direct","port_serial":"ABC123"}}"#
+        );
+
+        let link: embarch_topology::hardware::SignalLink =
+            serde_json::from_str(SIGNAL_LINK_JSON).expect("a client's POST /signals body parses");
+        assert_eq!(link.name, "outpost");
+        assert_eq!(link.origin_role, "dut");
+        assert_eq!(link.direction, embarch_topology::hardware::SignalDirection::DutToHost);
+        assert_eq!(
+            link.route,
+            embarch_topology::hardware::Route::Direct { port_serial: "ABC123".to_string() }
+        );
+        assert_eq!(serde_json::to_string(&link).unwrap(), SIGNAL_LINK_JSON);
+    }
+
     #[tokio::test]
     async fn remove_signal_requires_the_bearer_token() {
         let response = test_router()
