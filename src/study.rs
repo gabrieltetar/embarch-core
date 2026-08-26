@@ -23,10 +23,12 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
-    limits::MAX_FIRMWARE_VERSION_LEN, requirement_satisfied, samples_in, steps_crc, streams_crc,
+    limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
+    requirement_satisfied, samples_in, steps_crc, streams_crc,
     validate_taps, DevBenchMessage, GattTranscriptEntry, Provenance, Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
-    ValidationSource, VersionSource, DEV_BENCH_WIRE_SCHEMA_VERSION,
+    ValidationSource, VersionOverride, VersionSource, VersionSubject,
+    DEV_BENCH_WIRE_SCHEMA_VERSION,
 };
 
 use crate::api::{internal_err, AppState};
@@ -241,31 +243,133 @@ fn validate_study(study: &Study) -> Result<(), String> {
 /// the only message that can make dev-bench execute anything, so "the
 /// closure was never called" and "no step ran" are the same statement.
 ///
-/// `requires.firmware_version` is deliberately **not** checked here. There
-/// is no readback path from a DUT — Core flashes through a debug probe and
-/// gets nothing back — so it is checkable only when this run flashed the
-/// DUT itself or an outpost header record carries a build ID, neither of
-/// which Core can do today. That is what [`provenance_for`]'s source field
-/// exists to record instead.
+/// `requires.firmware_version` is checkable **only when this run's caller
+/// says it flashed the DUT** (`run.flashed_firmware_version`,
+/// `embarch-api/design.md` §3 decision 40). There is no readback path from a
+/// DUT — Core flashes through a debug probe and gets nothing back — so
+/// absent that, the requirement is recorded as `Declared` and not compared
+/// against anything. With it, the DUT half of the gate fires for the first
+/// time: `embarch-api` is the only process that sequenced both the flash and
+/// the submit, so it is the only one that can supply the string.
+///
+/// **An override is recorded, never silently honoured** (decision 31,
+/// `embarch-study-designer/design.md` §3 decision 40). On success this
+/// returns every requirement it waved through, which
+/// [`provenance_for`] writes into the result — a run allowed past a
+/// requirement must not be indistinguishable from one that satisfied it.
 fn gate_then_start(
     requires: &Requirements,
     reported_dev_bench_version: &str,
+    run: &StudyRunParams,
     send_study_start: impl FnOnce() -> Result<(), String>,
-) -> Result<(), (StatusCode, String)> {
-    if !requirement_satisfied(requires.dev_bench_version.as_str(), reported_dev_bench_version) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "dev-bench version mismatch: this study requires '{}', but the bench reports \
-                 '{reported_dev_bench_version}' — no step was run. Reflash the bench, or \
-                 author the study against the build you have (`any` if it genuinely doesn't \
-                 matter).",
-                requires.dev_bench_version
-            ),
-        ));
+) -> Result<heapless::Vec<VersionOverride, MAX_VERSION_OVERRIDES>, (StatusCode, String)> {
+    let mut overrides = heapless::Vec::new();
+
+    let mut check = |subject: VersionSubject, required: &str, actual: &str| {
+        if requirement_satisfied(required, actual) {
+            return Ok(());
+        }
+        if !run.allow_version_mismatch() {
+            return Err((
+                StatusCode::CONFLICT,
+                mismatch_message(subject, required, actual),
+            ));
+        }
+        // The push cannot fail: `MAX_VERSION_OVERRIDES` is the arity of
+        // `Requirements` itself, and each subject is checked at most once.
+        let _ = overrides.push(VersionOverride {
+            subject,
+            required: clamp_version(required),
+            actual: clamp_version(actual),
+        });
+        tracing::warn!(
+            field = subject.field_name(),
+            required,
+            actual,
+            "version requirement waved through by an explicit override; recording it in the result"
+        );
+        Ok(())
+    };
+
+    check(
+        VersionSubject::DevBench,
+        requires.dev_bench_version.as_str(),
+        reported_dev_bench_version,
+    )?;
+
+    if let Some(flashed) = run.flashed_firmware_version.as_deref() {
+        check(VersionSubject::Firmware, requires.firmware_version.as_str(), flashed)?;
     }
 
-    send_study_start().map_err(|msg| (StatusCode::BAD_GATEWAY, msg))
+    send_study_start().map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
+    Ok(overrides)
+}
+
+/// The `409` body for a version mismatch, naming **both** strings and saying
+/// no step ran — the same shape `doctor` check 13 fails in
+/// (`embarch-study-designer/design.md` §3 decision 40).
+fn mismatch_message(subject: VersionSubject, required: &str, actual: &str) -> String {
+    let (what, remedy) = match subject {
+        VersionSubject::DevBench => (
+            "dev-bench",
+            "Reflash the bench (`run_study --reflash dev-bench`)",
+        ),
+        VersionSubject::Firmware => (
+            "DUT firmware",
+            "Reflash the DUT from the revision the study wants",
+        ),
+    };
+    format!(
+        "{what} version mismatch: this study requires requires.{} = '{required}', but this run \
+         has '{actual}' — no step was run. {remedy}, author the study against the build you \
+         have (`any` if it genuinely doesn't matter), or re-submit with \
+         `allow_version_mismatch=1`, which proceeds and records the override in the result.",
+        subject.field_name()
+    )
+}
+
+/// The two out-of-band run parameters `POST /study` accepts as query
+/// parameters (design.md §3 decision 31's amendment,
+/// `embarch-api/design.md` §3 decision 40).
+///
+/// **Query parameters rather than fields on the `Study` body**, because
+/// `embarch-study-designer/design.md` §3 decision 40 settles that reflash is
+/// "a run parameter, not a study field": a saved study that reflashed a
+/// board every time you re-read its results is the thing that decision
+/// exists to prevent. A parameter of the *request* is literally that. It
+/// also leaves the `Study` body byte-identical, so `steps_crc`/`streams_crc`
+/// and every `Study` fixture on disk are untouched — a wrapping request body
+/// would have changed the shape every existing client posts.
+///
+/// Query rather than a header, for the same reason the override is recorded
+/// rather than honoured silently: a query parameter shows up in Core's own
+/// request log and in a `curl` an engineer types by hand. A header does not.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct StudyRunParams {
+    /// Proceed past a version requirement this run does not satisfy, and
+    /// record the override in `StudyResult.provenance.overrides`. Accepts
+    /// `1`/`true`; anything else (including absent) is off.
+    pub allow_version_mismatch: Option<String>,
+    /// What the caller says it just flashed onto the DUT. Its presence is
+    /// what makes `firmware_source: FlashedThisRun` honest — and what makes
+    /// `requires.firmware_version` checkable at all. Absent (the normal
+    /// case, and every case where nothing was flashed) the DUT's version
+    /// stays `Declared`.
+    ///
+    /// One parameter carrying both facts, not a boolean plus a string: "I
+    /// flashed something" without saying what is exactly the
+    /// assertion-without-content this whole area exists to remove.
+    pub flashed_firmware_version: Option<String>,
+}
+
+impl StudyRunParams {
+    fn allow_version_mismatch(&self) -> bool {
+        matches!(
+            self.allow_version_mismatch.as_deref(),
+            Some("1") | Some("true")
+        )
+    }
 }
 
 /// What this run actually executed against, and **how each version was
@@ -273,21 +377,41 @@ fn gate_then_start(
 /// §4.5).
 ///
 /// dev-bench's is [`VersionSource::ReportedByDevBench`] — Core read it off
-/// the live link. The DUT's is [`VersionSource::Declared`] and, today,
-/// *always* is: `FlashedThisRun` needs Core to have flashed the DUT as part
-/// of this run, which Core deliberately never does (decision 31's
-/// no-build-system boundary — `embarch-api` sequences check → build → flash
-/// → `POST /study`), and `ReportedByOutpost` needs an outpost header record
-/// no firmware emits yet. **Rendering a `Declared` version identically to a
-/// verified one is the exact mislabelling decision 31 was written to
-/// prevent**, so the source field says which it is rather than the value
-/// being presented on its own.
-fn provenance_for(study: &Study, reported_dev_bench_version: &str) -> Provenance {
+/// the live link. The DUT's is [`VersionSource::Declared`] unless the caller
+/// supplied `flashed_firmware_version`, in which case it is
+/// [`VersionSource::FlashedThisRun`] and the recorded string is what the
+/// caller says it put there rather than what the study asked for.
+///
+/// **Core still never flashes as part of a study** — decision 31's
+/// no-build-system boundary is unchanged. `FlashedThisRun` is reachable here
+/// only because `embarch-api` sequences check → build → flash → `POST
+/// /study` and tells Core so out of band; Core keeps no persisted "last
+/// thing I flashed" record of its own, which is the staleness pattern
+/// `embarch-topology/design.md` §3 decision 3 forbids and which decision
+/// 30(c) already declined once. `ReportedByOutpost` still needs an outpost
+/// header record no firmware emits yet.
+///
+/// **Rendering a `Declared` version identically to a verified one is the
+/// exact mislabelling decision 31 was written to prevent**, so the source
+/// field says which it is rather than the value being presented on its own —
+/// and `overrides` says which requirements, if any, this run was allowed
+/// past rather than satisfied.
+fn provenance_for(
+    study: &Study,
+    reported_dev_bench_version: &str,
+    run: &StudyRunParams,
+    overrides: heapless::Vec<VersionOverride, MAX_VERSION_OVERRIDES>,
+) -> Provenance {
+    let (firmware_version, firmware_source) = match run.flashed_firmware_version.as_deref() {
+        Some(flashed) => (clamp_version(flashed), VersionSource::FlashedThisRun),
+        None => (study.requires.firmware_version.clone(), VersionSource::Declared),
+    };
     Provenance {
         dev_bench_version: clamp_version(reported_dev_bench_version),
-        firmware_version: study.requires.firmware_version.clone(),
+        firmware_version,
         dev_bench_source: VersionSource::ReportedByDevBench,
-        firmware_source: VersionSource::Declared,
+        firmware_source,
+        overrides,
     }
 }
 
@@ -514,6 +638,7 @@ pub async fn hello_handler(
 /// of the study's lifetime.
 pub async fn post_study_handler(
     State(state): State<AppState>,
+    Query(run): Query<StudyRunParams>,
     Json(study): Json<Study>,
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
@@ -578,23 +703,20 @@ pub async fn post_study_handler(
         }
     };
 
-    // What this run actually ran against, captured off the live link before
-    // anything else can change (decision 31).
-    let provenance = provenance_for(&study, &hello.firmware_version);
-
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
     let streams = study.streams.clone();
     let streams_crc_value = study.streams_crc;
     let requires = study.requires.clone();
     let reported = hello.firmware_version.clone();
+    let run_for_gate = run.clone();
 
     // Decision 31's gate and the `StudyStart` send, in that order and in one
     // blocking hop: the gate runs *before* dev-bench is told to do anything,
     // so a version mismatch leaves a bench that never started a step.
     let started = tokio::task::spawn_blocking(move || {
         let mut link = link;
-        let outcome = gate_then_start(&requires, &reported, || {
+        let outcome = gate_then_start(&requires, &reported, &run_for_gate, || {
             // `streams` rides along; `validations` and `requires`
             // deliberately do not (`embarch-study-designer/design.md` §3
             // decisions 17, 39, 40) — dev-bench has to know which taps to
@@ -612,8 +734,8 @@ pub async fn post_study_handler(
     })
     .await;
 
-    let link = match started {
-        Ok((Ok(()), link)) => link,
+    let (link, overrides) = match started {
+        Ok((Ok(overrides), link)) => (link, overrides),
         Ok((Err(rejection), _link)) => {
             release_lock();
             return Err(rejection);
@@ -623,6 +745,14 @@ pub async fn post_study_handler(
             return Err(internal_err(e));
         }
     };
+
+    // What this run actually ran against — the bench's version captured off
+    // the live link, the DUT's from whatever the caller says it flashed, and
+    // whatever the gate above was told to wave through (decision 31).
+    // Assembled after the gate rather than before it, because `overrides` is
+    // the gate's own output and a provenance built ahead of it could only
+    // ever have claimed the requirements were met.
+    let provenance = provenance_for(&study, &hello.firmware_version, &run, overrides);
 
     let total_steps = study.steps.len() as u32;
     {
@@ -2086,7 +2216,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("embarch-study-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance_for(&study_with_steps(&[1_000]), "gbench1")).unwrap();
+        let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default())).unwrap();
         writer.write_step(&test_step_result("step-0")).unwrap();
 
         finish_job(&jobs, &events_tx, "abc", writer);
@@ -2159,7 +2289,7 @@ mod tests {
         capture.store.lock().unwrap().mark_lost_at_source(1);
 
         let mut writer =
-            EventsJsonWriter::start(dir.path(), "s", &provenance_for(&capture.study, "gbench1"))
+            EventsJsonWriter::start(dir.path(), "s", &provenance_for(&capture.study, "gbench1", &no_run_params(), Default::default()))
                 .unwrap();
         finish_streams(&capture, &mut writer);
         writer.finish().unwrap();
@@ -2182,7 +2312,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = EventsJsonWriter::start(&dir, "s", &provenance_for(&study_with_steps(&[1_000]), "gbench1")).unwrap();
+        let mut writer = EventsJsonWriter::start(&dir, "s", &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default())).unwrap();
         writer.write_step(&test_step_result("a")).unwrap();
         writer.write_step(&test_step_result("b")).unwrap();
         assert!(dir.join("events.json.partial").exists());
@@ -2397,6 +2527,29 @@ mod tests {
         }
     }
 
+    fn requires_pair(dev_bench: &str, firmware: &str) -> Requirements {
+        Requirements {
+            dev_bench_version: heapless::String::try_from(dev_bench).unwrap(),
+            firmware_version: heapless::String::try_from(firmware).unwrap(),
+        }
+    }
+
+    /// No override, nothing flashed — the shape every pre-item-2 caller had.
+    fn no_run_params() -> StudyRunParams {
+        StudyRunParams::default()
+    }
+
+    fn allow_mismatch() -> StudyRunParams {
+        StudyRunParams { allow_version_mismatch: Some("1".to_string()), ..Default::default() }
+    }
+
+    fn flashed(version: &str) -> StudyRunParams {
+        StudyRunParams {
+            flashed_firmware_version: Some(version.to_string()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn a_dev_bench_version_mismatch_is_a_409_and_no_step_ever_runs() {
         // The assertion that matters is the second one. `StudyStart` is the
@@ -2405,7 +2558,7 @@ mod tests {
         // which is exactly what decision 31 forbids, and exactly what a test
         // asserting only the status code would miss.
         let mut sent = false;
-        let outcome = gate_then_start(&requires("g1a2b3c"), "gdeadbee", || {
+        let outcome = gate_then_start(&requires("g1a2b3c"), "gdeadbee", &no_run_params(), || {
             sent = true;
             Ok(())
         });
@@ -2421,7 +2574,7 @@ mod tests {
     #[test]
     fn an_exact_version_match_starts_the_study() {
         let mut sent = false;
-        gate_then_start(&requires("g1a2b3c"), "g1a2b3c", || {
+        gate_then_start(&requires("g1a2b3c"), "g1a2b3c", &no_run_params(), || {
             sent = true;
             Ok(())
         })
@@ -2432,7 +2585,7 @@ mod tests {
     #[test]
     fn any_is_a_value_that_satisfies_every_bench() {
         let mut sent = false;
-        gate_then_start(&requires("any"), "whatever-the-bench-happens-to-be", || {
+        gate_then_start(&requires("any"), "whatever-the-bench-happens-to-be", &no_run_params(), || {
             sent = true;
             Ok(())
         })
@@ -2442,7 +2595,7 @@ mod tests {
 
     #[test]
     fn a_send_failure_is_a_bad_gateway_not_a_version_rejection() {
-        let (status, msg) = gate_then_start(&requires("any"), "x", || Err("serial died".to_string()))
+        let (status, msg) = gate_then_start(&requires("any"), "x", &no_run_params(), || Err("serial died".to_string()))
             .expect_err("a failed send is still a failure");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(msg, "serial died");
@@ -2456,12 +2609,177 @@ mod tests {
         // firmware version is `Declared` — an assertion nobody checked, and
         // it says so.
         let study = study_with_steps(&[1_000]);
-        let provenance = provenance_for(&study, "gfeedface");
+        let provenance = provenance_for(&study, "gfeedface", &no_run_params(), Default::default());
         assert_eq!(provenance.dev_bench_version.as_str(), "gfeedface");
         assert_eq!(provenance.dev_bench_source, VersionSource::ReportedByDevBench);
         assert_eq!(provenance.firmware_source, VersionSource::Declared);
         assert!(provenance.dev_bench_source.is_verified());
         assert!(!provenance.firmware_source.is_verified());
+    }
+
+    #[test]
+    fn an_override_proceeds_and_the_result_records_what_was_waved_through() {
+        // `embarch-study-designer/design.md` §3 decision 40: the override is
+        // "recorded in the result rather than silently honoured". The
+        // assertion that matters is the third one — a run that proceeded past
+        // a requirement must not be indistinguishable from one that met it.
+        let mut sent = false;
+        let overrides = gate_then_start(&requires("g1a2b3c"), "gdeadbee", &allow_mismatch(), || {
+            sent = true;
+            Ok(())
+        })
+        .expect("an explicit override proceeds");
+        assert!(sent, "the study runs — that is what the override is for");
+
+        let provenance = provenance_for(
+            &study_with_steps(&[1_000]),
+            "gdeadbee",
+            &allow_mismatch(),
+            overrides,
+        );
+        assert!(provenance.was_overridden());
+        let recorded = provenance
+            .override_for(VersionSubject::DevBench)
+            .expect("the dev-bench requirement is the one that was waved through");
+        assert_eq!(recorded.required.as_str(), "g1a2b3c");
+        assert_eq!(recorded.actual.as_str(), "gdeadbee");
+    }
+
+    #[test]
+    fn a_satisfied_gate_records_no_override_even_when_one_was_allowed() {
+        // `--allow-version-mismatch` is permission, not an assertion that
+        // anything mismatched. A run that passed the gate on its own merits
+        // must not be marked as having been waved through.
+        let overrides =
+            gate_then_start(&requires("g1a2b3c"), "g1a2b3c", &allow_mismatch(), || Ok(()))
+                .expect("an exact match satisfies the requirement");
+        let provenance =
+            provenance_for(&study_with_steps(&[1_000]), "g1a2b3c", &allow_mismatch(), overrides);
+        assert!(!provenance.was_overridden());
+    }
+
+    #[test]
+    fn the_dut_requirement_is_only_checked_when_this_run_says_it_flashed_one() {
+        // Core has no readback path from a DUT (decision 31). Absent a
+        // caller that flashed it, `requires.firmware_version` is compared
+        // against nothing and recorded as `Declared` — so a study demanding a
+        // specific DUT build still starts, exactly as it did before item 2.
+        let mut study = study_with_steps(&[1_000]);
+        study.requires = requires_pair("any", "g-dut-aaaa");
+        let mut sent = false;
+        let overrides = gate_then_start(
+            &requires_pair("any", "g-dut-aaaa"),
+            "gbench1",
+            &no_run_params(),
+            || {
+                sent = true;
+                Ok(())
+            },
+        )
+        .expect("an unverifiable DUT requirement is not a rejection");
+        assert!(sent);
+        assert!(overrides.is_empty());
+
+        let provenance = provenance_for(&study, "gbench1", &no_run_params(), overrides);
+        assert_eq!(provenance.firmware_source, VersionSource::Declared);
+        assert_eq!(provenance.firmware_version.as_str(), "g-dut-aaaa");
+        assert!(!provenance.firmware_source.is_verified());
+    }
+
+    #[test]
+    fn a_flashed_dut_version_makes_the_firmware_gate_fire_and_the_source_verified() {
+        // The whole point of `embarch-api` supplying this: the DUT half of
+        // the gate is unreachable from Core on its own (decision 31's
+        // implementation note), so this is the first path on which a wrong
+        // DUT build can be rejected at all.
+        let study = study_with_steps(&[1_000]);
+
+        let mut sent = false;
+        let (status, msg) = gate_then_start(
+            &requires_pair("any", "g-dut-aaaa"),
+            "gbench1",
+            &flashed("g-dut-bbbb"),
+            || {
+                sent = true;
+                Ok(())
+            },
+        )
+        .expect_err("a DUT build the study did not ask for is a rejection");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!sent, "no step may run on a firmware mismatch either");
+        assert!(msg.contains("g-dut-aaaa"), "{msg}");
+        assert!(msg.contains("g-dut-bbbb"), "{msg}");
+
+        // The matching case records what was actually put on the board, not
+        // what the study asked for — the two are the same string here, and
+        // the *source* is what makes the difference legible.
+        let overrides = gate_then_start(
+            &requires_pair("any", "g-dut-aaaa"),
+            "gbench1",
+            &flashed("g-dut-aaaa"),
+            || Ok(()),
+        )
+        .expect("the build this run flashed is the one the study wanted");
+        let provenance =
+            provenance_for(&study, "gbench1", &flashed("g-dut-aaaa"), overrides);
+        assert_eq!(provenance.firmware_source, VersionSource::FlashedThisRun);
+        assert_eq!(provenance.firmware_version.as_str(), "g-dut-aaaa");
+        assert!(provenance.firmware_source.is_verified());
+    }
+
+    #[test]
+    fn a_flashed_dut_version_wins_over_the_declared_one_in_the_result() {
+        // `requires.firmware_version: any` is a legitimate study that still
+        // flashed something real. The result has to say *what* ran, not
+        // "any" — which is the gap decision 40 was opened by.
+        let study = study_with_steps(&[1_000]);
+        let overrides =
+            gate_then_start(&requires_pair("any", "any"), "gbench1", &flashed("g-dut-cccc"), || {
+                Ok(())
+            })
+            .expect("`any` is satisfied by whatever was flashed");
+        let provenance = provenance_for(&study, "gbench1", &flashed("g-dut-cccc"), overrides);
+        assert_eq!(provenance.firmware_version.as_str(), "g-dut-cccc");
+        assert_eq!(provenance.firmware_source, VersionSource::FlashedThisRun);
+    }
+
+    #[test]
+    fn both_requirements_can_be_waved_through_in_one_run() {
+        let study = study_with_steps(&[1_000]);
+        let run = StudyRunParams {
+            allow_version_mismatch: Some("1".to_string()),
+            flashed_firmware_version: Some("g-dut-bbbb".to_string()),
+        };
+        let overrides =
+            gate_then_start(&requires_pair("g1a2b3c", "g-dut-aaaa"), "gdeadbee", &run, || Ok(()))
+                .expect("both are explicitly allowed");
+        assert_eq!(overrides.len(), 2);
+        let provenance = provenance_for(&study, "gdeadbee", &run, overrides);
+        assert!(provenance.override_for(VersionSubject::DevBench).is_some());
+        assert!(provenance.override_for(VersionSubject::Firmware).is_some());
+    }
+
+    #[test]
+    fn only_an_explicit_query_value_turns_the_override_on() {
+        // A typo'd or absent parameter must not read as permission to
+        // proceed past a version gate.
+        for raw in [None, Some(""), Some("0"), Some("false"), Some("yes"), Some("TRUE")] {
+            let run = StudyRunParams {
+                allow_version_mismatch: raw.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(
+                gate_then_start(&requires("g1a2b3c"), "gdeadbee", &run, || Ok(())).is_err(),
+                "allow_version_mismatch={raw:?} must not wave a mismatch through"
+            );
+        }
+        for raw in ["1", "true"] {
+            let run = StudyRunParams {
+                allow_version_mismatch: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert!(gate_then_start(&requires("g1a2b3c"), "gdeadbee", &run, || Ok(())).is_ok());
+        }
     }
 
     // ---- serving a capture back: GET /study/{id}/stream/{name} -------------
@@ -2492,6 +2810,95 @@ mod tests {
         assert_eq!(index.find_alias("power").map(|e| e.name.as_str()), Some("power"));
         assert!(index.find_alias("gatt").is_none());
         assert!(index.find("no-such-tap").is_none());
+    }
+
+    /// **The test the aliases exist for** (`embarch-core/design.md` §3
+    /// decision 30, `embarch-api/design.md` §3 decision 39): each of the
+    /// three retired fixed routes has to keep answering with *exactly* what
+    /// its replacement answers with, for one release, or an agent
+    /// mid-conversation gets silently different data from the same call it
+    /// was already making.
+    ///
+    /// Asserting the bodies are byte-identical is the point — two paths that
+    /// each merely return "some CSV" would pass a test that checked only
+    /// status codes, and diverge in content the first time one of them picks
+    /// a different entry out of the index.
+    #[tokio::test]
+    async fn each_alias_returns_byte_for_byte_what_its_replacement_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let gatt = tap(1, "gatt-transcript", StreamSource::GattTranscript, StreamEncoding::GattTranscript);
+        let waveform = tap(
+            2,
+            "sensor-waveform",
+            StreamSource::GattNotify {
+                service_uuid: embarch_study_designer::Uuid::parse(
+                    "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+                )
+                .unwrap(),
+                characteristic_uuid: embarch_study_designer::Uuid::parse(
+                    "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+                )
+                .unwrap(),
+            },
+            StreamEncoding::Samples {
+                layout: embarch_study_designer::SampleLayout::F32Le,
+                unit: embarch_study_designer::Unit::Volts,
+                channel_id: 1,
+            },
+        );
+        let study = study_with_taps(&[1_000], &[power_tap(), gatt, waveform]);
+        let capture = test_capture(dir.path(), study);
+
+        // Give all three taps something to serve.
+        for tap in capture.study.streams.clone().iter() {
+            let bytes: heapless::Vec<u8, { embarch_study_designer::limits::MAX_STREAM_CHUNK_BYTES }> =
+                match tap.encoding {
+                    StreamEncoding::GattTranscript => {
+                        let entry = transcript_entry(b"\x01\x02");
+                        let mut buf = [0u8; 256];
+                        let encoded = postcard::to_slice(&entry, &mut buf).unwrap();
+                        heapless::Vec::from_slice(encoded).unwrap()
+                    }
+                    _ => heapless::Vec::from_slice(&3.3f32.to_le_bytes()).unwrap(),
+                };
+            write_stream_record(&capture, tap, &StreamRecord { rx_utc_ms: 7, bytes });
+        }
+
+        let streams_dir = dir.path().join("streams");
+        let index = stream_store::read_index(&streams_dir).unwrap().unwrap();
+
+        for (alias, tap_name) in [
+            ("power", "power"),
+            ("gatt", "gatt-transcript"),
+            ("waveform", "sensor-waveform"),
+        ] {
+            let via_alias = index
+                .find_alias(alias)
+                .unwrap_or_else(|| panic!("alias '{alias}' must resolve"));
+            let via_name = index
+                .find(tap_name)
+                .unwrap_or_else(|| panic!("tap '{tap_name}' must resolve by its declared name"));
+            assert_eq!(
+                via_alias.name, via_name.name,
+                "alias '{alias}' and tap '{tap_name}' must be the same tap"
+            );
+
+            let alias_body = body_bytes(serve_capture(&streams_dir, via_alias, false, alias).await.unwrap()).await;
+            let stream_body =
+                body_bytes(serve_capture(&streams_dir, via_name, false, tap_name).await.unwrap()).await;
+            assert_eq!(
+                alias_body, stream_body,
+                "alias '{alias}' and study_stream_data('{tap_name}') must return identical bytes"
+            );
+            assert!(!alias_body.is_empty(), "alias '{alias}' returned nothing");
+        }
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     #[tokio::test]
