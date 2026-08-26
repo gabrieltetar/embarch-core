@@ -6,6 +6,7 @@ mod hardware;
 mod logs;
 mod serial;
 mod service;
+mod stream_store;
 mod study;
 mod token_store;
 

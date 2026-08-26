@@ -81,6 +81,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
+        .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))
         .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
         .route("/study/{study_id}/gatt-data", get(study::gatt_data_handler))
@@ -1203,5 +1204,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stream_data_requires_the_bearer_token() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/study/abc/stream/power")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The parameterised route (`design.md` §3 decision 30) is actually
+    /// wired to `study::stream_data_handler`, not falling through to axum's
+    /// own not-found — which is the difference this asserts, since an
+    /// unrouted path with a valid token 404s too, just with an empty body.
+    #[tokio::test]
+    async fn stream_data_is_routed_to_the_handler_rather_than_the_fallback() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/study/0123456789abcdef0123456789abcdef/stream/power")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("no captured streams"),
+            "expected the handler's own 404, got: {body}"
+        );
     }
 }

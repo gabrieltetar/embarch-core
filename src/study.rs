@@ -6,29 +6,32 @@
 //! finalized design this module implements. Section references in doc
 //! comments below point back into that document.
 
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
-    samples_in, steps_crc, streams_crc, validate_taps, DevBenchMessage, GattTranscriptEntry, Sample,
-    StepResult, StreamEncoding, StreamSource, StreamTap, Study, ValidationSource,
-    DEV_BENCH_WIRE_SCHEMA_VERSION,
+    limits::MAX_FIRMWARE_VERSION_LEN, requirement_satisfied, samples_in, steps_crc, streams_crc,
+    validate_taps, DevBenchMessage, GattTranscriptEntry, Provenance, Requirements, Sample,
+    StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
+    ValidationSource, VersionSource, DEV_BENCH_WIRE_SCHEMA_VERSION,
 };
 
 use crate::api::{internal_err, AppState};
 use crate::dev_bench_link::DevBenchLink;
+use crate::stream_store::{self, StreamStore};
 use crate::token_store;
 
 /// Host-side watchdog grace margin, on top of a step's own `timeout_ms`
@@ -218,6 +221,83 @@ fn validate_study(study: &Study) -> Result<(), String> {
     Ok(())
 }
 
+// ---- the version gate (design.md §3 decision 31) --------------------------
+
+/// **What Core can verify, it verifies; what it cannot, it must not pretend
+/// to** — `embarch-core/design.md` §3 decision 31, the Core half of
+/// `embarch-study-designer/design.md` §3 decision 40.
+///
+/// `requires.dev_bench_version` is the half Core genuinely *checks*:
+/// dev-bench self-reports its build over `HelloAck`, so this compares a
+/// declared requirement against a string the bench actually said, and a
+/// mismatch is a `409` naming both. The comparison rule itself
+/// ([`requirement_satisfied`]) lives in `embarch-study-designer` so Core
+/// holds no second copy of it.
+///
+/// **`send_study_start` is a parameter rather than a call**, so the
+/// ordering this decision turns on — *no step ever runs* on a mismatch — is
+/// a property a test can assert directly, rather than something a reader
+/// has to trust from the shape of the surrounding handler. `StudyStart` is
+/// the only message that can make dev-bench execute anything, so "the
+/// closure was never called" and "no step ran" are the same statement.
+///
+/// `requires.firmware_version` is deliberately **not** checked here. There
+/// is no readback path from a DUT — Core flashes through a debug probe and
+/// gets nothing back — so it is checkable only when this run flashed the
+/// DUT itself or an outpost header record carries a build ID, neither of
+/// which Core can do today. That is what [`provenance_for`]'s source field
+/// exists to record instead.
+fn gate_then_start(
+    requires: &Requirements,
+    reported_dev_bench_version: &str,
+    send_study_start: impl FnOnce() -> Result<(), String>,
+) -> Result<(), (StatusCode, String)> {
+    if !requirement_satisfied(requires.dev_bench_version.as_str(), reported_dev_bench_version) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "dev-bench version mismatch: this study requires '{}', but the bench reports \
+                 '{reported_dev_bench_version}' — no step was run. Reflash the bench, or \
+                 author the study against the build you have (`any` if it genuinely doesn't \
+                 matter).",
+                requires.dev_bench_version
+            ),
+        ));
+    }
+
+    send_study_start().map_err(|msg| (StatusCode::BAD_GATEWAY, msg))
+}
+
+/// What this run actually executed against, and **how each version was
+/// established** (design.md §3 decision 31, `embarch-study-designer/design.md`
+/// §4.5).
+///
+/// dev-bench's is [`VersionSource::ReportedByDevBench`] — Core read it off
+/// the live link. The DUT's is [`VersionSource::Declared`] and, today,
+/// *always* is: `FlashedThisRun` needs Core to have flashed the DUT as part
+/// of this run, which Core deliberately never does (decision 31's
+/// no-build-system boundary — `embarch-api` sequences check → build → flash
+/// → `POST /study`), and `ReportedByOutpost` needs an outpost header record
+/// no firmware emits yet. **Rendering a `Declared` version identically to a
+/// verified one is the exact mislabelling decision 31 was written to
+/// prevent**, so the source field says which it is rather than the value
+/// being presented on its own.
+fn provenance_for(study: &Study, reported_dev_bench_version: &str) -> Provenance {
+    Provenance {
+        dev_bench_version: clamp_version(reported_dev_bench_version),
+        firmware_version: study.requires.firmware_version.clone(),
+        dev_bench_source: VersionSource::ReportedByDevBench,
+        firmware_source: VersionSource::Declared,
+    }
+}
+
+fn clamp_version(v: &str) -> heapless::String<MAX_FIRMWARE_VERSION_LEN> {
+    heapless::String::try_from(v).unwrap_or_else(|_| {
+        tracing::warn!("dev-bench reported a firmware_version longer than {MAX_FIRMWARE_VERSION_LEN} bytes; recording it empty rather than truncated");
+        heapless::String::new()
+    })
+}
+
 fn generate_study_id() -> String {
     let mut bytes = [0u8; 16];
     rand::fill(&mut bytes);
@@ -231,8 +311,12 @@ fn current_utc_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn study_results_root() -> anyhow::Result<PathBuf> {
+    Ok(token_store::local_data_dir()?.join("study_results"))
+}
+
 fn study_results_dir(study_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(token_store::local_data_dir()?.join("study_results").join(study_id))
+    Ok(study_results_root()?.join(study_id))
 }
 
 /// Applies `f` to the registry entry for `study_id`, if it's still there.
@@ -434,6 +518,19 @@ pub async fn post_study_handler(
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
+    // A `StreamSource::Signal` tap names a signal `embarch-topology` has to
+    // have a declared route for before Core can open anything
+    // (`embarch-topology/design.md` §3 decision 18) — a wire between two
+    // headers is invisible to software and can only ever be stated. Checked
+    // here rather than at the moment the tap opens, because the failure
+    // otherwise lands mid-study as a silently-empty capture, which is the
+    // exact failure mode `validate_taps`' own step-range rules exist to
+    // prevent. Not part of `validate_study`: that function is pure, and this
+    // reads enrollment state off disk.
+    if let Err(msg) = check_signal_taps_are_declared(&study).await {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
+
     let study_id = generate_study_id();
 
     {
@@ -473,38 +570,53 @@ pub async fn post_study_handler(
         return Err((StatusCode::BAD_GATEWAY, msg));
     }
 
-    let mut link = match open_and_handshake(port.port_name).await {
-        Ok((link, _info)) => link,
+    let (link, hello) = match open_and_handshake(port.port_name).await {
+        Ok(pair) => pair,
         Err(msg) => {
             release_lock();
             return Err((StatusCode::BAD_GATEWAY, msg));
         }
     };
 
+    // What this run actually ran against, captured off the live link before
+    // anything else can change (decision 31).
+    let provenance = provenance_for(&study, &hello.firmware_version);
+
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
     let streams = study.streams.clone();
     let streams_crc_value = study.streams_crc;
-    let link = match tokio::task::spawn_blocking(move || {
-        // `streams` rides along; `validations` and `requires` deliberately
-        // do not (`embarch-study-designer/design.md` §3 decisions 17, 39,
-        // 40) — dev-bench has to know which taps to open and which `id`
-        // each answers to, and has nothing to do with either of the other
-        // two.
-        link.send(&DevBenchMessage::StudyStart {
-            steps,
-            steps_crc: steps_crc_value,
-            streams,
-            streams_crc: streams_crc_value,
-        })
-            .map(|_| link)
+    let requires = study.requires.clone();
+    let reported = hello.firmware_version.clone();
+
+    // Decision 31's gate and the `StudyStart` send, in that order and in one
+    // blocking hop: the gate runs *before* dev-bench is told to do anything,
+    // so a version mismatch leaves a bench that never started a step.
+    let started = tokio::task::spawn_blocking(move || {
+        let mut link = link;
+        let outcome = gate_then_start(&requires, &reported, || {
+            // `streams` rides along; `validations` and `requires`
+            // deliberately do not (`embarch-study-designer/design.md` §3
+            // decisions 17, 39, 40) — dev-bench has to know which taps to
+            // open and which `id` each answers to, and has nothing to do
+            // with either of the other two.
+            link.send(&DevBenchMessage::StudyStart {
+                steps,
+                steps_crc: steps_crc_value,
+                streams,
+                streams_crc: streams_crc_value,
+            })
+            .map_err(|e| format!("failed to send StudyStart to dev-bench: {e:?}"))
+        });
+        (outcome, link)
     })
-    .await
-    {
-        Ok(Ok(link)) => link,
-        Ok(Err(e)) => {
+    .await;
+
+    let link = match started {
+        Ok((Ok(()), link)) => link,
+        Ok((Err(rejection), _link)) => {
             release_lock();
-            return Err((StatusCode::BAD_GATEWAY, format!("failed to send StudyStart to dev-bench: {e:?}")));
+            return Err(rejection);
         }
         Err(e) => {
             release_lock();
@@ -537,7 +649,7 @@ pub async fn post_study_handler(
         let study_id_for_panic = study_id_for_task.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            run_study_to_completion(link, study, study_id_for_task, jobs, events_tx)
+            run_study_to_completion(link, study, study_id_for_task, jobs, events_tx, provenance)
         })
         .await;
 
@@ -558,17 +670,38 @@ pub async fn post_study_handler(
 
 // ---- background task: run to completion, receiving results ---------------
 
+/// Everything a capture needs, in one place that a signal-tap reader thread
+/// can share with the main dev-bench loop.
+///
+/// The `Mutex` exists for exactly one reason: a `StreamSource::Signal` tap
+/// with a `Route::Direct` route reads a **third physical serial connection**
+/// on its own thread (design.md §3 decision 30(a)), so two producers can
+/// reach the same [`StreamStore`]. It takes neither `hw_lock` nor
+/// `study_lock` — it is a read-only listener on a wire, and blocking a
+/// `/flash` on it would invent contention that does not exist.
+struct Capture {
+    study: Study,
+    study_id: String,
+    events_tx: broadcast::Sender<StudyEvent>,
+    store: StdMutex<StreamStore>,
+    /// Which step is open, for the `step_name` column every rendered row
+    /// carries. Read by signal threads, written by the main loop.
+    current_step: AtomicU32,
+}
+
 /// Owns the dev-bench link for the rest of the study's lifetime: receives
 /// `DevBenchMessage`s until `StudyDone` arrives or the watchdog fires,
-/// updating the job registry and `data.csv`/`waveform.csv`/`events.json` as
-/// it goes (design.md §5.1 steps 8+, §5.2). Entirely blocking — called from
-/// `spawn_blocking` by [`post_study_handler`].
+/// updating the job registry, `streams/` and `events.json` as it goes
+/// (design.md §5.1 steps 8+, §5.2, and `embarch-core/design.md` §3 decisions
+/// 30/31). Entirely blocking — called from `spawn_blocking` by
+/// [`post_study_handler`].
 fn run_study_to_completion(
     mut link: DevBenchLink,
     study: Study,
     study_id: String,
     jobs: JobRegistry,
     events_tx: broadcast::Sender<StudyEvent>,
+    provenance: Provenance,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -587,12 +720,33 @@ fn run_study_to_completion(
         return;
     }
 
+    // Retention across runs (`embarch-core/design.md` §3 decision 30): run
+    // once per submitted study, immediately after this study's own directory
+    // exists, so `keep` is exact and counts the run in progress rather than
+    // being one out. A sweep that fails is logged and ignored — losing disk
+    // hygiene is not a reason to lose a capture.
+    if let Ok(root) = study_results_root() {
+        if let Err(e) = stream_store::sweep_study_results(&root, stream_store::study_results_keep()) {
+            tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
+        }
+    }
+
+    // `streams/` and its index, before a single byte has arrived (decision
+    // 30(b)). One file per declared tap, named by the tap.
+    let store = match StreamStore::create(&results_dir, &study.streams, stream_store::stream_max_bytes()) {
+        Ok(store) => store,
+        Err(e) => {
+            fail_job(&jobs, &events_tx, &study_id, format!("failed to create the study's streams/ directory: {e:?}"));
+            return;
+        }
+    };
+
     // Streams `events.json` to disk as each `StepResult` arrives, rather
     // than accumulating them and assembling a `StudyResult` only at the
     // end — see `EventsJsonWriter`'s own doc comment for why that
     // accumulate-then-build step is exactly what used to overflow the
     // stack (`embarch-study-designer/design.md` §7).
-    let mut writer = match EventsJsonWriter::start(&results_dir, study.name.as_str()) {
+    let mut writer = match EventsJsonWriter::start(&results_dir, study.name.as_str(), &provenance) {
         Ok(w) => w,
         Err(e) => {
             fail_job(&jobs, &events_tx, &study_id, format!("failed to open events.json for writing: {e:?}"));
@@ -600,25 +754,37 @@ fn run_study_to_completion(
         }
     };
 
+    let capture = Arc::new(Capture {
+        study,
+        study_id: study_id.clone(),
+        events_tx: events_tx.clone(),
+        store: StdMutex::new(store),
+        current_step: AtomicU32::new(0),
+    });
+
     // Which taps dev-bench currently has open, by `StreamTap.id`. Purely
     // for reporting a chunk that arrives outside its own open window —
     // routing a chunk needs only the tap's declared encoding, which is in
     // the submitted `Study` and can't drift.
     let mut open_taps: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    // Core's own taps: a `Route::Direct` signal on a serial port Core opens
+    // itself, bypassing dev-bench entirely (decision 30(a)).
+    let mut signal_taps: HashMap<u8, SignalTapReader> = HashMap::new();
     let mut next_expected: usize = 0;
-    let mut deadline = next_deadline(&study, next_expected, Instant::now());
+    let mut deadline = next_deadline(&capture.study, next_expected, Instant::now());
 
-    loop {
+    if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, 0) {
+        stop_signal_taps(&mut signal_taps);
+        finish_streams(&capture, &mut writer);
+        fail_job(&jobs, &events_tx, &study_id, msg);
+        return;
+    }
+
+    let outcome = loop {
         match link.recv(deadline) {
             Ok(Some(DevBenchMessage::StepResult { step_index, result })) => {
                 if let Err(e) = writer.write_step(&result) {
-                    fail_job(
-                        &jobs,
-                        &events_tx,
-                        &study_id,
-                        format!("failed to write step {step_index}'s result to events.json: {e:?}"),
-                    );
-                    return;
+                    break Err(format!("failed to write step {step_index}'s result to events.json: {e:?}"));
                 }
                 let _ = events_tx.send(StudyEvent::StepCompleted {
                     study_id: study_id.clone(),
@@ -626,15 +792,21 @@ fn run_study_to_completion(
                     result: Box::new(result),
                 });
                 next_expected = step_index as usize + 1;
+                capture.current_step.store(next_expected as u32, Ordering::Relaxed);
                 update_job(&jobs, &study_id, |job| job.current_step = Some(step_index));
-                deadline = next_deadline(&study, next_expected, Instant::now());
+                // A signal tap's `StreamScope` is a step range like any
+                // other tap's, so Core opens and closes its port on the same
+                // boundaries dev-bench uses for the taps it mediates.
+                if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, next_expected as u32) {
+                    break Err(msg);
+                }
+                deadline = next_deadline(&capture.study, next_expected, Instant::now());
             }
             Ok(Some(DevBenchMessage::StudyDone { completed })) => {
                 tracing::info!(study_id, completed, "study run finished (StudyDone)");
-                finish_job(&jobs, &events_tx, &study_id, writer);
-                return;
+                break Ok(());
             }
-            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&study, id) {
+            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.study, id) {
                 Some(tap) => {
                     tracing::info!(study_id, id, name = tap.name.as_str(), "stream tap opened");
                     open_taps.insert(id);
@@ -647,11 +819,14 @@ fn run_study_to_completion(
             },
             Ok(Some(DevBenchMessage::StreamClose { id, dropped })) => {
                 open_taps.remove(&id);
-                let name = tap_for(&study, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
+                let name = tap_for(&capture.study, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
                 if dropped > 0 {
                     // A capture that lost data must say so rather than be
                     // read as complete — `embarch-study-designer/design.md`
                     // §4.8's whole reason for carrying `dropped` on close.
+                    // Recorded on the `StreamRef`, not just logged: a log
+                    // line is not something a result carries with it.
+                    capture.store.lock().unwrap().mark_lost_at_source(id);
                     tracing::warn!(
                         study_id,
                         id,
@@ -664,7 +839,7 @@ fn run_study_to_completion(
                 }
             }
             Ok(Some(DevBenchMessage::StreamChunkBatch { id, records })) => {
-                let Some(tap) = tap_for(&study, id).cloned() else {
+                let Some(tap) = tap_for(&capture.study, id).cloned() else {
                     tracing::warn!(
                         study_id,
                         id,
@@ -681,15 +856,7 @@ fn run_study_to_completion(
                     );
                 }
                 for record in records.iter() {
-                    write_stream_record(
-                        &results_dir,
-                        &study,
-                        &tap,
-                        record,
-                        &study_id,
-                        &events_tx,
-                        next_expected.saturating_sub(1) as u32,
-                    );
+                    write_stream_record(&capture, &tap, record);
                 }
             }
             Ok(Some(DevBenchMessage::LogLine { text })) => {
@@ -719,19 +886,259 @@ fn run_study_to_completion(
                 tracing::warn!(study_id, "unexpected message from dev-bench mid-study: {other:?}");
             }
             Ok(None) => {
-                fail_job(
-                    &jobs,
-                    &events_tx,
-                    &study_id,
-                    format!(
-                        "step timed out — no message received from dev-bench before the deadline \
-                         (waiting on step index {next_expected})"
-                    ),
-                );
-                return;
+                break Err(format!(
+                    "step timed out — no message received from dev-bench before the deadline \
+                     (waiting on step index {next_expected})"
+                ));
             }
+            Err(e) => break Err(format!("dev-bench connection error: {e:?}")),
+        }
+    };
+
+    // Whatever happened, Core's own ports close and the capture's `streams`
+    // are sealed into the writer before the job's status is decided.
+    stop_signal_taps(&mut signal_taps);
+    finish_streams(&capture, &mut writer);
+
+    match outcome {
+        Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer),
+        Err(reason) => fail_job(&jobs, &events_tx, &study_id, reason),
+    }
+}
+
+/// Hands the writer one [`StreamRef`] per declared tap. Called on every exit
+/// path, including a failure: a failed study's `.partial` file is a
+/// diagnostic artifact, and a diagnostic that omits what the capture
+/// actually produced is worth less than one that includes it.
+fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter) {
+    writer.set_streams(capture.store.lock().unwrap().refs());
+}
+
+// ---- Core's own taps: a Route::Direct signal on a third serial port -------
+
+/// One `StreamSource::Signal` tap Core reads itself (design.md §3 decision
+/// 30(a)): a USB-UART bridge with a DUT pin on it and nothing else — **a
+/// port that belongs to a wire, not to a device.**
+struct SignalTapReader {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    port_name: String,
+}
+
+impl SignalTapReader {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// `POST /study` pre-flight for every `StreamSource::Signal` tap: the signal
+/// has to have a declared route before Core can open anything.
+///
+/// This is the **first caller `resolve_signal_port`/`find_signal` have ever
+/// had** — `embarch-topology/design.md` §5 recorded that surface as unwired
+/// infrastructure, and this is what wires it.
+async fn check_signal_taps_are_declared(study: &Study) -> Result<(), String> {
+    let names: Vec<String> = study
+        .streams
+        .iter()
+        .filter_map(|tap| match &tap.source {
+            StreamSource::Signal { name } => Some(name.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        for name in &names {
+            match embarch_topology::hardware::find_signal(name) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(format!(
+                        "this study taps signal '{name}', which has no declared route — \
+                         declare it first with POST /signals. A wire between two headers is \
+                         invisible to software and can only ever be stated \
+                         (embarch-topology/design.md §3 decision 18)."
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "couldn't read the declared route for signal '{name}': {e:?}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("signal-route pre-flight task panicked: {e:?}"))?
+}
+
+/// Opens and closes Core's own signal ports on the same `StreamScope`
+/// boundaries dev-bench uses for the taps it mediates.
+///
+/// A `Route::ViaDevBench` signal deliberately gets **no port here**: its
+/// bytes arrive relayed over dev-bench's existing link, on the ordinary
+/// `StreamChunkBatch` path, and opening a second carrier for it would be
+/// asserting a wire that does not exist.
+fn sync_signal_taps(
+    capture: &Arc<Capture>,
+    open: &mut HashMap<u8, SignalTapReader>,
+    step_index: u32,
+) -> Result<(), String> {
+    for tap in capture.study.streams.iter() {
+        let StreamSource::Signal { name } = &tap.source else { continue };
+        let wanted = signal_tap_is_wanted(tap, step_index);
+        let is_open = open.contains_key(&tap.id);
+
+        if wanted && !is_open {
+            match start_signal_tap(capture, tap, name.as_str()) {
+                Ok(Some(reader)) => {
+                    tracing::info!(
+                        study_id = capture.study_id,
+                        id = tap.id,
+                        name = tap.name.as_str(),
+                        port = reader.port_name,
+                        "opened a signal tap's own serial port (bypassing dev-bench)"
+                    );
+                    open.insert(tap.id, reader);
+                }
+                // A `ViaDevBench` route: nothing for Core to open, and its
+                // bytes are already arriving over the dev-bench link.
+                Ok(None) => {}
+                Err(msg) => return Err(msg),
+            }
+        } else if !wanted && is_open {
+            if let Some(reader) = open.remove(&tap.id) {
+                tracing::info!(
+                    study_id = capture.study_id,
+                    id = tap.id,
+                    name = tap.name.as_str(),
+                    "closed a signal tap's own serial port (its scope ended)"
+                );
+                reader.stop();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether Core should have this signal tap's port open while `step_index`
+/// runs — a tap's declared [`StreamScope`], nothing else. Split out from
+/// [`sync_signal_taps`] purely so the open/close boundary is testable
+/// without a serial port: getting it wrong produces a capture that is
+/// silently short at one end, which is the failure this whole decision keeps
+/// insisting has to be loud.
+fn signal_tap_is_wanted(tap: &StreamTap, step_index: u32) -> bool {
+    tap.scope.covers(step_index)
+}
+
+fn stop_signal_taps(open: &mut HashMap<u8, SignalTapReader>) {
+    for (_, reader) in open.drain() {
+        reader.stop();
+    }
+}
+
+/// Resolves a signal to its live carrier and starts reading it.
+///
+/// **A tap that cannot be opened fails the study**, rather than running on
+/// to produce a result whose declared capture is silently empty. Loud beats
+/// plausible — the same posture decision 30(c) takes toward a trace it
+/// cannot decode.
+fn start_signal_tap(
+    capture: &Arc<Capture>,
+    tap: &StreamTap,
+    signal_name: &str,
+) -> Result<Option<SignalTapReader>, String> {
+    let link = match embarch_topology::hardware::find_signal(signal_name) {
+        Ok(Some(link)) => link,
+        Ok(None) => {
+            return Err(format!(
+                "signal '{signal_name}' has no declared route (declare it with POST /signals)"
+            ))
+        }
+        Err(e) => return Err(format!("couldn't read the declared route for '{signal_name}': {e:?}")),
+    };
+
+    if matches!(link.route, embarch_topology::hardware::Route::ViaDevBench { .. }) {
+        tracing::info!(
+            study_id = capture.study_id,
+            name = tap.name.as_str(),
+            "signal '{signal_name}' is routed via dev-bench; its bytes arrive relayed over the \
+             existing link, so Core opens no port of its own"
+        );
+        return Ok(None);
+    }
+
+    let port = embarch_topology::hardware::resolve_signal_port(signal_name)
+        .map_err(|e| format!("couldn't resolve a carrier for signal '{signal_name}': {e:?}"))?;
+
+    let baud = stream_store::signal_baud();
+    let serial = serialport::new(&port.port_name, baud)
+        .timeout(Duration::from_millis(200))
+        .open()
+        .map_err(|e| {
+            format!("failed to open signal '{signal_name}' on {} at {baud} baud: {e:?}", port.port_name)
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let capture = Arc::clone(capture);
+        let tap = tap.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name(format!("signal-tap-{}", tap.id))
+            .spawn(move || read_signal_tap(capture, tap, serial, stop))
+            .map_err(|e| format!("failed to start a reader thread for signal '{signal_name}': {e:?}"))?
+    };
+
+    Ok(Some(SignalTapReader { stop, handle: Some(handle), port_name: port.port_name }))
+}
+
+/// Reads a signal port until the tap's scope ends or the study does, and
+/// writes what arrives **verbatim** (decision 30(a)).
+///
+/// Bytes are chunked into `StreamRecord`s of at most
+/// `limits::MAX_STREAM_CHUNK_BYTES`, arrival-stamped by Core, and pushed
+/// through the identical [`write_stream_record`] path a dev-bench-mediated
+/// tap's records take — so a `Signal` tap and a relayed one render the same
+/// way, which is what lets the same saved study survive the bench being
+/// rewired.
+fn read_signal_tap(
+    capture: Arc<Capture>,
+    tap: StreamTap,
+    mut port: Box<dyn serialport::SerialPort>,
+    stop: Arc<AtomicBool>,
+) {
+    use std::io::Read as _;
+    const CHUNK: usize = embarch_study_designer::limits::MAX_STREAM_CHUNK_BYTES;
+
+    let mut buf = [0u8; CHUNK];
+    while !stop.load(Ordering::Relaxed) {
+        match port.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                let record = StreamRecord {
+                    // Core is the node that received these bytes, so Core
+                    // stamps them (`embarch-study-designer/design.md` §4.8).
+                    rx_utc_ms: current_utc_ms(),
+                    bytes: heapless::Vec::from_slice(&buf[..n]).unwrap_or_default(),
+                };
+                write_stream_record(&capture, &tap, &record);
+            }
+            // A bounded per-read timeout with nothing on the wire is the
+            // normal state of a debug UART, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
-                fail_job(&jobs, &events_tx, &study_id, format!("dev-bench connection error: {e:?}"));
+                tracing::warn!(
+                    study_id = capture.study_id,
+                    name = tap.name.as_str(),
+                    "signal tap read failed, stopping this tap: {e:?}"
+                );
                 return;
             }
         }
@@ -747,49 +1154,36 @@ fn tap_for(study: &Study, id: u8) -> Option<&StreamTap> {
     study.streams.get(usize::from(id)).filter(|tap| tap.id == id)
 }
 
-/// Writes one arrival-stamped record to whatever its tap's **declared**
-/// encoding says it is (`embarch-study-designer/design.md` §3 decision 39,
-/// §4.8) — the one place a stream payload acquires a meaning, and always
-/// because an engineer said so, never because Core inferred it.
+/// Writes one arrival-stamped record to its tap's files under `streams/`.
 ///
-/// **Interim file mapping, replaced in Milestone 7 Phase B.** Decisions 30/31
-/// (`embarch-core/design.md`) put every capture under
-/// `study_results/<id>/streams/<name>`, with the raw bytes always written
-/// before any decode is attempted. That is not built yet, so this keeps
-/// today's three fixed CSV paths — which are also what `GET
-/// /study/{id}/power-data`, `/waveform-data` and `/gatt-data` still serve —
-/// and picks between them from the tap's declared encoding and source. A tap
-/// whose encoding has no CSV form yet (`Raw`, `Text`, `OutpostTrace`) has
-/// nowhere to land until `streams/` exists, and says so rather than being
-/// silently discarded.
-#[allow(clippy::too_many_arguments)]
-fn write_stream_record(
-    results_dir: &FsPath,
-    study: &Study,
-    tap: &StreamTap,
-    record: &embarch_study_designer::StreamRecord,
-    study_id: &str,
-    events_tx: &broadcast::Sender<StudyEvent>,
-    current_step: u32,
-) {
+/// **The raw bytes go down first, always, before any decode is attempted**
+/// (`embarch-core/design.md` §3 decision 30(b)). A decode that fails then
+/// costs a rendering, not a capture — the run is recoverable, which is the
+/// whole difference between a bad afternoon and a lost one.
+///
+/// What a payload *means* comes only from the tap's declared
+/// [`StreamEncoding`] (`embarch-study-designer/design.md` §3 decision 39,
+/// §4.8) — never from the bytes. There is no sniff and no fallback here:
+/// `Raw` renders nothing because nobody declared anything to render it as.
+fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord) {
+    // Raw first. Unconditionally, for every encoding.
+    capture.store.lock().unwrap().write_raw(tap.id, &record.bytes);
+
+    let current_step = capture.current_step.load(Ordering::Relaxed);
+
     match tap.encoding {
         StreamEncoding::Samples { layout, unit, channel_id } => {
             let sample_hz = match tap.source {
                 StreamSource::PowerFrontEnd { sample_hz } => Some(sample_hz),
                 _ => None,
             };
-            let filename = if matches!(tap.source, StreamSource::PowerFrontEnd { .. }) {
-                "data.csv"
-            } else {
-                "waveform.csv"
-            };
             let samples: Vec<Sample> =
                 samples_in(record, layout, unit, channel_id, sample_hz).collect();
             for sample in &samples {
-                write_sample(results_dir, study, current_step, filename, *sample);
+                write_sample(capture, tap.id, current_step, *sample);
             }
-            let _ = events_tx.send(StudyEvent::SampleBatch {
-                study_id: study_id.to_string(),
+            let _ = capture.events_tx.send(StudyEvent::SampleBatch {
+                study_id: capture.study_id.clone(),
                 stream_id: tap.id,
                 stream_name: tap.name.as_str().to_string(),
                 samples,
@@ -802,119 +1196,122 @@ fn write_stream_record(
             // to mean; the generic record carries no step of its own.
             match postcard::from_bytes::<GattTranscriptEntry>(&record.bytes) {
                 Ok(entry) => {
-                    write_transcript_entry(results_dir, study, current_step, &entry);
-                    let _ = events_tx.send(StudyEvent::GattTranscript {
-                        study_id: study_id.to_string(),
+                    write_transcript_entry(capture, tap.id, current_step, &entry);
+                    let _ = capture.events_tx.send(StudyEvent::GattTranscript {
+                        study_id: capture.study_id.clone(),
                         step_index: current_step,
                         entry: Box::new(entry),
                     });
                 }
+                // The bytes are already on disk — this costs the row, not
+                // the capture.
                 Err(e) => tracing::warn!(
-                    study_id,
+                    study_id = capture.study_id,
                     name = tap.name.as_str(),
-                    "a record on a GattTranscript-encoded tap didn't decode as an entry: {e:?}"
+                    "a record on a GattTranscript-encoded tap didn't decode as an entry; \
+                     its raw bytes are kept: {e:?}"
                 ),
             }
         }
-        StreamEncoding::Raw | StreamEncoding::Text | StreamEncoding::OutpostTrace { .. } => {
-            tracing::warn!(
-                study_id,
+        StreamEncoding::Text => {
+            // The decode is the identity, so the raw file already *is* the
+            // rendering — it is named `.txt` rather than `.bin` to say so.
+            // Writing the same bytes twice would double the disk cost of the
+            // one encoding whose render adds nothing.
+        }
+        StreamEncoding::OutpostTrace { manifest_crc } => {
+            // Decision 30(c): a trace renders against the manifest the DUT's
+            // own build produced, or it renders **nothing**. Rendering it
+            // against the nearest available manifest would relabel every
+            // marker and thread — completely readable and completely wrong.
+            // Core cannot be given a manifest at all yet (see decision 30(c)
+            // for the named trigger), so today every outpost tap is in that
+            // state and every one of them keeps its raw bytes.
+            tracing::debug!(
+                study_id = capture.study_id,
                 name = tap.name.as_str(),
-                bytes = record.bytes.len(),
-                "dropping stream bytes: this encoding lands in study_results/<id>/streams/,                  which Milestone 7 Phase B builds (embarch-core/design.md decisions 30/31)"
+                manifest_crc,
+                "outpost trace bytes written raw; rendering needs a manifest Core has no way \
+                 to be given yet"
             );
+        }
+        StreamEncoding::Raw => {
+            // Nothing declared, so nothing rendered. `Raw` is the honest
+            // default for a payload nobody gave a meaning.
         }
     }
 }
 
-/// Appends one decoded `Sample` to `filename`, labelled with whichever step
-/// was open when its record arrived, plus `core_rx_utc_ms` (Core's own
-/// receipt-time wall clock, decision 30) as an extra column beyond what
-/// `Sample::to_csv_row` already renders. The row shape itself lives entirely
-/// in `embarch-study-designer` and is unchanged by the tap reshape.
-fn write_sample(
-    results_dir: &FsPath,
-    study: &Study,
-    step_index: u32,
-    filename: &str,
-    sample: Sample,
-) {
+/// Appends one decoded `Sample` to its tap's rendered CSV, labelled with
+/// whichever step was open when its record arrived, plus `core_rx_utc_ms`
+/// (Core's own receipt-time wall clock, decision 30) as an extra column
+/// beyond what `Sample::to_csv_row` already renders. The row shape itself
+/// lives entirely in `embarch-study-designer` and is unchanged by both the
+/// tap reshape and the move to `streams/` — only the path changed.
+fn write_sample(capture: &Capture, tap_id: u8, step_index: u32, sample: Sample) {
     // An out-of-range step index labels the row with an empty step name
     // rather than dropping a real sample — the same trade
     // `write_transcript_entry` already makes for a transcript entry.
-    let step_name = study.steps.get(step_index as usize).map(|s| s.name.as_str()).unwrap_or("");
+    let step_name = capture
+        .study
+        .steps
+        .get(step_index as usize)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
     let Some(row) = sample.to_csv_row(step_name) else {
         tracing::warn!(
-            "step name '{step_name}' doesn't fit alongside the rest of a CSV row; dropping this sample"
+            "step name '{step_name}' doesn't fit alongside the rest of a CSV row; dropping this \
+             sample's row (its raw bytes are already on disk)"
         );
         return;
     };
 
-    let path = results_dir.join(filename);
-    let is_new = !path.exists();
-
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut file) => {
-            if is_new {
-                if let Err(e) = writeln!(file, "{},core_rx_utc_ms", Sample::csv_header()) {
-                    tracing::error!("failed to write header to {}: {e:?}", path.display());
-                }
-            }
-            if let Err(e) = writeln!(file, "{row},{}", current_utc_ms()) {
-                tracing::error!("failed to append a row to {}: {e:?}", path.display());
-            }
-        }
-        Err(e) => tracing::error!("failed to open {} for append: {e:?}", path.display()),
-    }
+    capture
+        .store
+        .lock()
+        .unwrap()
+        .write_rendered_row(tap_id, &format!("{row},{}", current_utc_ms()));
 }
 
-/// Appends one GATT transcript entry to `gatt.csv`
+/// Appends one GATT transcript entry to its tap's rendered CSV
 /// (`embarch-study-designer/design.md` §3 decision 36, §4.3b), the same way
-/// [`write_sample`] appends to `data.csv`/`waveform.csv`: incrementally, as
-/// each entry arrives, so a capture survives a Core crash that writes the
-/// study itself off as `"failed"`.
+/// [`write_sample`] appends samples: incrementally, as each entry arrives,
+/// so a capture survives a Core crash that writes the study itself off as
+/// `"failed"`.
 ///
 /// `step_index` is whichever step was open when the record carrying this
 /// entry arrived (`embarch-study-designer/design.md` §3 decision 36's own
 /// definition of that column) — the generic stream record replacing the
-/// retired `GattTranscriptRecord` carries no step of its own.
-/// An out-of-range `step_index` still
-/// gets written, with an empty `step_name`, rather than dropped: the entry
-/// is real GATT traffic that happened, and losing it because Core couldn't
-/// label it would be the worse trade.
-fn write_transcript_entry(results_dir: &FsPath, study: &Study, step_index: u32, entry: &GattTranscriptEntry) {
-    let step_name = study.steps.get(step_index as usize).map(|s| s.name.as_str()).unwrap_or("");
+/// retired `GattTranscriptRecord` carries no step of its own. An
+/// out-of-range `step_index` still gets written, with an empty `step_name`,
+/// rather than dropped: the entry is real GATT traffic that happened, and
+/// losing it because Core couldn't label it would be the worse trade.
+fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry: &GattTranscriptEntry) {
+    let step_name = capture
+        .study
+        .steps
+        .get(step_index as usize)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
 
     let Some(row) = entry.to_csv_row(step_index, step_name) else {
         tracing::warn!(
-            "a GATT transcript entry for step '{step_name}' doesn't fit in one CSV row; dropping it"
+            "a GATT transcript entry for step '{step_name}' doesn't fit in one CSV row; dropping \
+             its row (its raw bytes are already on disk)"
         );
         return;
     };
 
-    let path = results_dir.join("gatt.csv");
-    let is_new = !path.exists();
-
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut file) => {
-            if is_new {
-                if let Err(e) = writeln!(file, "{},core_rx_utc_ms", GattTranscriptEntry::csv_header())
-                {
-                    tracing::error!("failed to write header to {}: {e:?}", path.display());
-                }
-            }
-            // `core_rx_utc_ms` appended by Core, not by the crate's own
-            // renderer — Core's receipt time, not part of the wire type
-            // (decision 30), same split `write_sample` already uses. It is
-            // also the only wall-clock timestamp on the row today:
-            // `rx_utc_ms` is dev-bench uptime until the clock-resync gap
-            // (design.md §7) closes.
-            if let Err(e) = writeln!(file, "{row},{}", current_utc_ms()) {
-                tracing::error!("failed to append a row to {}: {e:?}", path.display());
-            }
-        }
-        Err(e) => tracing::error!("failed to open {} for append: {e:?}", path.display()),
-    }
+    // `core_rx_utc_ms` appended by Core, not by the crate's own renderer —
+    // Core's receipt time, not part of the wire type (decision 30), same
+    // split `write_sample` uses. It is also the only wall-clock timestamp on
+    // the row today: `rx_utc_ms` is dev-bench uptime until the clock-resync
+    // gap (design.md §7) closes.
+    capture
+        .store
+        .lock()
+        .unwrap()
+        .write_rendered_row(tap_id, &format!("{row},{}", current_utc_ms()));
 }
 
 /// Streams `events.json` to disk one `StepResult` at a time, as each
@@ -931,20 +1328,24 @@ fn write_transcript_entry(results_dir: &FsPath, study: &Study, step_index: u32, 
 /// (and, in production, every `GET /study/{study_id}` call that cloned a
 /// completed job out of the registry).
 ///
-/// Writes to a `.partial` file, only renamed to the real `events.json` on a
-/// genuine [`EventsJsonWriter::finish`] — an aborted/failed study leaves the
-/// `.partial` file behind as a diagnostic artifact rather than a completed
-/// result, the same posture `data.csv`/`waveform.csv` already have for a
-/// crash mid-study (`embarch-study-designer/design.md` §3 decision 16).
+/// `provenance` and `streams` are the two `StudyResult` fields that landed
+/// in the type at Milestone 7 Phase A and that **this file had never carried
+/// at all** — `finish` wrote `steps` and a hardcoded `"validations":[]` and
+/// stopped. Both are small and bounded (`Provenance` is four short strings;
+/// `streams` is at most `MAX_STREAMS_PER_STUDY` entries), so both are
+/// serialized directly, and neither breaks the streaming discipline the rest
+/// of this type exists to keep.
 struct EventsJsonWriter {
     file: std::io::BufWriter<std::fs::File>,
     partial_path: PathBuf,
     final_path: PathBuf,
     wrote_any_step: bool,
+    provenance: Provenance,
+    streams: Vec<StreamRef>,
 }
 
 impl EventsJsonWriter {
-    fn start(results_dir: &FsPath, study_name: &str) -> anyhow::Result<Self> {
+    fn start(results_dir: &FsPath, study_name: &str, provenance: &Provenance) -> anyhow::Result<Self> {
         use anyhow::Context;
 
         let partial_path = results_dir.join("events.json.partial");
@@ -955,7 +1356,14 @@ impl EventsJsonWriter {
         );
         write!(file, "{{\"study_name\":{},\"steps\":[", serde_json::to_string(study_name)?)
             .with_context(|| format!("failed to write the opening of {}", partial_path.display()))?;
-        Ok(Self { file, partial_path, final_path, wrote_any_step: false })
+        Ok(Self {
+            file,
+            partial_path,
+            final_path,
+            wrote_any_step: false,
+            provenance: provenance.clone(),
+            streams: Vec::new(),
+        })
     }
 
     fn write_step(&mut self, result: &StepResult) -> anyhow::Result<()> {
@@ -967,15 +1375,32 @@ impl EventsJsonWriter {
         Ok(())
     }
 
+    /// One [`StreamRef`] per declared tap, handed over once the capture is
+    /// finished. Set rather than appended because a tap's `bytes_written`
+    /// and `truncated` are only final once its files are.
+    fn set_streams(&mut self, streams: Vec<StreamRef>) {
+        self.streams = streams;
+    }
+
     /// Closes the `steps` array, writes empty `validations` — post-hoc
     /// validation (design.md §3 decision 19, the `core-validation` feature's
     /// `SignalCheck` machinery) is a real feature this crate enables but
-    /// doesn't call yet, unchanged from before this streaming rework — and
-    /// atomically renames `.partial` to the real `events.json`.
+    /// doesn't call yet, unchanged from before this streaming rework —
+    /// followed by `provenance` and `streams`, then atomically renames
+    /// `.partial` to the real `events.json`.
     fn finish(mut self) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        write!(self.file, "],\"validations\":[]}}")?;
+        write!(self.file, "],\"validations\":[],\"provenance\":")?;
+        serde_json::to_writer(&mut self.file, &self.provenance)?;
+        write!(self.file, ",\"streams\":[")?;
+        for (i, stream_ref) in self.streams.iter().enumerate() {
+            if i > 0 {
+                write!(self.file, ",")?;
+            }
+            serde_json::to_writer(&mut self.file, stream_ref)?;
+        }
+        write!(self.file, "]}}")?;
         self.file.flush().with_context(|| format!("failed to flush {}", self.partial_path.display()))?;
         drop(self.file);
         std::fs::rename(&self.partial_path, &self.final_path).with_context(|| {
@@ -1118,36 +1543,153 @@ fn event_study_id(event: &StudyEvent) -> &str {
     }
 }
 
-// ---- GET /study/{study_id}/power-data, /waveform-data ----------------------
+// ---- GET /study/{study_id}/stream/{name}, and the three routes it replaces --
+
+/// `?raw=1` serves the tap's byte-for-byte capture instead of its rendering.
+///
+/// A tap with no rendering (`Raw`, `Text`, `OutpostTrace`) serves its raw
+/// file either way — the flag picks between two files when there are two,
+/// and is not a request for a different *kind* of answer.
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+impl StreamQuery {
+    fn wants_raw(&self) -> bool {
+        matches!(self.raw.as_deref(), Some("1") | Some("true") | Some(""))
+    }
+}
+
+/// One tap's capture, by the name the `Study` declared it under
+/// (`embarch-core/design.md` §3 decision 30(b), §4).
+///
+/// Served as **bytes**, for the same reason the three fixed routes it
+/// replaces were: Core and `embarch-api` are not guaranteed to share a
+/// filesystem (§7's artifact-transfer gap), so handing back a path would
+/// hand back something the caller cannot open.
+///
+/// A name that isn't in this study's `streams/index.json` is a `404`, which
+/// is also what makes a tap name incapable of naming a file outside the
+/// streams directory: only names the index already carries resolve at all.
+pub async fn stream_data_handler(
+    Path((study_id, name)): Path<(String, String)>,
+    Query(query): Query<StreamQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(&study_id)?;
+    let index = read_stream_index(&streams_dir)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("study '{study_id}' has no captured streams (it may predate streams/, or never have started)"),
+        )
+    })?;
+
+    let entry = index.find(&name).ok_or_else(|| {
+        let declared: Vec<&str> = index.streams.iter().map(|e| e.name.as_str()).collect();
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "study '{study_id}' declares no stream tap named '{name}' — it declared: {}",
+                if declared.is_empty() { "(none)".to_string() } else { declared.join(", ") }
+            ),
+        )
+    })?;
+
+    serve_capture(&streams_dir, entry, query.wants_raw(), &format!("stream '{name}'")).await
+}
+
+// The three fixed routes `GET /study/{id}/stream/{name}` replaces, kept as
+// aliases for one release rather than breaking `embarch-api`'s existing
+// `study_power_data`/`study_waveform_data`/`study_gatt_data` tools mid-flight
+// (`embarch-core/design.md` §3 decision 30). Each resolves through the
+// study's own index to whichever tap answers that alias — which is the whole
+// reason the index exists, since a handler reading results back off disk has
+// no `Study` in hand to ask.
 
 pub async fn power_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_study_csv(&study_id, "data.csv", "power data").await
+    serve_alias(&study_id, "power", "data.csv", "power data").await
 }
 
 pub async fn waveform_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_study_csv(&study_id, "waveform.csv", "waveform data").await
+    serve_alias(&study_id, "waveform", "waveform.csv", "waveform data").await
 }
 
 /// `embarch-study-designer/design.md` §3 decision 36: the study's whole GATT
 /// transcript, every entry across every step, uncapped — as opposed to
 /// `GET /study/{id}`'s per-step `gatt_activity`, which is a bounded inline
-/// summary. Same served-as-bytes shape as the two above, for the same
-/// reason (Core and its caller aren't guaranteed to share a filesystem).
+/// summary.
 pub async fn gatt_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_study_csv(&study_id, "gatt.csv", "GATT transcript").await
+    serve_alias(&study_id, "gatt", "gatt.csv", "GATT transcript").await
 }
 
-async fn serve_study_csv(study_id: &str, filename: &str, kind: &str) -> Result<Response, (StatusCode, String)> {
-    let dir = study_results_dir(study_id).map_err(internal_err)?;
-    let path = dir.join(filename);
+/// Resolves one of the three retired fixed paths.
+///
+/// `legacy_file` is the pre-`streams/` path the same data used to live at,
+/// and is tried when a study has no index at all: results captured before
+/// this release are still on disk, and an alias that 404'd on them would
+/// break the very tools these aliases exist to keep working.
+async fn serve_alias(
+    study_id: &str,
+    alias: &str,
+    legacy_file: &str,
+    kind: &str,
+) -> Result<Response, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(study_id)?;
 
-    match tokio::fs::read(&path).await {
+    if let Some(index) = read_stream_index(&streams_dir)? {
+        return match index.find_alias(alias) {
+            Some(entry) => serve_capture(&streams_dir, entry, false, kind).await,
+            None => Err((StatusCode::NOT_FOUND, format!("no {kind} captured for this study"))),
+        };
+    }
+
+    // Pre-`streams/` results.
+    let legacy = study_results_dir(study_id).map_err(internal_err)?.join(legacy_file);
+    match tokio::fs::read(&legacy).await {
         Ok(bytes) => Ok(([(CONTENT_TYPE, "text/csv")], bytes).into_response()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err((
-            StatusCode::NOT_FOUND,
-            format!("no {kind} captured for this study"),
-        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err((StatusCode::NOT_FOUND, format!("no {kind} captured for this study")))
+        }
         Err(e) => Err(internal_err(e)),
+    }
+}
+
+fn streams_dir_for(study_id: &str) -> Result<PathBuf, (StatusCode, String)> {
+    Ok(study_results_dir(study_id).map_err(internal_err)?.join(stream_store::STREAMS_DIR))
+}
+
+fn read_stream_index(streams_dir: &FsPath) -> Result<Option<stream_store::StreamIndex>, (StatusCode, String)> {
+    stream_store::read_index(streams_dir).map_err(internal_err)
+}
+
+async fn serve_capture(
+    streams_dir: &FsPath,
+    entry: &stream_store::StreamIndexEntry,
+    raw: bool,
+    kind: &str,
+) -> Result<Response, (StatusCode, String)> {
+    let file = match (raw, entry.rendered_file.as_deref()) {
+        (false, Some(rendered)) => rendered,
+        _ => entry.raw_file.as_str(),
+    }
+    .to_string();
+
+    let dir = streams_dir.to_path_buf();
+    let file_for_read = file.clone();
+    let is_csv = file.ends_with(".csv");
+    let read = tokio::task::spawn_blocking(move || {
+        stream_store::read_capture(&dir, &file_for_read, is_csv)
+    })
+    .await
+    .map_err(internal_err)?
+    .map_err(internal_err)?;
+
+    match read {
+        Some(bytes) => {
+            Ok(([(CONTENT_TYPE, stream_store::content_type_for(&file))], bytes).into_response())
+        }
+        None => Err((StatusCode::NOT_FOUND, format!("no {kind} captured for this study"))),
     }
 }
 
@@ -1168,6 +1710,45 @@ mod tests {
             continue_on_fail: false,
             delay_before_ms: 0,
         }
+    }
+
+    /// A `Capture` over `dir`, so the writers can be exercised with no
+    /// hardware, no HTTP, and no dev-bench link — the same posture the rest
+    /// of this module's tests already take.
+    fn test_capture(dir: &FsPath, study: Study) -> Capture {
+        let store = StreamStore::create(dir, &study.streams, 0).unwrap();
+        let (events_tx, _rx) = broadcast::channel(64);
+        Capture {
+            study,
+            study_id: "test-study-id".to_string(),
+            events_tx,
+            store: StdMutex::new(store),
+            current_step: AtomicU32::new(0),
+        }
+    }
+
+    fn tap(id: u8, name: &str, source: StreamSource, encoding: StreamEncoding) -> StreamTap {
+        StreamTap {
+            id,
+            name: heapless::String::try_from(name).unwrap(),
+            source,
+            encoding,
+            scope: embarch_study_designer::StreamScope::WholeStudy,
+        }
+    }
+
+    /// `study_with_steps`, plus declared taps (and the seal recomputed over
+    /// them, so the study is still submittable).
+    fn study_with_taps(timeouts: &[u32], taps: &[StreamTap]) -> Study {
+        let mut study = study_with_steps(timeouts);
+        let mut streams: HVec<StreamTap, { embarch_study_designer::limits::MAX_STREAMS_PER_STUDY }> =
+            HVec::new();
+        for tap in taps {
+            streams.push(tap.clone()).unwrap();
+        }
+        study.streams_crc = streams_crc(&streams).unwrap();
+        study.streams = streams;
+        study
     }
 
     fn study_with_steps(timeouts: &[u32]) -> Study {
@@ -1208,12 +1789,18 @@ mod tests {
     #[test]
     fn write_transcript_entry_appends_rows_under_one_header() {
         let dir = tempfile::tempdir().unwrap();
-        let study = study_with_steps(&[1_000, 2_000]);
+        let study = study_with_taps(
+            &[1_000, 2_000],
+            &[tap(0, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript)],
+        );
+        let capture = test_capture(dir.path(), study);
 
-        write_transcript_entry(dir.path(), &study, 0, &transcript_entry(b"ok\r\n"));
-        write_transcript_entry(dir.path(), &study, 1, &transcript_entry(b"hi"));
+        write_transcript_entry(&capture, 0, 0, &transcript_entry(b"ok\r\n"));
+        write_transcript_entry(&capture, 0, 1, &transcript_entry(b"hi"));
 
-        let csv = std::fs::read_to_string(dir.path().join("gatt.csv")).unwrap();
+        // The row shape is unchanged by the move to `streams/` — only the
+        // path is (`embarch-core/design.md` §3 decision 30(b)).
+        let csv = std::fs::read_to_string(dir.path().join("streams").join("gatt.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3, "expected a header plus two rows, got: {csv}");
 
@@ -1246,11 +1833,15 @@ mod tests {
         // Real GATT traffic Core can't label is still real GATT traffic:
         // written with an empty step_name rather than dropped.
         let dir = tempfile::tempdir().unwrap();
-        let study = study_with_steps(&[1_000]);
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(0, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript)],
+        );
+        let capture = test_capture(dir.path(), study);
 
-        write_transcript_entry(dir.path(), &study, 99, &transcript_entry(b"x"));
+        write_transcript_entry(&capture, 0, 99, &transcript_entry(b"x"));
 
-        let csv = std::fs::read_to_string(dir.path().join("gatt.csv")).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("streams").join("gatt.csv")).unwrap();
         let row = csv.lines().nth(1).expect("a row was written");
         assert!(row.starts_with("4242,99,,in,notification,"), "{row}");
         assert_eq!(
@@ -1495,7 +2086,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("embarch-study-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = EventsJsonWriter::start(&dir, "test-study").unwrap();
+        let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance_for(&study_with_steps(&[1_000]), "gbench1")).unwrap();
         writer.write_step(&test_step_result("step-0")).unwrap();
 
         finish_job(&jobs, &events_tx, "abc", writer);
@@ -1524,6 +2115,13 @@ mod tests {
         assert_eq!(result["steps"].as_array().unwrap().len(), 1);
         assert_eq!(result["steps"][0]["step_name"], "step-0");
         assert!(result["validations"].as_array().unwrap().is_empty());
+        // `provenance` and `streams` were added to `StudyResult` at Phase A
+        // and `events.json` had never carried either (decision 31). It does
+        // now, and the DUT's version says it was only ever declared.
+        assert_eq!(result["provenance"]["dev_bench_version"], "gbench1");
+        assert_eq!(result["provenance"]["dev_bench_source"], "ReportedByDevBench");
+        assert_eq!(result["provenance"]["firmware_source"], "Declared");
+        assert!(result["streams"].as_array().unwrap().is_empty());
 
         match rx.try_recv().unwrap() {
             StudyEvent::StatusChanged { study_id, status, .. } => {
@@ -1537,12 +2135,54 @@ mod tests {
     }
 
     #[test]
+    fn events_json_carries_one_stream_ref_per_declared_tap_including_truncation() {
+        // `StudyResult.streams` is what makes a short capture legible as a
+        // short one. A tap that produced nothing is present with
+        // `bytes_written: 0` rather than absent — a missing entry and an
+        // empty one are different facts.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[
+                power_tap(),
+                tap(1, "quiet", StreamSource::DevBenchLog, StreamEncoding::Raw),
+            ],
+        );
+        let capture = test_capture(dir.path(), study);
+
+        let record = StreamRecord {
+            rx_utc_ms: 5,
+            bytes: heapless::Vec::from_slice(&3.3f32.to_le_bytes()).unwrap(),
+        };
+        write_stream_record(&capture, &capture.study.streams[0].clone(), &record);
+        // dev-bench reported dropped records on the second tap.
+        capture.store.lock().unwrap().mark_lost_at_source(1);
+
+        let mut writer =
+            EventsJsonWriter::start(dir.path(), "s", &provenance_for(&capture.study, "gbench1"))
+                .unwrap();
+        finish_streams(&capture, &mut writer);
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let streams = result["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0]["name"], "power");
+        assert_eq!(streams[0]["bytes_written"], 4);
+        assert_eq!(streams[0]["truncated"], false);
+        assert_eq!(streams[1]["name"], "quiet");
+        assert_eq!(streams[1]["bytes_written"], 0);
+        assert_eq!(streams[1]["truncated"], true);
+    }
+
+    #[test]
     fn events_json_writer_leaves_only_the_partial_file_until_finished() {
         let dir = std::env::temp_dir().join(format!("embarch-study-writer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = EventsJsonWriter::start(&dir, "s").unwrap();
+        let mut writer = EventsJsonWriter::start(&dir, "s", &provenance_for(&study_with_steps(&[1_000]), "gbench1")).unwrap();
         writer.write_step(&test_step_result("a")).unwrap();
         writer.write_step(&test_step_result("b")).unwrap();
         assert!(dir.join("events.json.partial").exists());
@@ -1566,13 +2206,25 @@ mod tests {
 
     // ---- write_sample: CSV row shape, including Core's own core_rx_utc_ms ----
 
+    fn power_tap() -> StreamTap {
+        tap(
+            0,
+            "power",
+            StreamSource::PowerFrontEnd { sample_hz: 1_000 },
+            StreamEncoding::Samples {
+                layout: embarch_study_designer::SampleLayout::F32Le,
+                unit: embarch_study_designer::Unit::Volts,
+                channel_id: 0,
+            },
+        )
+    }
+
     #[test]
     fn write_sample_appends_core_rx_utc_ms_and_writes_the_header_once() {
-        let dir = std::env::temp_dir().join(format!("embarch-study-csv-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(&[1_000], &[power_tap()]);
+        let capture = test_capture(dir.path(), study);
 
-        let study = study_with_steps(&[1_000]);
         let sample = Sample {
             rx_utc_ms: 1_753_000_000_123,
             value: 3.3,
@@ -1580,17 +2232,18 @@ mod tests {
             channel_id: 0,
         };
 
-        write_sample(&dir, &study, 0, "data.csv", sample);
-        write_sample(&dir, &study, 0, "data.csv", sample);
+        write_sample(&capture, 0, 0, sample);
+        write_sample(&capture, 0, 0, sample);
 
-        let contents = std::fs::read_to_string(dir.join("data.csv")).unwrap();
+        // Named by the tap, under `streams/` — the row shape is exactly what
+        // `data.csv` carried before decision 30 moved the path.
+        let contents =
+            std::fs::read_to_string(dir.path().join("streams").join("power.csv")).unwrap();
         let mut lines = contents.lines();
         assert_eq!(lines.next().unwrap(), "rx_utc_ms,step_name,value,unit,channel_id,core_rx_utc_ms");
         let first_row = lines.next().unwrap();
         assert!(first_row.starts_with("1753000000123,step-0,3.3,volts,0,"));
         assert_eq!(lines.clone().count(), 1); // exactly one more data row
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1598,18 +2251,263 @@ mod tests {
         // A real sample that Core simply can't label is still real data.
         // Dropping it because the label is missing is the worse trade —
         // the same one `write_transcript_entry` already makes.
-        let dir = std::env::temp_dir().join(format!("embarch-study-csv-test-nostep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(&[1_000], &[power_tap()]);
+        let capture = test_capture(dir.path(), study);
 
-        let study = study_with_steps(&[1_000]);
         let sample = Sample { rx_utc_ms: 1, value: 1.0, unit: embarch_study_designer::Unit::Raw, channel_id: 0 };
 
-        write_sample(&dir, &study, 99, "data.csv", sample);
+        write_sample(&capture, 0, 99, sample);
 
-        let contents = std::fs::read_to_string(dir.join("data.csv")).unwrap();
+        let contents =
+            std::fs::read_to_string(dir.path().join("streams").join("power.csv")).unwrap();
         assert!(contents.lines().nth(1).unwrap().starts_with("1,,1,raw,0,"));
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- decision 30(b): raw bytes always land before any decode ----------
+
+    #[test]
+    fn a_record_whose_decode_fails_still_costs_only_the_row_and_never_the_capture() {
+        // The load-bearing sentence of decision 30(b): a tap writes its raw
+        // bytes *first*, so a decode that fails leaves the run recoverable.
+        // These bytes are not a `GattTranscriptEntry` and never will be.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(0, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript)],
+        );
+        let capture = test_capture(dir.path(), study);
+
+        let record = StreamRecord {
+            rx_utc_ms: 7,
+            bytes: heapless::Vec::from_slice(&[0xff; 24]).unwrap(),
+        };
+        write_stream_record(&capture, &capture.study.streams[0].clone(), &record);
+
+        let streams = dir.path().join("streams");
+        assert_eq!(std::fs::read(streams.join("gatt.bin")).unwrap(), vec![0xffu8; 24]);
+        // No row was rendered, and the rendered file was never even created.
+        assert!(!streams.join("gatt.csv").exists());
+        // The bytes are reported as captured, and nothing claims they were
+        // lost — they weren't.
+        let refs = capture.store.lock().unwrap().refs();
+        assert_eq!(refs[0].bytes_written, 24);
+        assert!(!refs[0].truncated);
+    }
+
+    #[test]
+    fn a_raw_tap_writes_its_bytes_and_renders_nothing() {
+        // No sniff, no heuristic, no "looks like text" fallback: `Raw` is
+        // the honest default for a payload nobody declared a meaning for
+        // (`embarch-study-designer/design.md` §3 decision 35).
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(
+                0,
+                "trace",
+                StreamSource::Signal { name: heapless::String::try_from("outpost").unwrap() },
+                StreamEncoding::Raw,
+            )],
+        );
+        let capture = test_capture(dir.path(), study);
+
+        let record =
+            StreamRecord { rx_utc_ms: 1, bytes: heapless::Vec::from_slice(b"hello").unwrap() };
+        write_stream_record(&capture, &capture.study.streams[0].clone(), &record);
+
+        let streams = dir.path().join("streams");
+        assert_eq!(std::fs::read(streams.join("trace.bin")).unwrap(), b"hello");
+        assert!(!streams.join("trace.csv").exists());
+        assert!(!streams.join("trace.txt").exists());
+    }
+
+    #[test]
+    fn a_record_arriving_during_step_1_is_labelled_step_1_not_step_0() {
+        // `embarch-study-designer/design.md` §4.8 defines this column as
+        // "whichever step the host has open when the record arrives" —
+        // which is the step now *running*, not the one that just finished.
+        // Phase A's adaptation used the latter, and the two agree only
+        // before the first `StepResult`, which is exactly why the off-by-one
+        // went unnoticed: the retired `GattTranscriptRecord` carried its own
+        // `step_index` from dev-bench, so this only became the host's number
+        // to compute at Phase A. Pinned at both writers.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000, 2_000],
+            &[
+                power_tap(),
+                tap(1, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript),
+            ],
+        );
+        let capture = test_capture(dir.path(), study);
+
+        // dev-bench has just reported step 0's result, so step 1 is open.
+        capture.current_step.store(1, Ordering::Relaxed);
+        let step = capture.current_step.load(Ordering::Relaxed);
+
+        let sample = Sample {
+            rx_utc_ms: 1,
+            value: 1.0,
+            unit: embarch_study_designer::Unit::Volts,
+            channel_id: 0,
+        };
+        write_sample(&capture, 0, step, sample);
+        write_transcript_entry(&capture, 1, step, &transcript_entry(b"x"));
+
+        let streams = dir.path().join("streams");
+        let power = std::fs::read_to_string(streams.join("power.csv")).unwrap();
+        assert!(
+            power.lines().nth(1).unwrap().contains(",step-1,"),
+            "expected the open step, got: {}",
+            power.lines().nth(1).unwrap()
+        );
+        let gatt = std::fs::read_to_string(streams.join("gatt.csv")).unwrap();
+        let row = gatt.lines().nth(1).unwrap();
+        assert!(row.starts_with("4242,1,step-1,"), "expected the open step, got: {row}");
+    }
+
+    // ---- decision 30(a): Core's own signal-tap port -----------------------
+
+    #[test]
+    fn a_signal_taps_port_is_open_exactly_across_its_declared_scope() {
+        // The whole-study tap the outpost uses is open from step 0 onward;
+        // a windowed one opens and closes on its own inclusive boundaries,
+        // the same ones dev-bench uses for the taps it mediates.
+        let signal = StreamSource::Signal { name: heapless::String::try_from("outpost").unwrap() };
+        let whole = tap(0, "trace", signal.clone(), StreamEncoding::Raw);
+        let mut windowed = tap(1, "burst", signal, StreamEncoding::Raw);
+        windowed.scope = embarch_study_designer::StreamScope::Steps { from: 1, to: 2 };
+
+        assert!(signal_tap_is_wanted(&whole, 0));
+        assert!(signal_tap_is_wanted(&whole, 7));
+
+        assert!(!signal_tap_is_wanted(&windowed, 0));
+        assert!(signal_tap_is_wanted(&windowed, 1));
+        assert!(signal_tap_is_wanted(&windowed, 2), "the range is inclusive at both ends");
+        assert!(!signal_tap_is_wanted(&windowed, 3));
+    }
+
+    // ---- decision 31: the POST /study version gate ------------------------
+
+    fn requires(dev_bench: &str) -> Requirements {
+        Requirements {
+            dev_bench_version: heapless::String::try_from(dev_bench).unwrap(),
+            firmware_version: heapless::String::try_from("any").unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_dev_bench_version_mismatch_is_a_409_and_no_step_ever_runs() {
+        // The assertion that matters is the second one. `StudyStart` is the
+        // only message that can make dev-bench execute anything, so a gate
+        // that returned 409 *after* sending it would still have run steps —
+        // which is exactly what decision 31 forbids, and exactly what a test
+        // asserting only the status code would miss.
+        let mut sent = false;
+        let outcome = gate_then_start(&requires("g1a2b3c"), "gdeadbee", || {
+            sent = true;
+            Ok(())
+        });
+
+        let (status, msg) = outcome.expect_err("a mismatch must be rejected");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!sent, "StudyStart must not be sent on a version mismatch — no step may run");
+        // Both strings named, so the operator can see which way to fix it.
+        assert!(msg.contains("g1a2b3c"), "{msg}");
+        assert!(msg.contains("gdeadbee"), "{msg}");
+    }
+
+    #[test]
+    fn an_exact_version_match_starts_the_study() {
+        let mut sent = false;
+        gate_then_start(&requires("g1a2b3c"), "g1a2b3c", || {
+            sent = true;
+            Ok(())
+        })
+        .expect("an exact match satisfies the requirement");
+        assert!(sent);
+    }
+
+    #[test]
+    fn any_is_a_value_that_satisfies_every_bench() {
+        let mut sent = false;
+        gate_then_start(&requires("any"), "whatever-the-bench-happens-to-be", || {
+            sent = true;
+            Ok(())
+        })
+        .expect("`any` is an explicit, legal way to say the build doesn't matter");
+        assert!(sent);
+    }
+
+    #[test]
+    fn a_send_failure_is_a_bad_gateway_not_a_version_rejection() {
+        let (status, msg) = gate_then_start(&requires("any"), "x", || Err("serial died".to_string()))
+            .expect_err("a failed send is still a failure");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(msg, "serial died");
+    }
+
+    #[test]
+    fn provenance_never_presents_a_declared_dut_version_as_a_verified_one() {
+        // Decision 31's asymmetry, made structural: dev-bench self-reports,
+        // so its source is `ReportedByDevBench`. There is no readback path
+        // from a DUT, and Core does not flash one as part of a study, so the
+        // firmware version is `Declared` — an assertion nobody checked, and
+        // it says so.
+        let study = study_with_steps(&[1_000]);
+        let provenance = provenance_for(&study, "gfeedface");
+        assert_eq!(provenance.dev_bench_version.as_str(), "gfeedface");
+        assert_eq!(provenance.dev_bench_source, VersionSource::ReportedByDevBench);
+        assert_eq!(provenance.firmware_source, VersionSource::Declared);
+        assert!(provenance.dev_bench_source.is_verified());
+        assert!(!provenance.firmware_source.is_verified());
+    }
+
+    // ---- serving a capture back: GET /study/{id}/stream/{name} -------------
+
+    #[tokio::test]
+    async fn a_stream_is_served_rendered_by_default_and_raw_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(&[1_000], &[power_tap()]);
+        let capture = test_capture(dir.path(), study);
+        let record = StreamRecord {
+            rx_utc_ms: 5,
+            bytes: heapless::Vec::from_slice(&3.3f32.to_le_bytes()).unwrap(),
+        };
+        write_stream_record(&capture, &capture.study.streams[0].clone(), &record);
+
+        let streams_dir = dir.path().join("streams");
+        let index = stream_store::read_index(&streams_dir).unwrap().unwrap();
+        let entry = index.find("power").expect("the tap resolves by its declared name");
+
+        let rendered = serve_capture(&streams_dir, entry, false, "power").await.unwrap();
+        assert_eq!(rendered.status(), StatusCode::OK);
+        assert_eq!(rendered.headers().get(CONTENT_TYPE).unwrap(), "text/csv");
+
+        let raw = serve_capture(&streams_dir, entry, true, "power").await.unwrap();
+        assert_eq!(raw.headers().get(CONTENT_TYPE).unwrap(), "application/octet-stream");
+
+        // And the three retired routes still resolve, through the same index.
+        assert_eq!(index.find_alias("power").map(|e| e.name.as_str()), Some("power"));
+        assert!(index.find_alias("gatt").is_none());
+        assert!(index.find("no-such-tap").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_declared_tap_that_captured_nothing_is_a_404_rather_than_an_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(&[1_000], &[power_tap()]);
+        let _capture = test_capture(dir.path(), study);
+
+        let streams_dir = dir.path().join("streams");
+        let index = stream_store::read_index(&streams_dir).unwrap().unwrap();
+        let entry = index.find("power").unwrap();
+
+        let (status, _) = serve_capture(&streams_dir, entry, false, "power data")
+            .await
+            .expect_err("nothing was captured");
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     // ---- generate_study_id ----
