@@ -858,6 +858,7 @@ pub async fn post_study_handler(
     let streams = study.streams.clone();
     let streams_crc_value = study.streams_crc;
     let requires = study.requires.clone();
+    let dev_bench_log_level = study.dev_bench_log_level;
     let reported = hello.firmware_version.clone();
     let run_for_gate = run.clone();
 
@@ -877,6 +878,7 @@ pub async fn post_study_handler(
                 steps_crc: steps_crc_value,
                 streams,
                 streams_crc: streams_crc_value,
+                dev_bench_log_level,
             })
             .map_err(|e| format!("failed to send StudyStart to dev-bench: {e:?}"))
         });
@@ -1363,7 +1365,15 @@ fn render_outpost_traces(
         return;
     };
 
-    let mut results: HashMap<String, (String, String)> = HashMap::new();
+    /// Per tap: the rendered file name, the human note, and the two facts a
+    /// caller branches on — whether it is named, and whether it is timed.
+    struct Rendered {
+        file: String,
+        note: String,
+        named: bool,
+        timed: bool,
+    }
+    let mut results: HashMap<String, Rendered> = HashMap::new();
 
     for tap in taps {
         if !matches!(tap.encoding, StreamEncoding::OutpostTrace) {
@@ -1378,18 +1388,40 @@ fn render_outpost_traces(
             entry.raw_file.strip_suffix(".bin").unwrap_or(&entry.raw_file)
         );
         let out_path = streams_dir.join(&rendered_name);
+        // Core's own receipt time per frame, written during the capture — the
+        // trace's only clock, since a record carries none of its own
+        // (`embarch-outpost/design.md` §3 decisions 4, 17, 18).
+        let arrival_path = entry.arrival_file.as_ref().map(|f| streams_dir.join(f));
 
-        match outpost_manifest::render(&raw_path, &out_path, stored.map(|s| &s.manifest)) {
+        match outpost_manifest::render(
+            &raw_path,
+            &out_path,
+            arrival_path.as_deref(),
+            stored.map(|s| &s.manifest),
+        ) {
             Ok(outcome) => {
-                let note = match &outcome.refusal {
-                    Some(why) => format!(
+                // Two independent things can be missing from a trace — its
+                // names and its times — and a reader has to be able to tell
+                // which. Both land in the same `note`, both said out loud.
+                let mut notes: Vec<String> = Vec::new();
+                if let Some(why) = &outcome.refusal {
+                    notes.push(format!(
                         "decoded but NOT named: {}. The raw capture is intact; applying a \
                          manifest that does not describe this firmware would relabel every \
                          marker and thread.",
                         why.describe()
-                    ),
-                    None => String::new(),
-                };
+                    ));
+                }
+                if let Some(why) = &outcome.arrival_refusal {
+                    notes.push(format!("decoded but NOT timed: {why}."));
+                } else if outcome.stamped_frames == 0 && outcome.frames > 0 {
+                    notes.push(
+                        "decoded but NOT timed: no arrival stamps were recorded for this \
+                         capture, so its rows are ordered and untimed."
+                            .to_string(),
+                    );
+                }
+                let note = notes.join(" ");
                 tracing::info!(
                     name = tap.name.as_str(),
                     frames = outcome.frames,
@@ -1398,9 +1430,18 @@ fn render_outpost_traces(
                     records = outcome.records,
                     dropped_at_source = outcome.dropped_at_source,
                     named = outcome.refusal.is_none(),
+                    stamped_frames = outcome.stamped_frames,
                     "rendered an outpost trace"
                 );
-                results.insert(tap.name.as_str().to_string(), (rendered_name, note));
+                results.insert(
+                    tap.name.as_str().to_string(),
+                    Rendered {
+                        file: rendered_name,
+                        note,
+                        named: outcome.refusal.is_none(),
+                        timed: outcome.stamped_frames > 0,
+                    },
+                );
             }
             Err(e) => {
                 tracing::error!(
@@ -1409,7 +1450,12 @@ fn render_outpost_traces(
                 );
                 results.insert(
                     tap.name.as_str().to_string(),
-                    (String::new(), format!("rendering failed: {e}")),
+                    Rendered {
+                        file: String::new(),
+                        note: format!("rendering failed: {e}"),
+                        named: false,
+                        timed: false,
+                    },
                 );
             }
         }
@@ -1419,13 +1465,15 @@ fn render_outpost_traces(
         return;
     }
     if let Err(e) = stream_store::update_index(&streams_dir, |entry| {
-        if let Some((rendered, note)) = results.get(&entry.name) {
-            if !rendered.is_empty() {
-                entry.rendered_file = Some(rendered.clone());
+        if let Some(rendered) = results.get(&entry.name) {
+            if !rendered.file.is_empty() {
+                entry.rendered_file = Some(rendered.file.clone());
             }
-            if !note.is_empty() {
-                entry.note = Some(note.clone());
+            if !rendered.note.is_empty() {
+                entry.note = Some(rendered.note.clone());
             }
+            entry.named = Some(rendered.named);
+            entry.timed = Some(rendered.timed);
         }
     }) {
         tracing::warn!("failed to record the outpost rendering in streams/index.json: {e:?}");
@@ -1684,8 +1732,18 @@ fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
 /// §4.8) — never from the bytes. There is no sniff and no fallback here:
 /// `Raw` renders nothing because nobody declared anything to render it as.
 fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord) {
-    // Raw first. Unconditionally, for every encoding.
-    capture.store.lock().unwrap().write_raw(tap.id, &record.bytes);
+    {
+        // Raw first. Unconditionally, for every encoding. The arrival stamp
+        // goes down in the same lock, immediately after, because for an
+        // `OutpostTrace` tap it is the *only* clock the trace will ever have —
+        // a record carries none of its own (`embarch-outpost/design.md` §3
+        // decisions 4 and 17) and the rendering happens post-hoc, long after
+        // this read. A no-op for every other encoding, whose rendered rows
+        // carry `core_rx_utc_ms` themselves.
+        let mut store = capture.store.lock().unwrap();
+        store.write_raw(tap.id, &record.bytes);
+        store.note_arrival(tap.id, &record.bytes, record.rx_utc_ms);
+    }
 
     let current_step = capture.current_step.load(Ordering::Relaxed);
 
@@ -2079,10 +2137,20 @@ pub struct StreamIndexEntryResponse {
     /// `GET /study/{id}/stream/{name}` (without `?raw=1`) serves something
     /// other than the raw bytes.
     pub rendered: bool,
-    /// Why this tap's rendering is missing, incomplete, or **unnamed** — set
-    /// only when there is something to say.
+    /// Why this tap's rendering is missing, incomplete, unnamed or untimed —
+    /// set only when there is something to say. Prose, for a person; the two
+    /// facts to branch on are below.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Whether a manifest named this trace (`embarch-outpost/design.md` §3
+    /// decision 9), and whether its frames carry Core's receipt time
+    /// (decisions 17, 18). Two independent facts, reported as two, because a
+    /// trace can be either without the other and a caller that read them off
+    /// `note`'s text would be re-deriving a judgement Core already made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2144,6 +2212,8 @@ fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexRespons
                 alias: e.alias,
                 rendered: e.rendered_file.is_some(),
                 note: e.note,
+                named: e.named,
+                timed: e.timed,
             })
             .collect(),
     }
@@ -2379,6 +2449,7 @@ mod tests {
             streams,
             steps_crc: steps_crc_value,
             streams_crc: streams_crc_value,
+            dev_bench_log_level: Default::default(),
         }
     }
 
@@ -3477,8 +3548,11 @@ mod tests {
                     raw_file: "outpost.bin".to_string(),
                     rendered_file: Some("outpost.trace.csv".to_string()),
                     encoding: StreamEncoding::OutpostTrace,
+                    arrival_file: Some("outpost.arrival.csv".to_string()),
                     alias: None,
                     note: Some("decoded but NOT named: manifest build_id \"a\" != firmware build_id \"b\"".to_string()),
+                    named: Some(false),
+                    timed: Some(true),
                 },
                 stream_store::StreamIndexEntry {
                     id: 1,
@@ -3486,8 +3560,11 @@ mod tests {
                     raw_file: "power.bin".to_string(),
                     rendered_file: Some("power.csv".to_string()),
                     encoding: StreamEncoding::Raw,
+                    arrival_file: None,
                     alias: Some("power".to_string()),
                     note: None,
+                    named: None,
+                    timed: None,
                 },
             ],
         };
@@ -3501,6 +3578,11 @@ mod tests {
             "the refusal reason must reach an HTTP caller, or a UI cannot tell an unnamed trace \
              from a named one"
         );
+        // Two independent facts, carried as two: this trace is unnamed *and*
+        // timed, and a caller reading "named" off the note's absence would get
+        // one of them wrong.
+        assert_eq!(trace.named, Some(false));
+        assert_eq!(trace.timed, Some(true));
         // The unrefused tap says nothing, rather than saying "fine" — an
         // absent note is what "nothing to report" looks like.
         assert_eq!(response.streams[1].note, None);
@@ -3519,8 +3601,11 @@ mod tests {
                 raw_file: "raw.bin".to_string(),
                 rendered_file: None,
                 encoding: StreamEncoding::Raw,
+                arrival_file: None,
                 alias: None,
                 note: None,
+                named: None,
+                timed: None,
             }],
         };
         assert!(!stream_index_response(index).streams[0].rendered);

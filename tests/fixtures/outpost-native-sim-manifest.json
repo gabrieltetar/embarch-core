@@ -1,10 +1,9 @@
 {
   "arch": "x86",
-  "build_id": "0909fda-dirty+op0909fda-dirty+ma0bd48ea",
-  "cycles_per_sec_config": 1000000,
+  "build_id": "d490fc3-dirty+opd490fc3-dirty+ma0bd48ea",
   "isr_args": {},
   "isrs": {},
-  "manifest_crc": 294088412,
+  "manifest_crc": 2849702020,
   "markers": {
     "0": "WORK_BEGIN",
     "1": "WORK_END",
@@ -15,13 +14,13 @@
     "threads created with k_thread_create() into a plain `static struct k_thread` have no distinguishing symbol and are absent here by design; they render as raw pointers rather than as a guess",
     "no _sw_isr_table in the ELF (CONFIG_GEN_SW_ISR_TABLE=n, or an architecture that does not use one): ISR records carry their raw vector number and resolve to no name"
   ],
-  "outpost_version": "0909fda-dirty",
-  "record_layout_version": 1,
-  "schema": 1,
+  "outpost_version": "d490fc3-dirty",
+  "record_layout_version": 2,
+  "schema": 2,
   "threads": {
     "0x08057520": "outpost_pong",
     "0x080575c0": "outpost_ping",
-    "0x080581a0": "idle",
-    "0x08058240": "main"
+    "0x080580a0": "idle",
+    "0x08058140": "main"
   }
 }

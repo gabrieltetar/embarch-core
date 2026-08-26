@@ -170,18 +170,49 @@ pub struct StreamIndexEntry {
     /// `raw_file` already *is* the rendering) and `OutpostTrace` (needs a
     /// manifest Core cannot yet be given — decision 30(c)).
     pub rendered_file: Option<String>,
+    /// `frame_index,rx_utc_ms,frame_bytes` — **Core's own receipt time for
+    /// every frame of an `OutpostTrace` capture**, and the trace's only clock
+    /// (`embarch-outpost/design.md` §3 decisions 17 and 18). `None` for every
+    /// other encoding: a sample and a transcript entry carry
+    /// `core_rx_utc_ms` in their own rendered rows, so only the encoding
+    /// whose rendering happens post-hoc needs the stamps kept beside the
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_file: Option<String>,
     pub encoding: StreamEncoding,
     /// Which of the three retired fixed-path routes this tap answers, if
     /// any: `"power"`, `"waveform"` or `"gatt"`. The mapping is exactly the
     /// one Phase A's interim `write_stream_record` used to pick between the
     /// three CSV files, moved here rather than re-derived.
     pub alias: Option<String>,
-    /// Why this tap's rendering is missing, incomplete, or unnamed — set only
-    /// when there is something to say. An `OutpostTrace` tap decoded without
-    /// an applicable manifest carries the refusal here, so the reason survives
-    /// alongside the capture instead of only in a log line nobody kept.
+    /// Why this tap's rendering is missing, incomplete, unnamed or untimed —
+    /// set only when there is something to say. An `OutpostTrace` tap decoded
+    /// without an applicable manifest carries the refusal here, so the reason
+    /// survives alongside the capture instead of only in a log line nobody
+    /// kept.
+    ///
+    /// **Prose, for a person.** The two facts a caller has to branch on live
+    /// in [`named`](Self::named) and [`timed`](Self::timed) precisely so
+    /// nothing has to pattern-match on this text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Whether an applicable manifest named this trace's threads, ISRs and
+    /// markers. `None` until the capture closes, and on every encoding for
+    /// which the question is meaningless.
+    ///
+    /// Split out from `note` when a trace gained a *second* way of being
+    /// incomplete: it can be named and untimed, timed and unnamed, or neither,
+    /// and a caller that inferred "named" from "no note" would call an untimed
+    /// trace unnamed (`embarch-outpost/design.md` §3 decision 18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named: Option<bool>,
+    /// Whether this trace's frames carry Core's receipt time — the trace's
+    /// only clock (`embarch-outpost/design.md` §3 decision 17). `false` is an
+    /// ordered, untimed trace: a real answer, and one a caller must draw
+    /// differently rather than against an axis of milliseconds it does not
+    /// have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed: Option<bool>,
 }
 
 impl StreamIndex {
@@ -382,11 +413,68 @@ struct TapFiles {
     /// Always present. Written before any decode is attempted.
     raw: SegmentedFile,
     rendered: Option<SegmentedFile>,
+    /// Only an `OutpostTrace` tap has one: see [`ArrivalLog`].
+    arrival: Option<ArrivalLog>,
     /// `StreamClose.dropped > 0` — data the *source* lost before it ever
     /// reached Core. A different loss from a retention rotation, reported
     /// through the same `StreamRef.truncated` flag because a reader's
     /// question is the same either way: is this capture complete?
     lost_at_source: bool,
+}
+
+/// Core's receipt time for each frame of an outpost capture, kept beside the
+/// raw bytes.
+///
+/// **This is the trace's clock.** An outpost record carries no timestamp at
+/// all (`embarch-outpost/design.md` §3 decision 4), so the only time a trace
+/// has is when Core received it — and the rendering happens *post-hoc*, from
+/// the complete raw file, long after the read that saw the bytes. Something
+/// has to carry the stamps across that gap, and this is it (decision 18).
+///
+/// **What a row is keyed by.** `frame_index` counts non-empty runs between
+/// `0x00` delimiters from the start of the capture — exactly what
+/// `embarch_study_designer::outpost::chunks` enumerates, so the writer and the
+/// decoder agree on what frame 7 is *without this side decoding anything*. All
+/// this does is count delimiters; a frame that later fails its CRC still
+/// consumes an index on both sides, which is what keeps them in step.
+///
+/// **Why `frame_bytes` is in the row.** It makes the join checkable rather
+/// than assumed. The raw file rotates under retention and this file does not,
+/// so their frame 0 can stop being the same frame; with each frame's own
+/// length recorded, the renderer can verify an alignment and **refuse** when
+/// none fits, instead of shifting every timestamp by a few frames and
+/// producing a trace that is entirely readable and entirely wrong.
+struct ArrivalLog {
+    file: SegmentedFile,
+    /// Non-empty delimiter-separated runs seen so far — the next frame's index.
+    frames: u64,
+    /// Bytes of the run in progress. A frame split across two reads is the
+    /// normal case, not an edge one: this is what makes the count survive it.
+    pending: usize,
+}
+
+impl ArrivalLog {
+    /// Scans one arrival's bytes for frame boundaries and appends a row per
+    /// frame that *completed* in it.
+    ///
+    /// The stamp is the read's, so several frames completing in one read all
+    /// carry the same time. That is honest — they did arrive together, in one
+    /// buffer, and the interval between them is not something Core observed.
+    fn note(&mut self, bytes: &[u8], rx_utc_ms: u64) -> Option<String> {
+        let mut rows = String::new();
+        for byte in bytes {
+            if *byte == 0 {
+                if self.pending > 0 {
+                    rows.push_str(&format!("{},{rx_utc_ms},{}\n", self.frames, self.pending));
+                    self.frames += 1;
+                }
+                self.pending = 0;
+            } else {
+                self.pending += 1;
+            }
+        }
+        (!rows.is_empty()).then_some(rows)
+    }
 }
 
 /// Every declared tap's files for one study, plus the index that maps a tap
@@ -425,6 +513,8 @@ impl StreamStore {
 
             let raw_file = format!("{stem}.{}", raw_extension(&tap.encoding));
             let rendered_file = rendered_extension(&tap.encoding).map(|ext| format!("{stem}.{ext}"));
+            let arrival_file = matches!(tap.encoding, StreamEncoding::OutpostTrace)
+                .then(|| format!("{stem}.arrival.csv"));
 
             files.push(TapFiles {
                 name: tap.name.as_str().to_string(),
@@ -432,6 +522,22 @@ impl StreamStore {
                 rendered: rendered_file
                     .as_ref()
                     .map(|f| SegmentedFile::new(&dir, f, rendered_header(&tap.encoding), max_bytes)),
+                arrival: arrival_file.as_ref().map(|f| ArrivalLog {
+                    // **Deliberately unrotated** (`max_bytes` 0), unlike every
+                    // other file here. A row is ~24 bytes against a frame of a
+                    // few hundred, so this is a rounding error on the capture
+                    // it describes — and rotating it would delete the low
+                    // frame indices the join starts from, turning a bounded
+                    // retention loss into an unalignable one.
+                    file: SegmentedFile::new(
+                        &dir,
+                        f,
+                        Some("frame_index,rx_utc_ms,frame_bytes".to_string()),
+                        0,
+                    ),
+                    frames: 0,
+                    pending: 0,
+                }),
                 lost_at_source: false,
             });
 
@@ -440,9 +546,12 @@ impl StreamStore {
                 name: tap.name.as_str().to_string(),
                 raw_file,
                 rendered_file,
+                arrival_file,
                 encoding: tap.encoding,
                 alias: alias_for(&tap.source, &tap.encoding).map(str::to_string),
                 note: None,
+                named: None,
+                timed: None,
             });
         }
 
@@ -492,6 +601,34 @@ impl StreamStore {
                 name = tap.name.as_str(),
                 "failed to append a row to {}: {e:?}",
                 rendered.live.display()
+            );
+        }
+    }
+
+    /// Records **when** these bytes arrived, for the one encoding whose
+    /// timeline is Core's receipt time rather than the DUT's own clock.
+    ///
+    /// Called right after [`write_raw`](Self::write_raw) with the same bytes
+    /// and that record's `rx_utc_ms`; a no-op for every tap that has no
+    /// arrival log. Losing a row here costs the *time* on those frames and
+    /// never the capture — which is why it warns and returns rather than
+    /// propagating.
+    pub fn note_arrival(&mut self, id: u8, bytes: &[u8], rx_utc_ms: u64) {
+        let Some(tap) = self.taps.get_mut(usize::from(id)) else {
+            return;
+        };
+        let Some(arrival) = tap.arrival.as_mut() else {
+            return;
+        };
+        let Some(rows) = arrival.note(bytes, rx_utc_ms) else {
+            return;
+        };
+        if let Err(e) = arrival.file.write(rows.as_bytes()) {
+            tracing::error!(
+                name = tap.name.as_str(),
+                "failed to append arrival stamps to {}: {e:?}; those frames will render \
+                 without a time",
+                arrival.file.live.display()
             );
         }
     }
@@ -757,9 +894,85 @@ mod tests {
 
         let index = read_index(store.dir()).unwrap().unwrap();
         assert_eq!(index.streams[0].rendered_file, None);
+        // The one encoding that gets an arrival log, declared before any bytes
+        // arrive like everything else in the index.
+        assert_eq!(index.streams[0].arrival_file.as_deref(), Some("outpost.arrival.csv"));
         assert_eq!(fs::read(store.dir().join("outpost.bin")).unwrap(), b"\x01\x02\x03");
         assert_eq!(store.refs()[0].bytes_written, 3);
         assert!(!store.refs()[0].truncated);
+    }
+
+    fn outpost_store(dir: &Path) -> StreamStore {
+        let taps = vec![
+            tap(
+                0,
+                "outpost",
+                StreamSource::Signal { name: heapless::String::try_from("outpost-uart").unwrap() },
+                StreamEncoding::OutpostTrace,
+            ),
+            tap(1, "power", StreamSource::PowerFrontEnd { sample_hz: 1000 }, samples()),
+        ];
+        StreamStore::create(dir, &taps, 0).unwrap()
+    }
+
+    /// The arrival log's whole job: a row per frame, keyed by the same frame
+    /// index `outpost::chunks` enumerates, with Core's receipt time on it.
+    ///
+    /// The three cases that decide whether the index stays in step with the
+    /// decoder are all here, because getting any of them wrong shifts every
+    /// timestamp in a trace: **a frame split across two reads** (the normal
+    /// case on a serial port), **several frames completing in one read** (they
+    /// share a stamp, because they genuinely arrived together), and **an empty
+    /// run between two delimiters**, which `chunks` skips and this must skip
+    /// too.
+    #[test]
+    fn the_arrival_log_records_one_stamped_row_per_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = outpost_store(dir.path());
+
+        // Frame A arrives in two reads; then B and C complete in one read,
+        // with a doubled delimiter between them.
+        store.note_arrival(0, b"\x03\xaa", 1_000);
+        store.note_arrival(0, b"\xbb\x00", 1_020);
+        store.note_arrival(0, b"\x02\xcc\x00\x00\x04\xdd\xee\xff\x00", 1_040);
+
+        let log = fs::read_to_string(dir.path().join("streams").join("outpost.arrival.csv")).unwrap();
+        let rows: Vec<&str> = log.lines().collect();
+        assert_eq!(rows[0], "frame_index,rx_utc_ms,frame_bytes");
+        assert_eq!(
+            &rows[1..],
+            [
+                // 3 bytes — the delimiter is not part of the frame — and the
+                // stamp of the read that *completed* it.
+                "0,1020,3",
+                // Both completed in the same read, so both carry its time.
+                "1,1040,2",
+                "2,1040,4",
+            ],
+            "the log did not match the frames those reads carried"
+        );
+
+        // And the frame lengths are exactly what the decoder will see, which
+        // is what makes the join checkable rather than assumed.
+        let raw = b"\x03\xaa\xbb\x00\x02\xcc\x00\x00\x04\xdd\xee\xff\x00";
+        let lens: Vec<usize> = embarch_study_designer::outpost::chunks(raw)
+            .map(<[u8]>::len)
+            .collect();
+        assert_eq!(lens, vec![3, 2, 4]);
+    }
+
+    /// Only the encoding whose rendering happens post-hoc gets a log. A sample
+    /// row carries `core_rx_utc_ms` itself, so a second copy of the same fact
+    /// would be a file to keep in sync for nothing.
+    #[test]
+    fn a_tap_that_is_not_an_outpost_trace_has_no_arrival_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = outpost_store(dir.path());
+        store.note_arrival(1, b"\x01\x02\x00", 1_000);
+
+        let index = read_index(store.dir()).unwrap().unwrap();
+        assert_eq!(index.streams[1].arrival_file, None);
+        assert!(!dir.path().join("streams").join("power.arrival.csv").exists());
     }
 
     #[test]

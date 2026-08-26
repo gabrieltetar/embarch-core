@@ -32,9 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use embarch_study_designer::outpost::{
-    self, Frame, ManifestRefusal, OutpostManifest, RecordKind, Unwrapper,
-};
+use embarch_study_designer::outpost::{self, Frame, ManifestRefusal, OutpostManifest, RecordKind};
 
 /// The file a study's own copy of the manifest is written to, inside that
 /// study's results directory.
@@ -183,7 +181,86 @@ pub struct RenderOutcome {
     pub refusal: Option<ManifestRefusal>,
     /// The build ID the firmware reported, when a header frame was found.
     pub firmware_build_id: Option<String>,
-    pub cycles_per_sec: u32,
+    /// Frames that got a receipt time out of the arrival log — the trace's only
+    /// clock (`embarch-outpost/design.md` §3 decisions 17, 18). Zero means
+    /// every row rendered with an empty `rx_utc_ms`: an ordered, untimed
+    /// trace, which is a real answer and is never dressed up as a timed one.
+    pub stamped_frames: usize,
+    /// Why the arrival log did not apply, when there was one and it did not.
+    /// Reaches `streams/index.json`'s `note` the same way a manifest refusal
+    /// does.
+    pub arrival_refusal: Option<String>,
+}
+
+/// Core's own receipt time per frame, read back from the sidecar
+/// `stream_store::ArrivalLog` wrote during the capture.
+///
+/// **The alignment is verified, not assumed.** The raw capture rotates under
+/// retention and the arrival log does not, so "frame 0" can mean different
+/// frames in the two files. Each row carries its frame's byte length, so this
+/// tries the two alignments that can actually occur — the log starting where
+/// the capture starts, and the log running ahead of a capture that lost its
+/// beginning — and checks the lengths agree. When neither fits, **nothing is
+/// stamped**: a whole trace shifted by three frames is readable, wrong, and
+/// indistinguishable from a correct one, which is precisely the failure this
+/// module exists to refuse.
+#[derive(Debug, Default)]
+struct ArrivalIndex {
+    /// `(rx_utc_ms, frame_bytes)`, in frame-index order.
+    rows: Vec<(u64, usize)>,
+}
+
+impl ArrivalIndex {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut rows: Vec<(u64, u64, usize)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("frame_index") {
+                continue;
+            }
+            let mut it = line.split(',');
+            let (Some(idx), Some(rx), Some(len)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            match (idx.parse::<u64>(), rx.parse::<u64>(), len.parse::<usize>()) {
+                (Ok(idx), Ok(rx), Ok(len)) => rows.push((idx, rx, len)),
+                // A half-written final line is the normal shape of a file that
+                // was being appended to when the process stopped.
+                _ => continue,
+            }
+        }
+        rows.sort_unstable();
+        // Rows must be a contiguous run for an offset alignment to mean
+        // anything. A hole means some `note_arrival` write failed, and the
+        // honest response is to keep the prefix rather than to silently
+        // renumber across the hole.
+        let mut kept: Vec<(u64, usize)> = Vec::new();
+        for (i, (idx, rx, len)) in rows.into_iter().enumerate() {
+            if idx != i as u64 {
+                break;
+            }
+            kept.push((rx, len));
+        }
+        Ok(Self { rows: kept })
+    }
+
+    /// How far into [`Self::rows`] the capture's frame 0 sits, or `None` when
+    /// no alignment survives the length check.
+    fn offset_for(&self, chunk_lens: &[usize]) -> Option<usize> {
+        if self.rows.is_empty() || chunk_lens.is_empty() {
+            return None;
+        }
+        let candidates = [0usize, self.rows.len().saturating_sub(chunk_lens.len())];
+        candidates.into_iter().find(|&off| {
+            let overlap = chunk_lens.len().min(self.rows.len().saturating_sub(off));
+            // One frame in common proves nothing — a single length matches by
+            // coincidence often enough on a wire whose frames are mostly one
+            // of two sizes.
+            overlap >= 2
+                && (0..overlap).all(|i| self.rows[off + i].1 == chunk_lens[i])
+        })
+    }
 }
 
 /// Decodes a captured outpost stream into a `*.trace.csv` beside it.
@@ -196,11 +273,45 @@ pub struct RenderOutcome {
 pub fn render(
     raw_path: &Path,
     out_path: &Path,
+    arrival_path: Option<&Path>,
     manifest: Option<&OutpostManifest>,
 ) -> anyhow::Result<RenderOutcome> {
     use std::io::Write as _;
 
     let raw = std::fs::read(raw_path)?;
+
+    // Frame lengths first, in the same enumeration order the rows will be
+    // written in, because the arrival join is checked against them before a
+    // single row is stamped.
+    let chunk_lens: Vec<usize> = outpost::chunks(&raw).map(<[u8]>::len).collect();
+    let mut arrival_refusal: Option<String> = None;
+    let (arrivals, arrival_offset) = match arrival_path {
+        None => (ArrivalIndex::default(), None),
+        Some(path) => match ArrivalIndex::read(path) {
+            Ok(index) => match index.offset_for(&chunk_lens) {
+                Some(off) => (index, Some(off)),
+                None => {
+                    arrival_refusal = Some(format!(
+                        "{} holds {} frame stamps and this capture decodes into {} frames, and no \
+                         alignment of the two agrees on frame lengths — rendering the trace \
+                         without times rather than shifting every timestamp",
+                        path.display(),
+                        index.rows.len(),
+                        chunk_lens.len()
+                    ));
+                    (ArrivalIndex::default(), None)
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (ArrivalIndex::default(), None)
+            }
+            Err(e) => {
+                arrival_refusal =
+                    Some(format!("could not read {}: {e}", path.display()));
+                (ArrivalIndex::default(), None)
+            }
+        },
+    };
 
     let mut header: Option<embarch_study_designer::outpost::OutpostHeader> = None;
     let mut applied: Option<&OutpostManifest> = None;
@@ -212,7 +323,6 @@ pub fn render(
     let mut out = std::fs::File::create(out_path)?;
     writeln!(out, "{}", outpost::csv_header())?;
 
-    let mut unwrap = Unwrapper::new();
     let mut scratch = vec![0u8; 4096];
     let mut outcome = RenderOutcome {
         frames: 0,
@@ -222,11 +332,21 @@ pub fn render(
         dropped_at_source: 0,
         refusal: None,
         firmware_build_id: None,
-        cycles_per_sec: 0,
+        stamped_frames: 0,
+        arrival_refusal: None,
     };
     let mut last_seq: Option<u8> = None;
 
-    for chunk in outpost::chunks(&raw) {
+    for (frame_index, chunk) in outpost::chunks(&raw).enumerate() {
+        // The frame's own receipt time, or none. Looked up by index rather
+        // than by position in a filtered list on purpose: a frame that fails
+        // its CRC below still consumed an index while the bytes were being
+        // stamped (`stream_store::ArrivalLog`), so skipping one here must not
+        // shift the frames after it.
+        let rx_utc_ms = arrival_offset
+            .and_then(|off| arrivals.rows.get(off + frame_index))
+            .map(|(rx, _)| *rx);
+
         // A frame larger than the scratch buffer is a configuration Core
         // cannot decode rather than one it should truncate: grow once and
         // retry, so a DUT with a large `CONFIG_EMBARCH_OUTPOST_BATCH_BYTES`
@@ -256,7 +376,6 @@ pub fn render(
             Frame::Header { header: h, .. } => {
                 if header.is_none() {
                     outcome.firmware_build_id = Some(h.build_id.as_str().to_string());
-                    outcome.cycles_per_sec = h.cycles_per_sec;
                     if let Some(m) = manifest {
                         match m.check(h.build_id.as_str(), h.record_layout_version) {
                             Ok(()) => {
@@ -269,7 +388,10 @@ pub fn render(
                     header = Some(h);
                 }
             }
-            Frame::Records { records, .. } => {
+            Frame::Records { records, seq } => {
+                if rx_utc_ms.is_some() {
+                    outcome.stamped_frames += 1;
+                }
                 for record in records {
                     let Ok(record) = record else {
                         outcome.bad_frames += 1;
@@ -279,11 +401,10 @@ pub fn render(
                     if RecordKind::from_byte(record.kind) == Some(RecordKind::Gap) {
                         outcome.dropped_at_source += u64::from(record.a);
                     }
-                    let absolute = unwrap.absolute(record.cycles);
                     writeln!(
                         out,
                         "{}",
-                        record.to_csv_row(absolute, outcome.cycles_per_sec, applied)
+                        record.to_csv_row(frame_index as u64, seq, rx_utc_ms, applied)
                     )?;
                 }
             }
@@ -292,14 +413,20 @@ pub fn render(
 
     if header.is_none() {
         // Nothing in the stream said what it is. Every record is still
-        // structurally decodable, but their timestamps have no rate and their
-        // layout version is unconfirmed.
+        // structurally decodable, and every one still has whatever time the
+        // arrival log gave its frame — what is missing is the build ID that
+        // would let a manifest name any of it, and the layout version that
+        // would confirm the shapes agree.
         tracing::warn!(
             path = %raw_path.display(),
-            "an outpost capture carried no header frame; its rows have no time base"
+            "an outpost capture carried no header frame; nothing can be named from it"
         );
     }
+    if let Some(why) = &arrival_refusal {
+        tracing::warn!(path = %raw_path.display(), "{why}");
+    }
     outcome.refusal = refusal;
+    outcome.arrival_refusal = arrival_refusal;
     Ok(outcome)
 }
 
@@ -311,7 +438,7 @@ mod tests {
         "schema": 1,
         "build_id": "v1.0-dirty+opabc+mdef",
         "outpost_version": "abc",
-        "record_layout_version": 1,
+        "record_layout_version": 2,
         "markers": {"0": "WORK_BEGIN"},
         "threads": {"0x20001234": "main"},
         "isrs": {"7": "nrfx_isr"},
@@ -336,7 +463,8 @@ mod tests {
 
     #[test]
     fn a_manifest_from_a_different_record_layout_is_refused_at_the_door() {
-        let json = MANIFEST_JSON.replace("\"record_layout_version\": 1", "\"record_layout_version\": 2");
+        let json =
+            MANIFEST_JSON.replace("\"record_layout_version\": 2", "\"record_layout_version\": 1");
         assert!(parse(&json).unwrap_err().contains("record layout version"));
     }
 
@@ -366,9 +494,9 @@ mod tests {
     const REAL_MANIFEST: &str =
         include_str!("../tests/fixtures/outpost-native-sim-manifest.json");
 
-    fn render_real(manifest: Option<&OutpostManifest>) -> (RenderOutcome, String) {
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "embarch-outpost-render-{}-{:?}",
+            "embarch-outpost-{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -376,10 +504,47 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An arrival log for the real capture, with **real frame lengths and
+    /// synthesised times**.
+    ///
+    /// The lengths are the capture's own, which is the half the join is
+    /// verified against. The times are invented, and have to be: that capture
+    /// went to a `native_sim` process's stdout, so no receiver ever stamped it
+    /// — no outpost byte has crossed a real UART on any board. `spacing_ms` is
+    /// how far apart consecutive frames are pretended to have arrived.
+    fn synth_arrivals(raw: &[u8], first_ms: u64, spacing_ms: u64) -> String {
+        let mut out = String::from("frame_index,rx_utc_ms,frame_bytes\n");
+        for (i, chunk) in outpost::chunks(raw).enumerate() {
+            out.push_str(&format!(
+                "{i},{},{}\n",
+                first_ms + i as u64 * spacing_ms,
+                chunk.len()
+            ));
+        }
+        out
+    }
+
+    fn render_real(manifest: Option<&OutpostManifest>) -> (RenderOutcome, String) {
+        render_real_with_arrivals(manifest, None)
+    }
+
+    fn render_real_with_arrivals(
+        manifest: Option<&OutpostManifest>,
+        arrivals: Option<&str>,
+    ) -> (RenderOutcome, String) {
+        let dir = scratch_dir("render");
         let raw = dir.join("outpost.bin");
         let out = dir.join("outpost.trace.csv");
+        let arrival_path = dir.join("outpost.arrival.csv");
         std::fs::write(&raw, REAL_CAPTURE).unwrap();
-        let outcome = render(&raw, &out, manifest).expect("renders");
+        let arrival_arg = arrivals.map(|text| {
+            std::fs::write(&arrival_path, text).unwrap();
+            arrival_path.as_path()
+        });
+        let outcome = render(&raw, &out, arrival_arg, manifest).expect("renders");
         let csv = std::fs::read_to_string(&out).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         (outcome, csv)
@@ -394,7 +559,6 @@ mod tests {
         assert_eq!(outcome.lost_frames, 0, "frame sequence numbers show a gap");
         assert!(outcome.frames > 1, "only one frame decoded out of a real capture");
         assert!(outcome.records > 100, "only {} records decoded", outcome.records);
-        assert_eq!(outcome.cycles_per_sec, 1_000_000);
         assert_eq!(
             outcome.refusal, None,
             "the manifest from this capture's own build was refused"
@@ -404,7 +568,15 @@ mod tests {
             "this capture deliberately overflows the ring; its gap records must be counted"
         );
 
-        assert!(csv.starts_with("cycles,us,kind,a,b,name\n"));
+        assert!(csv.starts_with("frame_index,frame_seq,rx_utc_ms,kind,a,b,name\n"));
+        // Nobody stamped this capture, so every row's time column is empty —
+        // stated rather than filled in.
+        assert_eq!(outcome.stamped_frames, 0);
+        assert_eq!(outcome.arrival_refusal, None, "there was no arrival log to refuse");
+        for line in csv.lines().skip(1) {
+            let rx = line.split(',').nth(2).expect("an rx_utc_ms column");
+            assert!(rx.is_empty(), "an unstamped capture rendered a time: {line}");
+        }
         // Names resolved out of the ELF, at zero wire cost.
         for expected in ["outpost_ping", "outpost_pong", "WORK_BEGIN", "BURST"] {
             assert!(csv.contains(expected), "the rendered trace never names {expected}");
@@ -444,6 +616,92 @@ mod tests {
         assert!(!csv.contains("WORK_BEGIN"), "names appeared without a manifest to take them from");
     }
 
+    /// The arrival join, end to end: a frame's stamp lands on every record in
+    /// that frame and on no record of another.
+    #[test]
+    fn arrival_stamps_land_on_every_record_of_their_own_frame() {
+        let manifest = parse(REAL_MANIFEST).unwrap();
+        let arrivals = synth_arrivals(REAL_CAPTURE, 1_700_000_000_000, 20);
+        let (outcome, csv) = render_real_with_arrivals(Some(&manifest), Some(&arrivals));
+
+        assert!(outcome.stamped_frames > 1, "only {} frames got a time", outcome.stamped_frames);
+        assert_eq!(outcome.arrival_refusal, None);
+
+        let mut seen = 0usize;
+        for line in csv.lines().skip(1) {
+            let f: Vec<&str> = line.split(',').collect();
+            let frame_index: u64 = f[0].parse().expect("a frame index");
+            let rx: u64 = f[2].parse().expect("every row is stamped");
+            assert_eq!(
+                rx,
+                1_700_000_000_000 + frame_index * 20,
+                "a record was stamped with another frame's time: {line}"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, outcome.records);
+    }
+
+    /// **The failure this join exists to refuse.** An arrival log whose frames
+    /// are not this capture's frames does not get applied to it — a trace
+    /// shifted by a few frames reads exactly like a correct one.
+    #[test]
+    fn an_arrival_log_that_does_not_fit_the_capture_stamps_nothing() {
+        let manifest = parse(REAL_MANIFEST).unwrap();
+        // Same row count, deliberately wrong lengths.
+        let mut bogus = String::from("frame_index,rx_utc_ms,frame_bytes\n");
+        for (i, _) in outpost::chunks(REAL_CAPTURE).enumerate() {
+            bogus.push_str(&format!("{i},{},7\n", 1_700_000_000_000u64 + i as u64));
+        }
+        let (outcome, csv) = render_real_with_arrivals(Some(&manifest), Some(&bogus));
+
+        assert_eq!(outcome.stamped_frames, 0, "a mismatched arrival log was applied anyway");
+        let why = outcome.arrival_refusal.expect("the refusal has to be reported");
+        assert!(why.contains("no alignment"), "{why}");
+        // And the trace is still there, ordered and untimed.
+        assert!(outcome.records > 100);
+        assert!(csv.contains("outpost_ping"), "the refusal cost the names too");
+    }
+
+    /// A capture that lost its beginning to retention rotation: the arrival log
+    /// is not rotated, so it runs ahead of the bytes. The lengths are what say
+    /// by how much.
+    #[test]
+    fn a_rotated_capture_aligns_from_the_end_it_still_has() {
+        let manifest = parse(REAL_MANIFEST).unwrap();
+        let arrivals = synth_arrivals(REAL_CAPTURE, 1_700_000_000_000, 20);
+        // Drop the first three frames' bytes, keeping every stamp.
+        let mut cut = 0usize;
+        let mut seen = 0usize;
+        for (i, b) in REAL_CAPTURE.iter().enumerate() {
+            if *b == 0 {
+                seen += 1;
+                if seen == 3 {
+                    cut = i + 1;
+                    break;
+                }
+            }
+        }
+        let dir = scratch_dir("rotated");
+        let raw = dir.join("outpost.bin");
+        let out = dir.join("outpost.trace.csv");
+        let arrival_path = dir.join("outpost.arrival.csv");
+        std::fs::write(&raw, &REAL_CAPTURE[cut..]).unwrap();
+        std::fs::write(&arrival_path, &arrivals).unwrap();
+        let outcome =
+            render(&raw, &out, Some(&arrival_path), Some(&manifest)).expect("renders");
+        let csv = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(outcome.arrival_refusal, None, "a rotated capture refused its own stamps");
+        assert!(outcome.stamped_frames > 1);
+        // Frame 0 of what survived is frame 3 of what was stamped, so the
+        // first row must carry frame 3's time and not frame 0's.
+        let first = csv.lines().nth(1).expect("a row");
+        let rx: u64 = first.split(',').nth(2).unwrap().parse().unwrap();
+        assert_eq!(rx, 1_700_000_000_000 + 3 * 20, "{first}");
+    }
+
     #[test]
     fn a_truncated_capture_costs_the_frames_it_lost_and_nothing_else() {
         // Cut the capture mid-frame, the way a study that ended while bytes
@@ -454,7 +712,7 @@ mod tests {
         let out = dir.join("outpost.trace.csv");
         std::fs::write(&raw, &REAL_CAPTURE[..REAL_CAPTURE.len() / 2]).unwrap();
         let manifest = parse(REAL_MANIFEST).unwrap();
-        let outcome = render(&raw, &out, Some(&manifest)).expect("renders");
+        let outcome = render(&raw, &out, None, Some(&manifest)).expect("renders");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(outcome.refusal, None, "a truncated capture still has its header");
@@ -464,6 +722,59 @@ mod tests {
             "cutting one frame in half cost {} frames",
             outcome.bad_frames
         );
+    }
+
+    /// Regenerates `embarch-ui`'s committed trace fixtures from this crate's
+    /// own renderer, so that view is tested against Core's real output rather
+    /// than against a CSV somebody typed.
+    ///
+    /// `#[ignore]`d because it writes into a sibling repo. Run it deliberately,
+    /// after any change to the row shape:
+    ///
+    /// ```text
+    /// EMBARCH_UI_FIXTURES=../embarch-ui/tests/fixtures \
+    ///     cargo test regenerate_the_ui_trace_fixtures -- --ignored --nocapture
+    /// ```
+    ///
+    /// It emits both halves, because a trace has two honest states and the
+    /// view has to draw each: `outpost-native-sim.trace.csv` (**untimed** —
+    /// nobody stamped that capture, and nobody could have: it went to a
+    /// simulator's stdout) and `outpost-native-sim-stamped.trace.csv` (the
+    /// same real frames with **synthesised** 20 ms arrival stamps, which is
+    /// the only way a stamped fixture can exist until an outpost byte crosses
+    /// a real UART).
+    #[test]
+    #[ignore = "writes fixtures into ../embarch-ui"]
+    fn regenerate_the_ui_trace_fixtures() {
+        let Ok(out_dir) = std::env::var("EMBARCH_UI_FIXTURES") else {
+            panic!("set EMBARCH_UI_FIXTURES to embarch-ui/tests/fixtures");
+        };
+        let out_dir = Path::new(&out_dir);
+        let manifest = parse(REAL_MANIFEST).expect("the real manifest parses");
+
+        let dir = scratch_dir("ui-fixtures");
+        let raw = dir.join("outpost.bin");
+        std::fs::write(&raw, REAL_CAPTURE).unwrap();
+
+        let untimed = dir.join("untimed.csv");
+        let outcome = render(&raw, &untimed, None, Some(&manifest)).expect("renders");
+        assert_eq!(outcome.stamped_frames, 0);
+        std::fs::copy(&untimed, out_dir.join("outpost-native-sim.trace.csv")).unwrap();
+
+        let arrival = dir.join("outpost.arrival.csv");
+        std::fs::write(&arrival, synth_arrivals(REAL_CAPTURE, 1_700_000_000_000, 20)).unwrap();
+        let stamped = dir.join("stamped.csv");
+        let outcome =
+            render(&raw, &stamped, Some(&arrival), Some(&manifest)).expect("renders");
+        assert!(outcome.stamped_frames > 1);
+        assert_eq!(outcome.arrival_refusal, None);
+        std::fs::copy(&stamped, out_dir.join("outpost-native-sim-stamped.trace.csv")).unwrap();
+
+        println!(
+            "wrote both fixtures: {} records over {} frames, {} of them stamped",
+            outcome.records, outcome.frames, outcome.stamped_frames
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
