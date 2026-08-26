@@ -1109,6 +1109,25 @@ fn run_study_to_completion(
     // the submitted `Study` and can't drift.
     let mut open_taps: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
+    // What this study asked the bench for, stated in the bench's own file
+    // (`embarch-dev-bench/design.md` §3 decision 39).
+    //
+    // **A quiet debug file is ambiguous without this line, and that is the
+    // whole reason it exists.** Since verbosity became per-study, a run with
+    // no firmware log lines in it means either "the bench had nothing to say"
+    // or "this study asked for `Warn` and the bench obliged" — and those are
+    // opposite conclusions to draw about a study that just failed. Written
+    // whatever the level is, including the default, because the reader needs
+    // the answer most precisely when nothing else was written.
+    crate::dev_bench_log::note(
+        Some(&study_id),
+        &format!(
+            "study '{}' starting; dev-bench log level {:?}",
+            capture.study.name.as_str(),
+            capture.study.dev_bench_log_level
+        ),
+    );
+
     // The reserved log tap's own handle. Derived the same way both ends
     // derive it — one past the last declared index — and read from
     // `capture.taps`' last entry rather than recomputed, so there is exactly
