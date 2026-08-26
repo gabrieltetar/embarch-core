@@ -199,7 +199,7 @@ pub fn flash(
             let mut probe = open_probe(probe_serial)?;
             embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
         }
-        return flash_backend::run(&backend, chip, firmware_path, probe_serial, erase);
+        return flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase);
     }
 
     let format = parse_format(format, base_address)?;
