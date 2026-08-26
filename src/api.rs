@@ -39,6 +39,10 @@ pub struct AppState {
     /// subscriber that falls behind gets an explicit `lagged` notice
     /// (`study::study_events_handler`) rather than silently missing events.
     pub study_events: tokio::sync::broadcast::Sender<study::StudyEvent>,
+    /// The DUT's `outpost-manifest.json`, as the flash that put that image on
+    /// the board delivered it (`embarch-outpost/design.md` §3 decision 9,
+    /// design.md §3 decision 30(c)). Empty until a `POST /flash` carries one.
+    pub outpost_manifest: crate::outpost_manifest::ManifestSlot,
 }
 
 impl AppState {
@@ -48,6 +52,7 @@ impl AppState {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         Self {
             token,
+            outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             hw_lock: Arc::new(Mutex::new(())),
             study_lock: Arc::new(StdMutex::new(None)),
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
@@ -181,6 +186,17 @@ struct FlashRequest {
     /// that omits it is unaffected.
     #[serde(default)]
     erase: bool,
+    /// The `outpost-manifest.json` this build produced, as a path *this
+    /// process* can open — the JSON-body sibling of the multipart `manifest`
+    /// part, exactly as `firmware_path` is `firmware`'s.
+    ///
+    /// On the same call as the artifact rather than on a `POST /manifests` of
+    /// its own (design.md §3 decision 30(c), Settlement 1): the manifest and
+    /// the image it describes then arrive in **one operation**, which is what
+    /// makes "the study's own flash binds it" hold with no "which manifest is
+    /// current" record to go stale.
+    #[serde(default)]
+    manifest_path: Option<String>,
 }
 
 fn default_format() -> String {
@@ -220,6 +236,10 @@ struct FlashArgs {
     base_address: Option<u64>,
     probe_serial: Option<String>,
     erase: bool,
+    /// The manifest's bytes, when this flash carried one. `None` means this
+    /// flash carried none, which **clears** whatever that chip had — see
+    /// `ManifestSlot::clear_for_chip`.
+    manifest_json: Option<String>,
     _uploaded: Option<tempfile::NamedTempFile>,
 }
 
@@ -254,6 +274,15 @@ async fn flash_handler(
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?;
         let base_address = req.base_address.as_deref().map(parse_base_address).transpose()?;
+        let manifest_json = match req.manifest_path.as_deref() {
+            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read manifest_path '{path}': {e}"),
+                )
+            })?),
+            None => None,
+        };
         FlashArgs {
             chip: req.chip,
             path: PathBuf::from(req.firmware_path),
@@ -261,6 +290,7 @@ async fn flash_handler(
             base_address,
             probe_serial: req.probe_serial,
             erase: req.erase,
+            manifest_json,
             _uploaded: None,
         }
     };
@@ -275,8 +305,20 @@ async fn flash_handler(
         base_address,
         probe_serial,
         erase,
+        manifest_json,
         _uploaded,
     } = args;
+
+    // Parsed *before* the flash, so a build-tooling problem is reported while
+    // the person who ran the build is still watching rather than at render
+    // time, hours later, as an unnamed trace.
+    let parsed_manifest = match manifest_json.as_deref() {
+        Some(json) => Some(
+            crate::outpost_manifest::parse(json)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        ),
+        None => None,
+    };
 
     tokio::task::spawn_blocking(move || {
         let result =
@@ -287,6 +329,18 @@ async fn flash_handler(
     .await
     .map_err(internal_err)?
     .map_err(internal_err)?;
+
+    // Only after the flash actually succeeded: a manifest bound to an image
+    // that never reached the board would describe firmware that is not running.
+    match (manifest_json, parsed_manifest) {
+        (Some(json), Some(manifest)) => {
+            state.outpost_manifest.store(&chip_for_response, json, manifest)
+        }
+        // A flash carrying no manifest replaced whatever image the stored one
+        // described, so the stored one no longer describes anything on that
+        // chip. Keeping it would leave Core holding a plausible, wrong answer.
+        _ => state.outpost_manifest.clear_for_chip(&chip_for_response),
+    }
 
     Ok(Json(FlashResponse {
         flashed: true,
@@ -303,13 +357,16 @@ fn bad_multipart_field<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 /// body — only meaningful for `format = "bin"`), `probe_serial` (optional,
 /// same as the JSON body), and a `firmware` file part (required) — the
 /// artifact's raw bytes, written to a temp file since `hardware::flash`
-/// reads from a path.
+/// reads from a path. An optional `manifest` text part carries the build's
+/// `outpost-manifest.json` (design.md §3 decision 30(c)) — the multipart
+/// sibling of the JSON body's `manifest_path`.
 async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs, (StatusCode, String)> {
     let mut chip: Option<String> = None;
     let mut format: Option<String> = None;
     let mut base_address_raw: Option<String> = None;
     let mut probe_serial: Option<String> = None;
     let mut erase_raw: Option<String> = None;
+    let mut manifest_json: Option<String> = None;
     let mut uploaded: Option<tempfile::NamedTempFile> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(bad_multipart_field)? {
@@ -319,6 +376,10 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
             Some("base_address") => base_address_raw = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("probe_serial") => probe_serial = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("erase") => erase_raw = Some(field.text().await.map_err(bad_multipart_field)?),
+            // The manifest rides the same request as the artifact it
+            // describes (design.md §3 decision 30(c)), so there is no interval
+            // in which Core holds one without the other.
+            Some("manifest") => manifest_json = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("firmware") => {
                 let bytes = field.bytes().await.map_err(bad_multipart_field)?;
                 let mut temp = tempfile::Builder::new()
@@ -349,6 +410,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
         format,
         base_address,
         probe_serial,
+        manifest_json,
         // Accepts the spellings a form actually carries a boolean as; anything
         // else is a caller error rather than a silent `false`, since silently
         // *not* erasing is exactly the surprise this field exists to remove.

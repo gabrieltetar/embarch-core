@@ -834,6 +834,7 @@ pub async fn post_study_handler(
     let jobs = state.study_jobs.clone();
     let study_lock = state.study_lock.clone();
     let events_tx = state.study_events.clone();
+    let manifest_slot = state.outpost_manifest.clone();
     let study_id_for_task = study_id.clone();
 
     tokio::spawn(async move {
@@ -842,7 +843,15 @@ pub async fn post_study_handler(
         let study_id_for_panic = study_id_for_task.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            run_study_to_completion(link, study, study_id_for_task, jobs, events_tx, provenance)
+            run_study_to_completion(
+                link,
+                study,
+                study_id_for_task,
+                jobs,
+                events_tx,
+                provenance,
+                manifest_slot,
+            )
         })
         .await;
 
@@ -905,6 +914,7 @@ fn run_study_to_completion(
     jobs: JobRegistry,
     events_tx: broadcast::Sender<StudyEvent>,
     provenance: Provenance,
+    manifest_slot: crate::outpost_manifest::ManifestSlot,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -933,6 +943,37 @@ fn run_study_to_completion(
             tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
         }
     }
+
+    // The study's own copy of whatever manifest the DUT's last flash bound,
+    // taken **now** rather than at render time: the binding's lifetime is the
+    // flash that created it, and a later flash during a long study would
+    // otherwise swap the answer out from under a capture already in progress.
+    // A study with no outpost tap takes no copy — there would be nothing to
+    // decode against it.
+    let study_manifest = if study
+        .streams
+        .iter()
+        .any(|t| matches!(t.encoding, StreamEncoding::OutpostTrace))
+    {
+        let stored = manifest_slot.current();
+        if let Some(stored) = stored.as_ref() {
+            if let Err(e) = crate::outpost_manifest::write_study_copy(&results_dir, stored) {
+                // The manifest not reaching disk costs the *names* in a trace
+                // whose bytes are captured regardless, so it is a warning
+                // rather than a failed study.
+                tracing::warn!("failed to write this study's outpost manifest copy: {e:?}");
+            }
+        } else {
+            tracing::info!(
+                study_id,
+                "this study declares an outpost tap and no manifest is bound; its trace will be \
+                 decoded but not named"
+            );
+        }
+        stored
+    } else {
+        None
+    };
 
     // Declared taps plus the reserved `dev-bench` log tap, which no study
     // may declare (`validate_taps` rejects the name) and every study gets.
@@ -993,6 +1034,7 @@ fn run_study_to_completion(
     if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, 0) {
         stop_signal_taps(&mut signal_taps);
         finish_streams(&capture, &mut writer);
+        render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
         fail_job(&jobs, &events_tx, &study_id, msg);
         return;
     }
@@ -1155,6 +1197,10 @@ fn run_study_to_completion(
     // are sealed into the writer before the job's status is decided.
     stop_signal_taps(&mut signal_taps);
     finish_streams(&capture, &mut writer);
+    // On the failure path too: a study that stopped early still captured
+    // whatever ran before it did, and a trace of the run that went wrong is
+    // the one most worth reading.
+    render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
 
     match outcome {
         Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer),
@@ -1168,6 +1214,97 @@ fn run_study_to_completion(
 /// actually produced is worth less than one that includes it.
 fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter) {
     writer.set_streams(capture.store.lock().unwrap().refs());
+}
+
+/// Decodes every `OutpostTrace` tap's captured bytes into a `*.trace.csv`,
+/// once the capture is closed (`embarch-outpost/design.md` §3 decision 10 —
+/// post-hoc, no live feed).
+///
+/// **A missing or mismatched manifest costs the names, never the capture.**
+/// The rows are written either way: a timeline of numeric thread pointers and
+/// vector numbers is a real answer, and `index.json`'s `note` says why it has
+/// no names, so an unnamed trace is never mistaken for a named one. What is
+/// refused is applying the *wrong* manifest, which would produce a trace that
+/// is entirely readable and entirely wrong.
+fn render_outpost_traces(
+    results_dir: &FsPath,
+    taps: &[StreamTap],
+    stored: Option<&crate::outpost_manifest::StoredManifest>,
+) {
+    use crate::outpost_manifest;
+
+    let streams_dir = results_dir.join(stream_store::STREAMS_DIR);
+    let Ok(Some(index)) = stream_store::read_index(&streams_dir) else {
+        return;
+    };
+
+    let mut results: HashMap<String, (String, String)> = HashMap::new();
+
+    for tap in taps {
+        if !matches!(tap.encoding, StreamEncoding::OutpostTrace) {
+            continue;
+        }
+        let Some(entry) = index.find(tap.name.as_str()) else {
+            continue;
+        };
+        let raw_path = streams_dir.join(&entry.raw_file);
+        let rendered_name = format!(
+            "{}.trace.csv",
+            entry.raw_file.strip_suffix(".bin").unwrap_or(&entry.raw_file)
+        );
+        let out_path = streams_dir.join(&rendered_name);
+
+        match outpost_manifest::render(&raw_path, &out_path, stored.map(|s| &s.manifest)) {
+            Ok(outcome) => {
+                let note = match &outcome.refusal {
+                    Some(why) => format!(
+                        "decoded but NOT named: {}. The raw capture is intact; applying a \
+                         manifest that does not describe this firmware would relabel every \
+                         marker and thread.",
+                        why.describe()
+                    ),
+                    None => String::new(),
+                };
+                tracing::info!(
+                    name = tap.name.as_str(),
+                    frames = outcome.frames,
+                    bad_frames = outcome.bad_frames,
+                    lost_frames = outcome.lost_frames,
+                    records = outcome.records,
+                    dropped_at_source = outcome.dropped_at_source,
+                    named = outcome.refusal.is_none(),
+                    "rendered an outpost trace"
+                );
+                results.insert(tap.name.as_str().to_string(), (rendered_name, note));
+            }
+            Err(e) => {
+                tracing::error!(
+                    name = tap.name.as_str(),
+                    "failed to render an outpost trace; its raw bytes are kept: {e:?}"
+                );
+                results.insert(
+                    tap.name.as_str().to_string(),
+                    (String::new(), format!("rendering failed: {e}")),
+                );
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return;
+    }
+    if let Err(e) = stream_store::update_index(&streams_dir, |entry| {
+        if let Some((rendered, note)) = results.get(&entry.name) {
+            if !rendered.is_empty() {
+                entry.rendered_file = Some(rendered.clone());
+            }
+            if !note.is_empty() {
+                entry.note = Some(note.clone());
+            }
+        }
+    }) {
+        tracing::warn!("failed to record the outpost rendering in streams/index.json: {e:?}");
+    }
 }
 
 // ---- Core's own taps: a Route::Direct signal on a third serial port -------
@@ -1475,21 +1612,13 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // Writing the same bytes twice would double the disk cost of the
             // one encoding whose render adds nothing.
         }
-        StreamEncoding::OutpostTrace { manifest_crc } => {
-            // Decision 30(c): a trace renders against the manifest the DUT's
-            // own build produced, or it renders **nothing**. Rendering it
-            // against the nearest available manifest would relabel every
-            // marker and thread — completely readable and completely wrong.
-            // Core cannot be given a manifest at all yet (see decision 30(c)
-            // for the named trigger), so today every outpost tap is in that
-            // state and every one of them keeps its raw bytes.
-            tracing::debug!(
-                study_id = capture.study_id,
-                name = tap.name.as_str(),
-                manifest_crc,
-                "outpost trace bytes written raw; rendering needs a manifest Core has no way \
-                 to be given yet"
-            );
+        StreamEncoding::OutpostTrace => {
+            // Rendered **post-hoc, from the complete raw file**, not here.
+            // `embarch-outpost/design.md` §3 decision 10 settled that a trace
+            // is recorded for a study's duration and drawn afterwards, and
+            // decoding at the end is also what lets a header frame that
+            // arrived late name every record before it. See
+            // `render_outpost_traces`, which runs once the capture is closed.
         }
         StreamEncoding::Raw => {
             // Nothing declared, so nothing rendered. `Raw` is the honest

@@ -176,6 +176,12 @@ pub struct StreamIndexEntry {
     /// one Phase A's interim `write_stream_record` used to pick between the
     /// three CSV files, moved here rather than re-derived.
     pub alias: Option<String>,
+    /// Why this tap's rendering is missing, incomplete, or unnamed — set only
+    /// when there is something to say. An `OutpostTrace` tap decoded without
+    /// an applicable manifest carries the refusal here, so the reason survives
+    /// alongside the capture instead of only in a log line nobody kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl StreamIndex {
@@ -191,6 +197,31 @@ impl StreamIndex {
 /// Reads `streams/index.json`. `Ok(None)` when there is no `streams/`
 /// directory at all — a study captured before this existed, or one that
 /// never got far enough to write it.
+/// Rewrites `index.json` after the capture has closed.
+///
+/// The index is written *before* any bytes arrive (decision 30(b)), which is
+/// what makes a tap that produced nothing still appear. Two things are only
+/// knowable afterwards, though: whether a post-hoc rendering exists, and why
+/// it does not. This is how those get in without the pre-arrival write having
+/// to predict them.
+pub fn update_index<F>(streams_dir: &Path, mut edit: F) -> anyhow::Result<()>
+where
+    F: FnMut(&mut StreamIndexEntry),
+{
+    use anyhow::Context as _;
+
+    let Some(mut index) = read_index(streams_dir)? else {
+        return Ok(());
+    };
+    for entry in &mut index.streams {
+        edit(entry);
+    }
+    let path = streams_dir.join(INDEX_FILE);
+    fs::write(&path, serde_json::to_vec_pretty(&index)?)
+        .with_context(|| format!("failed to rewrite {}", path.display()))?;
+    Ok(())
+}
+
 pub fn read_index(streams_dir: &Path) -> anyhow::Result<Option<StreamIndex>> {
     let path = streams_dir.join(INDEX_FILE);
     match fs::read(&path) {
@@ -411,6 +442,7 @@ impl StreamStore {
                 rendered_file,
                 encoding: tap.encoding,
                 alias: alias_for(&tap.source, &tap.encoding).map(str::to_string),
+                note: None,
             });
         }
 
@@ -530,7 +562,12 @@ fn rendered_extension(encoding: &StreamEncoding) -> Option<&'static str> {
         // already its rendering; `OutpostTrace` needs a manifest Core cannot
         // yet be given, and renders nothing rather than guessing (decision
         // 30(c)).
-        StreamEncoding::Raw | StreamEncoding::Text | StreamEncoding::OutpostTrace { .. } => None,
+        // `Raw` has nothing declared to decode against, and `Text`'s raw file
+        // is already its rendering. `OutpostTrace` renders too, but **not from
+        // the streaming path**: it is decoded post-hoc from the complete raw
+        // file once the capture closes, and `set_rendered` fills its entry in
+        // afterwards.
+        StreamEncoding::Raw | StreamEncoding::Text | StreamEncoding::OutpostTrace => None,
     }
 }
 
@@ -701,17 +738,19 @@ mod tests {
     }
 
     #[test]
-    fn an_outpost_trace_tap_keeps_its_raw_bytes_and_renders_nothing() {
-        // Decision 30(c): a trace with no matching manifest writes its raw
-        // stream and renders nothing rather than relabelling every marker
-        // against the wrong manifest. Core cannot be *given* a manifest yet,
-        // so today every outpost tap is in that state.
+    fn an_outpost_trace_taps_raw_bytes_are_written_before_any_rendering_exists() {
+        // An outpost tap's rendering is produced **post-hoc**, from the
+        // complete raw file once the capture closes
+        // (`study::render_outpost_traces`), so the streaming path writes only
+        // raw bytes and the index carries no `rendered_file` yet. That is the
+        // ordering decision 30(b) requires either way: raw before decode, so a
+        // decode that fails never costs the capture.
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(
             0,
             "outpost",
             StreamSource::Signal { name: heapless::String::try_from("outpost-uart").unwrap() },
-            StreamEncoding::OutpostTrace { manifest_crc: 0xdead_beef },
+            StreamEncoding::OutpostTrace,
         )];
         let mut store = StreamStore::create(dir.path(), &taps, 0).unwrap();
         store.write_raw(0, b"\x01\x02\x03");
@@ -721,6 +760,31 @@ mod tests {
         assert_eq!(fs::read(store.dir().join("outpost.bin")).unwrap(), b"\x01\x02\x03");
         assert_eq!(store.refs()[0].bytes_written, 3);
         assert!(!store.refs()[0].truncated);
+    }
+
+    #[test]
+    fn update_index_fills_in_what_only_the_end_of_a_capture_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![tap(
+            0,
+            "outpost",
+            StreamSource::Signal { name: heapless::String::try_from("outpost-uart").unwrap() },
+            StreamEncoding::OutpostTrace,
+        )];
+        let store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+
+        update_index(store.dir(), |entry| {
+            entry.rendered_file = Some("outpost.trace.csv".to_string());
+            entry.note = Some("decoded but NOT named".to_string());
+        })
+        .unwrap();
+
+        let index = read_index(store.dir()).unwrap().unwrap();
+        assert_eq!(index.streams[0].rendered_file.as_deref(), Some("outpost.trace.csv"));
+        assert_eq!(index.streams[0].note.as_deref(), Some("decoded but NOT named"));
+        // The pre-arrival facts are untouched.
+        assert_eq!(index.streams[0].raw_file, "outpost.bin");
+        assert_eq!(index.streams[0].name, "outpost");
     }
 
     #[test]
