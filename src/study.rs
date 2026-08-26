@@ -27,7 +27,7 @@ use embarch_study_designer::{
     requirement_satisfied, samples_in, steps_crc, streams_crc,
     validate_taps, DevBenchMessage, GattTranscriptEntry, Provenance, Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
-    ValidationSource, VersionOverride, VersionSource, VersionSubject,
+    VersionOverride, VersionSource, VersionSubject,
     DEV_BENCH_WIRE_SCHEMA_VERSION,
 };
 
@@ -148,37 +148,15 @@ pub enum StudyEvent {
 
 // ---- pure validation (no HTTP, no hardware — unit-testable directly) ------
 
-/// design.md §5.1 steps 2-3: every per-step `PostHocValidation` must name a
-/// step that exists and every tap-sourced one a tap that exists, and both of
-/// a study's seals must match what their own halves recompute to. Factored
-/// out from the handler so it's testable with no HTTP plumbing — the same
-/// posture `embarch_topology::hardware`'s own port-selection logic takes.
+/// design.md §5.1: both of a study's seals must match what their own halves
+/// recompute to, and its declared taps must satisfy §4.8's own pre-flight
+/// rules. Factored out from the handler so it's testable with no HTTP
+/// plumbing — the same posture `embarch_topology::hardware`'s own
+/// port-selection logic takes.
+///
+/// The per-`PostHocValidation` step-index/tap-name checks this used to run
+/// are gone with post-hoc validation itself.
 fn validate_study(study: &Study) -> Result<(), String> {
-    for validation in study.validations.iter() {
-        // `embarch-study-designer/design.md` §3 decision 19's 2026-08-25
-        // amendment: a stream-fed check names the tap and carries no
-        // `step_index`, so the two shapes fail for different reasons and
-        // say so differently.
-        match &validation.source {
-            ValidationSource::Step { step_index, .. } => {
-                if *step_index as usize >= study.steps.len() {
-                    return Err(format!(
-                        "validations[].source.step_index {} is out of range for a study with {} step(s)",
-                        step_index,
-                        study.steps.len()
-                    ));
-                }
-            }
-            ValidationSource::Tap { name } => {
-                if !study.streams.iter().any(|tap| tap.name == *name) {
-                    return Err(format!(
-                        "validations[].source names stream tap '{name}', which this study doesn't declare —                          a check against a tap that was never opened would silently never run"
-                    ));
-                }
-            }
-        }
-    }
-
     // design.md §3 decision 39/§4.8's own pre-flight rules — id-is-index,
     // no blank/duplicate/reserved name, no step range that could never open.
     // Computed by the crate, not restated here, so Core holds no second copy
@@ -1534,16 +1512,17 @@ impl EventsJsonWriter {
         self.streams = streams;
     }
 
-    /// Closes the `steps` array, writes empty `validations` — post-hoc
-    /// validation (design.md §3 decision 19, the `core-validation` feature's
-    /// `SignalCheck` machinery) is a real feature this crate enables but
-    /// doesn't call yet, unchanged from before this streaming rework —
-    /// followed by `provenance` and `streams`, then atomically renames
-    /// `.partial` to the real `events.json`.
+    /// Closes the `steps` array, then writes `provenance` and `streams`, and
+    /// atomically renames `.partial` to the real `events.json`.
+    ///
+    /// No longer writes a `"validations":[]` key. It was always literally
+    /// that — hardcoded empty, because Core never evaluated a single
+    /// validation in its life — which is a good part of why the whole notion
+    /// was removed rather than finished.
     fn finish(mut self) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        write!(self.file, "],\"validations\":[],\"provenance\":")?;
+        write!(self.file, "],\"provenance\":")?;
         serde_json::to_writer(&mut self.file, &self.provenance)?;
         write!(self.file, ",\"streams\":[")?;
         for (i, stream_ref) in self.streams.iter().enumerate() {
@@ -1849,8 +1828,7 @@ async fn serve_capture(
 mod tests {
     use super::*;
     use embarch_study_designer::{
-        Action, BleRole, DataChannel, ExpectedValue, PostHocCheck, PostHocValidation,
-        ValidationSource,
+        Action, BleRole,
     };
     use heapless::Vec as HVec;
 
@@ -1916,7 +1894,6 @@ mod tests {
             name: heapless::String::try_from("test-study").unwrap(),
             requires: embarch_study_designer::Requirements::any(),
             steps,
-            validations: HVec::new(),
             streams,
             steps_crc: steps_crc_value,
             streams_crc: streams_crc_value,
@@ -2018,69 +1995,8 @@ mod tests {
         assert!(err.contains("steps_crc mismatch"), "{err}");
     }
 
-    #[test]
-    fn validate_study_rejects_an_out_of_range_validation_step_index() {
-        let mut study = study_with_steps(&[1_000]);
-        study
-            .validations
-            .push(PostHocValidation {
-                source: ValidationSource::Step { step_index: 5, channel: DataChannel::CapturedData },
-                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
-            })
-            .unwrap();
-        let err = validate_study(&study).unwrap_err();
-        assert!(err.contains("out of range"), "{err}");
-    }
 
-    /// `embarch-study-designer/design.md` §3 decision 19's 2026-08-25
-    /// amendment: a tap-sourced check names a tap, and naming one the study
-    /// doesn't declare is rejected up front rather than producing a check
-    /// that silently never runs.
-    #[test]
-    fn validate_study_rejects_a_validation_naming_an_undeclared_tap() {
-        let mut study = study_with_steps(&[1_000]);
-        study
-            .validations
-            .push(PostHocValidation {
-                source: ValidationSource::Tap {
-                    name: heapless::String::try_from("outpost").unwrap(),
-                },
-                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
-            })
-            .unwrap();
-        let err = validate_study(&study).unwrap_err();
-        assert!(err.contains("outpost"), "{err}");
-    }
 
-    #[test]
-    fn validate_study_accepts_a_validation_naming_a_declared_tap() {
-        use embarch_study_designer::{StreamEncoding, StreamScope, StreamSource};
-
-        let mut study = study_with_steps(&[1_000]);
-        study
-            .streams
-            .push(StreamTap {
-                id: 0,
-                name: heapless::String::try_from("outpost").unwrap(),
-                source: StreamSource::Signal {
-                    name: heapless::String::try_from("outpost").unwrap(),
-                },
-                encoding: StreamEncoding::Raw,
-                scope: StreamScope::WholeStudy,
-            })
-            .unwrap();
-        study.streams_crc = streams_crc(&study.streams).unwrap();
-        study
-            .validations
-            .push(PostHocValidation {
-                source: ValidationSource::Tap {
-                    name: heapless::String::try_from("outpost").unwrap(),
-                },
-                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
-            })
-            .unwrap();
-        assert!(validate_study(&study).is_ok());
-    }
 
     /// The two seals are checked independently, so a corrupt tap list is
     /// reported as a `streams_crc` failure and leaves `steps_crc`'s verdict
@@ -2109,18 +2025,6 @@ mod tests {
         assert!(!err.contains("steps_crc mismatch"), "{err}");
     }
 
-    #[test]
-    fn validate_study_accepts_an_in_range_validation_step_index() {
-        let mut study = study_with_steps(&[1_000, 2_000]);
-        study
-            .validations
-            .push(PostHocValidation {
-                source: ValidationSource::Step { step_index: 1, channel: DataChannel::CapturedData },
-                check: PostHocCheck::Simple(ExpectedValue::InRange { min: 0.0, max: 1.0 }),
-            })
-            .unwrap();
-        assert!(validate_study(&study).is_ok());
-    }
 
     // ---- next_deadline (watchdog math) ----
 
@@ -2307,7 +2211,10 @@ mod tests {
         assert_eq!(result["study_name"], "test-study");
         assert_eq!(result["steps"].as_array().unwrap().len(), 1);
         assert_eq!(result["steps"][0]["step_name"], "step-0");
-        assert!(result["validations"].as_array().unwrap().is_empty());
+        // `validations` is deliberately *absent*, not empty: post-hoc
+        // validation is gone, and this key used to be a hardcoded `[]` Core
+        // wrote without ever having evaluated anything into it.
+        assert!(result.get("validations").is_none());
         // `provenance` and `streams` were added to `StudyResult` at Phase A
         // and `events.json` had never carried either (decision 31). It does
         // now, and the DUT's version says it was only ever declared.

@@ -14,7 +14,13 @@ clap = { version = "4.6.2", features = ["derive"] }
 # crate's design.md §4.6/decision 19) — study.rs doesn't call that evaluation
 # code yet (the self-test study it validates against has no `validations`),
 # but the feature costs nothing to turn on now and this is the intended place.
-embarch-study-designer = { path = "../embarch-study-designer", features = ["core-validation"] }
+# `std` (which implies `alloc`) is what Core needs from this crate: the
+# `gatt.csv`/`data.csv` rendering helpers (`GattTranscriptEntry::csv_header`,
+# `Sample::to_csv_row`) are std-gated, and `alloc` backs `Study.steps` with a
+# heap Vec (that crate's §3 decision 46). Core used to reach `std` indirectly
+# via `core-validation = ["std"]`; that feature is gone with post-hoc
+# validation, so the dependency now says what it actually wants.
+embarch-study-designer = { path = "../embarch-study-designer", features = ["std"] }
 # study.rs constructs embarch-study-designer types' heapless::Vec fields
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
 # features with embarch-study-designer's own "serde"-enabled dependency.
