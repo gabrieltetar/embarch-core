@@ -497,13 +497,31 @@ pub struct HelloAckInfo {
     pub schema_version: u32,
     pub compatible: bool,
     pub firmware_version: String,
+    /// What the bench says its own chip ID is (`embarch-study-designer`
+    /// schema v10, §3 decision 35) — empty when its build cannot answer.
+    pub hardware_id: String,
+    /// How that compares to the identity the JTAG side just verified, as a
+    /// stable string (`match`/`mismatch`/`not-reported`/`undeclared`).
+    /// Reported rather than only enforced, because `undeclared` is the
+    /// current answer for every chip and a human needs to see both strings
+    /// side by side to make it anything else — see
+    /// `embarch_topology::hardware::compare_self_reported`.
+    pub link_identity: String,
+    /// The JTAG-read identity this was compared against, so one call to
+    /// `GET /dev-bench/hello` shows both halves.
+    pub probe_hardware_id: String,
 }
 
 /// Opens `port_name`, sends `Hello`, and waits for `HelloAck`. Runs entirely
 /// inside `spawn_blocking` (all serial I/O is blocking) — `Err` carries a
 /// human-readable message describing what failed, not a status code, since
 /// this is called before we know whether that maps to `502`, `504`, etc.
-async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAckInfo), String> {
+async fn open_and_handshake(
+    port_name: String,
+    enrolled: &embarch_topology::hardware::EnrolledBoard,
+) -> Result<(DevBenchLink, HelloAckInfo), String> {
+    let probe_hardware_id = enrolled.hardware_id.clone();
+    let chip = enrolled.chip.clone();
     tokio::task::spawn_blocking(move || {
         let mut link = DevBenchLink::open(&port_name).map_err(|e| format!("{e:?}"))?;
 
@@ -515,12 +533,25 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
 
         let deadline = Instant::now() + Duration::from_millis(HANDSHAKE_TIMEOUT_MS);
         match link.recv(deadline) {
-            Ok(Some(DevBenchMessage::HelloAck { schema_version, compatible, firmware_version })) => {
+            Ok(Some(DevBenchMessage::HelloAck {
+                schema_version,
+                compatible,
+                firmware_version,
+                hardware_id,
+            })) => {
+                let identity = embarch_topology::hardware::compare_self_reported(
+                    &chip,
+                    &probe_hardware_id,
+                    &hardware_id,
+                );
                 tracing::info!(
                     dev_bench_schema_version = schema_version,
                     core_schema_version = DEV_BENCH_WIRE_SCHEMA_VERSION,
                     %firmware_version,
                     compatible,
+                    bench_hardware_id = %hardware_id,
+                    %probe_hardware_id,
+                    link_identity = describe_identity(identity),
                     "dev-bench Hello/HelloAck handshake complete"
                 );
                 if !compatible {
@@ -529,10 +560,25 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
                          is not compatible with Core's schema version {DEV_BENCH_WIRE_SCHEMA_VERSION}"
                     ));
                 }
+                // §3 decision 35's gate. Only a *declared* disagreement
+                // refuses the link: `Undeclared`/`NotReported` mean the
+                // question could not be asked, and refusing every healthy
+                // bench because Core cannot yet relate two encodings would
+                // be strictly worse than the gap this closes.
+                if identity == embarch_topology::hardware::SelfReportedIdentity::Mismatch {
+                    return Err(format!(
+                        "dev-bench topology mismatch: the board on the serial link reports chip ID \
+                         '{hardware_id}', but the enrolled probe just verified '{probe_hardware_id}' \
+                         over JTAG — these are different boards"
+                    ));
+                }
                 let info = HelloAckInfo {
                     schema_version,
                     compatible,
                     firmware_version: firmware_version.to_string(),
+                    hardware_id: hardware_id.to_string(),
+                    link_identity: describe_identity(identity).to_string(),
+                    probe_hardware_id: probe_hardware_id.clone(),
                 };
                 Ok((link, info))
             }
@@ -573,15 +619,29 @@ async fn open_and_handshake(port_name: String) -> Result<(DevBenchLink, HelloAck
 /// `spawn_blocking`: the gate attaches to real hardware and reads memory,
 /// exactly the blocking probe-rs calls every other hardware-touching
 /// handler in this crate already wraps.
-async fn enforce_dev_bench_gate() -> Result<(), String> {
+async fn enforce_dev_bench_gate() -> Result<embarch_topology::hardware::EnrolledBoard, String> {
+    // Returns the enrolled board rather than just `Ok(())` since §3 decision
+    // 35: the JTAG-verified identity it confirms is exactly what the
+    // `HelloAck` comparison needs, and re-reading it would be a second
+    // answer to a question already answered.
     tokio::task::spawn_blocking(|| {
         embarch_topology::hardware::validate_role(embarch_topology::hardware::DEV_BENCH_ROLE)
     })
     .await
     .map_err(|e| format!("board-identity gate task panicked: {e:?}"))?
-    .map_err(|e| format!("{e:?}"))?;
+    .map_err(|e| format!("{e:?}"))
+}
 
-    Ok(())
+/// Stable strings for [`embarch_topology::hardware::SelfReportedIdentity`],
+/// so a log line and `GET /dev-bench/hello`'s JSON say the same word.
+fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity) -> &'static str {
+    use embarch_topology::hardware::SelfReportedIdentity as S;
+    match identity {
+        S::Match => "match",
+        S::Mismatch => "mismatch",
+        S::NotReported => "not-reported",
+        S::Undeclared => "undeclared",
+    }
 }
 
 // ---- GET /dev-bench/hello ---------------------------------------------------
@@ -618,11 +678,11 @@ pub async fn hello_handler(
         Err(e) => return Err(internal_err(e)),
     };
 
-    enforce_dev_bench_gate()
+    let enrolled = enforce_dev_bench_gate()
         .await
         .map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
 
-    let (_link, info) = open_and_handshake(port.port_name)
+    let (_link, info) = open_and_handshake(port.port_name, &enrolled)
         .await
         .map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
     // `_link` drops here, closing the serial port — this call never holds
@@ -690,12 +750,15 @@ pub async fn post_study_handler(
         }
     };
 
-    if let Err(msg) = enforce_dev_bench_gate().await {
-        release_lock();
-        return Err((StatusCode::BAD_GATEWAY, msg));
-    }
+    let enrolled = match enforce_dev_bench_gate().await {
+        Ok(board) => board,
+        Err(msg) => {
+            release_lock();
+            return Err((StatusCode::BAD_GATEWAY, msg));
+        }
+    };
 
-    let (link, hello) = match open_and_handshake(port.port_name).await {
+    let (link, hello) = match open_and_handshake(port.port_name, &enrolled).await {
         Ok(pair) => pair,
         Err(msg) => {
             release_lock();
@@ -2885,6 +2948,42 @@ mod tests {
             .await
             .expect_err("nothing was captured");
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---- dev-bench link identity (§3 decision 35) ----
+
+    #[test]
+    fn only_a_declared_disagreement_refuses_the_link() {
+        // The gate in `open_and_handshake` refuses on exactly one variant.
+        // Pinned as a test because the tempting version of this — "refuse
+        // unless it matched" — refuses every healthy bench on the suite's
+        // only board, since no chip has a declared relation yet.
+        use embarch_topology::hardware::SelfReportedIdentity as S;
+        let refuses = |identity: S| identity == S::Mismatch;
+
+        assert!(refuses(S::Mismatch));
+        assert!(!refuses(S::Match));
+        assert!(!refuses(S::NotReported), "a bench that cannot answer is not a wrong bench");
+        assert!(
+            !refuses(S::Undeclared),
+            "Core not knowing how to relate two encodings is not evidence of a wrong board"
+        );
+    }
+
+    #[test]
+    fn identity_words_are_stable_and_distinct() {
+        // These reach `GET /dev-bench/hello`'s JSON and a log line, and are
+        // what a human greps for while working out the pairing that turns
+        // `undeclared` into a real relation — so they are API, not prose.
+        use embarch_topology::hardware::SelfReportedIdentity as S;
+        let all = [S::Match, S::Mismatch, S::NotReported, S::Undeclared];
+        let words: Vec<&str> = all.iter().map(|i| describe_identity(*i)).collect();
+        assert_eq!(words, vec!["match", "mismatch", "not-reported", "undeclared"]);
+
+        let mut unique = words.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len());
     }
 
     // ---- generate_study_id ----

@@ -121,6 +121,17 @@ mod tests {
             schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
             compatible: true,
             firmware_version: heapless::String::try_from("nrf54l15dk-g1a2b3c").unwrap(),
+            hardware_id: heapless::String::try_from("aaaaaaaabbbbbbbb").unwrap(),
+        });
+        // A bench whose build has no `hwinfo` driver — the empty ID has to
+        // survive Core's own COBS+postcard round trip too, not just the
+        // crate's (schema v10, `embarch-study-designer/design.md` §3
+        // decision 47).
+        round_trip(&DevBenchMessage::HelloAck {
+            schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
+            compatible: true,
+            firmware_version: heapless::String::try_from("nrf54l15dk-g1a2b3c").unwrap(),
+            hardware_id: heapless::String::new(),
         });
     }
 
