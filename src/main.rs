@@ -2,6 +2,7 @@ mod api;
 mod chip_resolve;
 mod dev_bench_link;
 mod elevate;
+mod flash_backend;
 mod hardware;
 mod logs;
 mod serial;
@@ -103,6 +104,22 @@ enum Command {
         /// not prefix — someone hunting a "54L15" should find `nRF54L15_xxAA`.
         filter: Option<String>,
     },
+    /// Report which program Core would use to flash a given chip, and where
+    /// it found it — design.md §3 decision 36. Pure lookup: no probe is
+    /// opened, nothing is flashed and no board need be attached, same posture
+    /// as `detect-dev-bench` and `chip-list`.
+    ///
+    /// This is the answer to "is the vendor tool installed?" without
+    /// discovering it at the moment of a flash, which is the worst time to
+    /// find out. On a chip family Core refuses probe-rs for, this prints the
+    /// same refusal a flash would fail with, including what to install.
+    FlashBackend {
+        /// The probe-rs chip name, as `embarch-api` would send it (e.g.
+        /// `nRF54L15`). Omit to report every family this build treats
+        /// specially, which is the quicker "is my bench ready" check.
+        #[arg(long)]
+        chip: Option<String>,
+    },
     /// Print the last N lines of embarch-core's own current daily log file
     /// (§3 decision 16) — pure local file read, no hardware access, same
     /// posture as `detect-dev-bench`. Useful for seeing what a Core running
@@ -192,6 +209,37 @@ fn main() -> anyhow::Result<()> {
                 "  detected_by: {}\n  serial: {:?}\n  product: {:?}\n  interface: {:?}",
                 port.detected_by, port.serial_number, port.product, port.interface
             );
+        }
+        Command::FlashBackend { chip } => {
+            // A short, representative list rather than every chip probe-rs
+            // knows: the question this answers is "which tool does this bench
+            // need", and that is decided per family.
+            let chips: Vec<String> = match &chip {
+                Some(c) => vec![c.clone()],
+                None => ["nRF54L15", "nRF52840", "esp32c5"].iter().map(|s| s.to_string()).collect(),
+            };
+            let mut any_err = false;
+            for c in &chips {
+                match flash_backend::discover(c) {
+                    Ok(backend) => {
+                        let where_ = match &backend {
+                            flash_backend::Backend::ProbeRs => "built in".to_string(),
+                            flash_backend::Backend::JLink { exe }
+                            | flash_backend::Backend::NrfUtil { exe }
+                            | flash_backend::Backend::NrfJprog { exe } => exe.display().to_string(),
+                        };
+                        println!("{c}\t{}\t{where_}", backend.name());
+                    }
+                    Err(e) => {
+                        any_err = true;
+                        println!("{c}\tUNAVAILABLE");
+                        eprintln!("\n{c}: {e:?}\n");
+                    }
+                }
+            }
+            if any_err {
+                std::process::exit(1);
+            }
         }
         Command::ChipList { filter } => {
             let names = chip_resolve::chip_list(filter.as_deref());

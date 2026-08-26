@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::flash_backend;
 use probe_rs::flashing::{self, BinOptions, Format};
 use probe_rs::probe::list::Lister;
 use probe_rs::Permissions;
@@ -175,10 +176,33 @@ pub fn flash(
     probe_serial: Option<&str>,
     erase: bool,
 ) -> Result<()> {
-    let format = parse_format(format, base_address)?;
     let gated_serial = resolved_serial(probe_serial)?;
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this flash")?;
+
+    // **Which program writes the image is decided before anything is opened**
+    // (`flash_backend`, design.md §3 decision 48). For a family whose vendor
+    // semantics probe-rs does not implement, Core does not flash with probe-rs
+    // at all — it runs the vendor's own tool, the one the board's `board.cmake`
+    // already names, or refuses and says what to install. The identity gate
+    // still runs first either way: what may be flashed is a separate question
+    // from what does the flashing.
+    let backend = flash_backend::discover(chip)?;
+    if backend != flash_backend::Backend::ProbeRs {
+        // The target-power pre-flight still runs, and is worth the extra probe
+        // open: without it an unpowered board becomes whatever confusing thing
+        // the vendor tool says about a target it cannot reach, instead of
+        // Core's own "can't flash: target not powered". This opens the probe
+        // and **drops it before spawning**, because the vendor tool claims the
+        // same USB interface and two owners is a hang, not an error.
+        {
+            let mut probe = open_probe(probe_serial)?;
+            embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
+        }
+        return flash_backend::run(&backend, chip, firmware_path, probe_serial, erase);
+    }
+
+    let format = parse_format(format, base_address)?;
     let mut probe = open_probe(probe_serial)?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
 
