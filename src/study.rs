@@ -1791,6 +1791,32 @@ fn start_signal_tap(
             format!("failed to open signal '{signal_name}' on {} at {baud} baud: {e:?}", port.port_name)
         })?;
 
+    // **Throw away whatever the OS was already holding.** A TX-only DUT
+    // transmits whether or not anyone is listening, so by the time a study
+    // opens this port the driver's receive buffer can already hold bytes from
+    // minutes ago -- and those bytes belong to no capture. Found 2026-08-27:
+    // the first six records of a study's trace carried a cycle count 195
+    // seconds ahead of the seventh, because the DUT had been reset in between
+    // and the pre-reset tail was still queued. On a monotonic host clock that
+    // was invisible; the moment the DUT's own clock became the axis it made the
+    // capture's window read as 11 ms instead of 1.2 s and gave two lanes a
+    // 9159% share.
+    //
+    // A discard rather than a drain-and-keep: these bytes predate the study,
+    // there is no arrival stamp for them, and prepending them to the capture
+    // claims they are part of an experiment that had not started. Failing to
+    // clear is logged and not fatal -- a stale prefix is a bad capture, not a
+    // reason to refuse to capture at all, and `embarch-ui` refuses the DUT
+    // clock on its own if one gets through.
+    if let Err(e) = serial.clear(serialport::ClearBuffer::Input) {
+        tracing::warn!(
+            study_id = capture.study_id,
+            name = tap.name.as_str(),
+            "could not clear buffered input on {} before capturing signal '{signal_name}': {e:?}              -- this capture may begin with bytes that predate the study",
+            port.port_name
+        );
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let handle = {
         let capture = Arc::clone(capture);
