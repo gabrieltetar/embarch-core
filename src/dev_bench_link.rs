@@ -80,8 +80,19 @@ impl DevBenchLink {
     ///
     /// A prefix rather than the whole frame: a `StepResult` carrying a full
     /// GATT table runs to kilobytes, and a log line that long is its own
-    /// problem. Twenty-four bytes reaches past the tag, the step index and
-    /// most step names.
+    /// problem. **Raised from 24 bytes to 192 on 2026-08-27, because 24 was
+    /// short of the one thing that mattered.** A real failure arrived as an
+    /// 88-byte frame whose last variable-length field was a 64-character
+    /// `Fail` reason — the actual explanation of why a study step failed, sat
+    /// inside the frame Core was holding, and the log threw it away after the
+    /// first byte of it. 192 bytes covers a `StepResult` with a full-length
+    /// reason and its trailing options with room to spare, and still refuses
+    /// to print a kilobyte of GATT table.
+    ///
+    /// **The ASCII column is not decoration.** The fields that identify a
+    /// frame are two strings — the step name and the fail reason — and
+    /// reading either out of hex by hand is exactly the friction that made a
+    /// truncated frame take three studies to characterise.
     ///
     /// Pure, and separate from `recv`, so the message is testable without a
     /// serial port.
@@ -96,9 +107,36 @@ impl DevBenchLink {
         };
         let tag_name = tag.map(Self::describe_tag).unwrap_or("(frame too short to hold a tag)");
         let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = head
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        // What the COBS code byte claims against what actually turned up. A
+        // frame short of its own declared length is a *transport* fault, and
+        // it reads identically to a field-layout disagreement unless the two
+        // numbers are put side by side -- which is how a flat 16-byte
+        // truncation was first misread as an encoder omitting trailing
+        // fields (`embarch-dev-bench/design.md` §4).
+        let claim = match head.first() {
+            // COBS: the code byte is 1 + the count of non-zero bytes that
+            // follow, so the whole framed run should be that many bytes.
+            Some(&code) if code > 0 => {
+                let expected = usize::from(code);
+                if expected > framed_len {
+                    format!(
+                        ", COBS code byte claims {expected} bytes and {framed_len} arrived -- \
+                         SHORT BY {}",
+                        expected - framed_len
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
         format!(
             "failed to decode DevBenchMessage: {framed_len} COBS-framed bytes, \
-             variant index {} ({tag_name}), first {} bytes {}",
+             variant index {} ({tag_name}){claim}, first {} bytes {} | {ascii}",
             tag.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string()),
             head.len(),
             hex.join(" ")
@@ -177,7 +215,7 @@ impl DevBenchLink {
                 // in place, so by the time it fails `frame` no longer holds
                 // what arrived on the wire.
                 let framed_len = frame.len();
-                let head: Vec<u8> = frame.iter().take(24).copied().collect();
+                let head: Vec<u8> = frame.iter().take(192).copied().collect();
                 let msg = postcard::from_bytes_cobs(&mut frame).with_context(|| {
                     Self::describe_undecodable_frame(&head, framed_len)
                 })?;
@@ -273,6 +311,35 @@ mod tests {
         assert!(msg.contains("variant index 7"), "{msg}");
         assert!(msg.contains("StepResult"), "{msg}");
         assert!(msg.contains("0d 07 01 09"), "the hex prefix is the point: {msg}");
+    }
+
+    /// **A frame short of its own declared length says so, and says by how
+    /// much.** This is the fault that cost three studies to characterise: a
+    /// `StepResult` arriving exactly 16 bytes short of what its COBS code byte
+    /// promised, which reads identically to a field-layout disagreement until
+    /// the two numbers are put side by side
+    /// (`embarch-dev-bench/design.md` §4).
+    #[test]
+    fn a_frame_shorter_than_its_cobs_code_claims_reports_the_shortfall() {
+        // Code byte 0x58 = 88, so 87 non-zero bytes should follow and the
+        // whole framed run should be 88 bytes. Hand it 72, as the bench did.
+        let mut framed = vec![0x58u8, 0x07, 0x05, 0x12];
+        framed.extend_from_slice(b"nus-sensor01-start");
+        let msg = DevBenchLink::describe_undecodable_frame(&framed, 72);
+        assert!(msg.contains("SHORT BY 16"), "{msg}");
+        assert!(msg.contains("claims 88 bytes and 72 arrived"), "{msg}");
+        // And the strings that identify the frame are readable without
+        // decoding hex by hand.
+        assert!(msg.contains("nus-sensor01-start"), "{msg}");
+    }
+
+    /// A frame that is not short must not claim a shortfall — the absence of
+    /// the phrase is what makes its presence meaningful.
+    #[test]
+    fn a_complete_frame_reports_no_shortfall() {
+        let framed = vec![0x04u8, 0x01, 0x02, 0x03];
+        let msg = DevBenchLink::describe_undecodable_frame(&framed, 4);
+        assert!(!msg.contains("SHORT BY"), "{msg}");
     }
 
     #[test]
