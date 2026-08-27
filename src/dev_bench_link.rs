@@ -44,6 +44,47 @@ pub struct DevBenchLink {
     /// over is visible as a number, not as a pattern someone has to notice
     /// in a log.
     empty_frames: u64,
+    /// How many frames arrived and would not decode. Counted for the same
+    /// reason as `empty_frames`, and read by the caller to decide when a link
+    /// has stopped being worth reading — see [`Received::Undecodable`].
+    undecodable_frames: u64,
+}
+
+/// What one [`DevBenchLink::recv`] produced.
+///
+/// Three outcomes rather than `Result<Option<_>>`'s two, because **an
+/// undecodable frame is not a dead link and treating it as one cost a real
+/// diagnosis** (`embarch-dev-bench/design.md` §4). A `StepResult` carrying a
+/// step's failure reason arrived short of its own declared length; Core
+/// refused it, tore the link down, and reported the study as a *transport*
+/// error that never mentioned a step had failed. The one message whose job
+/// was to explain a failure was the one message that could kill the link.
+///
+/// So the posture here is the suite's posture everywhere else — an
+/// undecodable frame costs *the frame*, not the link, which is exactly why an
+/// outpost frame carries its own CRC ([`embarch-outpost/design.md`] §3
+/// decision 5). The frames after it are still worth having: dev-bench's own
+/// account of what went wrong arrives as ordinary `LogLine`s, and a
+/// `StudyDone` still says whether the run ended on its own terms.
+///
+/// `DevBenchMessage` is a ~2 KB `no_std` type sized by its largest variant, so
+/// clippy would rather see it boxed here. **It is deliberately not.** The
+/// signature this replaced was `Result<Option<DevBenchMessage>>`, which carries
+/// exactly the same 2 KB by value, so boxing would not remove a cost — it would
+/// add a heap allocation per received frame, on the path `StreamChunkBatch`
+/// traffic runs through at full link rate. The value is constructed and matched
+/// out in the same breath; it never lives in a collection.
+#[allow(clippy::large_enum_variant)]
+pub enum Received {
+    /// A frame arrived and decoded.
+    Message(DevBenchMessage),
+    /// A frame arrived and did not decode; the string is
+    /// [`DevBenchLink::describe_undecodable_frame`]'s account of it, ready to
+    /// log. The link is still live and the caller should keep reading.
+    Undecodable(String),
+    /// The deadline passed with no complete frame buffered. The caller's
+    /// watchdog case, not an error.
+    Deadline,
 }
 
 impl DevBenchLink {
@@ -54,7 +95,14 @@ impl DevBenchLink {
             .timeout(READ_TIMEOUT)
             .open()
             .with_context(|| format!("failed to open dev-bench serial port '{port_name}'"))?;
-        Ok(Self { port, buf: Vec::new(), empty_frames: 0 })
+        Ok(Self { port, buf: Vec::new(), empty_frames: 0, undecodable_frames: 0 })
+    }
+
+    /// How many frames this link has read that would not decode. Read by
+    /// `study.rs` to stop reading a link that has turned to noise, rather
+    /// than looping on garbage until the step deadline.
+    pub fn undecodable_frames(&self) -> u64 {
+        self.undecodable_frames
     }
 
     /// Postcard-encodes `msg`, COBS-frames it (trailing `0x00` delimiter
@@ -119,14 +167,24 @@ impl DevBenchLink {
         // fields (`embarch-dev-bench/design.md` §4).
         let claim = match head.first() {
             // COBS: the code byte is 1 + the count of non-zero bytes that
-            // follow, so the whole framed run should be that many bytes.
+            // follow, so the block it opens should run to that many bytes --
+            // the code byte itself included, the `0x00` delimiter *not*.
+            //
+            // **`framed_len` counts the delimiter and the block does not,
+            // which is a one-byte lie worth not telling.** `take_frame`
+            // drains `..=pos`, so every length that reaches here is one more
+            // than the block's. Reporting "SHORT BY 12" for a block that lost
+            // thirteen bytes is the kind of number someone lines up against a
+            // field layout, and being out by one there is how an afternoon
+            // goes missing.
             Some(&code) if code > 0 => {
                 let expected = usize::from(code);
-                if expected > framed_len {
+                let block_len = framed_len.saturating_sub(1);
+                if expected > block_len {
                     format!(
-                        ", COBS code byte claims {expected} bytes and {framed_len} arrived -- \
-                         SHORT BY {}",
-                        expected - framed_len
+                        ", COBS code byte claims a {expected}-byte block and {block_len} \
+                         arrived (plus the delimiter) -- SHORT BY {}",
+                        expected - block_len
                     )
                 } else {
                     String::new()
@@ -205,10 +263,11 @@ impl DevBenchLink {
     /// polled reads) until either a complete `0x00`-delimited frame arrives
     /// or `deadline` passes.
     ///
-    /// Returns `Ok(None)` on a plain deadline expiry — the caller's watchdog
-    /// case, not an error. An `Err` means the connection itself failed
-    /// (a read error) or a frame arrived but didn't decode.
-    pub fn recv(&mut self, deadline: Instant) -> Result<Option<DevBenchMessage>> {
+    /// `Err` means the *connection* failed — a read error on the port, and
+    /// nothing else. A frame that arrived and would not decode comes back as
+    /// [`Received::Undecodable`]; see that variant for why it is not an
+    /// error.
+    pub fn recv(&mut self, deadline: Instant) -> Result<Received> {
         loop {
             if let Some(mut frame) = Self::take_frame(&mut self.buf, &mut self.empty_frames) {
                 // Kept for the error path below: `from_bytes_cobs` decodes
@@ -216,14 +275,19 @@ impl DevBenchLink {
                 // what arrived on the wire.
                 let framed_len = frame.len();
                 let head: Vec<u8> = frame.iter().take(192).copied().collect();
-                let msg = postcard::from_bytes_cobs(&mut frame).with_context(|| {
-                    Self::describe_undecodable_frame(&head, framed_len)
-                })?;
-                return Ok(Some(msg));
+                return match postcard::from_bytes_cobs(&mut frame) {
+                    Ok(msg) => Ok(Received::Message(msg)),
+                    Err(_) => {
+                        self.undecodable_frames += 1;
+                        Ok(Received::Undecodable(Self::describe_undecodable_frame(
+                            &head, framed_len,
+                        )))
+                    }
+                };
             }
 
             if Instant::now() >= deadline {
-                return Ok(None);
+                return Ok(Received::Deadline);
             }
 
             let mut chunk = [0u8; 256];
@@ -315,30 +379,66 @@ mod tests {
 
     /// **A frame short of its own declared length says so, and says by how
     /// much.** This is the fault that cost three studies to characterise: a
-    /// `StepResult` arriving exactly 16 bytes short of what its COBS code byte
-    /// promised, which reads identically to a field-layout disagreement until
-    /// the two numbers are put side by side
-    /// (`embarch-dev-bench/design.md` §4).
+    /// `StepResult` arriving short of what its COBS code byte promised, which
+    /// reads identically to a field-layout disagreement until the two numbers
+    /// are put side by side (`embarch-dev-bench/design.md` §4).
+    ///
+    /// **The shortfall is counted against the block, not the frame.** The
+    /// numbers reaching this function include the `0x00` delimiter and the
+    /// code byte's claim does not, so a naive subtraction is out by one — and
+    /// this is a number people line up against a field layout by hand.
     #[test]
     fn a_frame_shorter_than_its_cobs_code_claims_reports_the_shortfall() {
-        // Code byte 0x58 = 88, so 87 non-zero bytes should follow and the
-        // whole framed run should be 88 bytes. Hand it 72, as the bench did.
+        // Code byte 0x58 = 88, so the block should run to 88 bytes, the code
+        // byte included and the delimiter excluded. Hand it the 72 the bench
+        // did -- 71 of the block, plus the delimiter.
         let mut framed = vec![0x58u8, 0x07, 0x05, 0x12];
         framed.extend_from_slice(b"nus-sensor01-start");
         let msg = DevBenchLink::describe_undecodable_frame(&framed, 72);
-        assert!(msg.contains("SHORT BY 16"), "{msg}");
-        assert!(msg.contains("claims 88 bytes and 72 arrived"), "{msg}");
+        assert!(msg.contains("SHORT BY 17"), "{msg}");
+        assert!(msg.contains("claims a 88-byte block and 71 arrived"), "{msg}");
         // And the strings that identify the frame are readable without
         // decoding hex by hand.
         assert!(msg.contains("nus-sensor01-start"), "{msg}");
     }
 
+    /// The exact frame from the run that finally read its own failure reason
+    /// (2026-08-27, study `61e3b5a0`), pinned end to end: the block claims 81
+    /// bytes, 68 of it arrived, and the thirteen bytes missing are the tail of
+    /// the reason string. **13, not the 12 a delimiter-inclusive subtraction
+    /// gives** — and the difference matters because the field layout this gets
+    /// compared against is exact: variant (1) + step index (1) + name length
+    /// (1) + `nus-sensor01-start` (18) + `Fail` (1) + reason length (1) +
+    /// reason (57) = 80 data bytes, which is precisely the 81-byte block the
+    /// code byte claims. The encoder wrote all of it; the wire lost the end.
+    #[test]
+    fn the_real_truncated_step_result_reports_thirteen_missing_bytes() {
+        let mut framed = vec![0x51u8, 0x07, 0x05, 0x12];
+        framed.extend_from_slice(b"nus-sensor01-start");
+        framed.extend_from_slice(&[0x01, 0x39]);
+        framed.extend_from_slice(b"disconnected during write (HCI 0x08, supervi");
+        framed.push(0x00);
+        assert_eq!(framed.len(), 69, "this is the frame as it arrived");
+
+        let msg = DevBenchLink::describe_undecodable_frame(&framed, framed.len());
+        assert!(msg.contains("SHORT BY 13"), "{msg}");
+        // The whole point of the 192-byte dump and the ASCII column: the
+        // reason is readable without decoding anything by hand.
+        assert!(msg.contains("disconnected during write (HCI 0x08, supervi"), "{msg}");
+    }
+
     /// A frame that is not short must not claim a shortfall — the absence of
     /// the phrase is what makes its presence meaningful.
+    ///
+    /// **The delimiter is part of the fixture, and it was not before.** Every
+    /// length that reaches `describe_undecodable_frame` comes from
+    /// `take_frame`, which drains through the `0x00`; a fixture without one
+    /// is a frame that cannot occur, and this test passed on the old
+    /// arithmetic only because both sides were out by the same byte.
     #[test]
     fn a_complete_frame_reports_no_shortfall() {
-        let framed = vec![0x04u8, 0x01, 0x02, 0x03];
-        let msg = DevBenchLink::describe_undecodable_frame(&framed, 4);
+        let framed = vec![0x04u8, 0x01, 0x02, 0x03, 0x00];
+        let msg = DevBenchLink::describe_undecodable_frame(&framed, framed.len());
         assert!(!msg.contains("SHORT BY"), "{msg}");
     }
 

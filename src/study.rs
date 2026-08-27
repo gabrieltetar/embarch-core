@@ -25,7 +25,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use embarch_study_designer::{
     limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
     dev_bench_log_tap, protocols_crc, requirement_satisfied, samples_in, steps_crc, streams_crc,
-    validate_protocol, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Provenance,
+    validate_protocol, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Outcome, Provenance,
     Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
     VersionOverride, VersionSource, VersionSubject,
@@ -33,7 +33,7 @@ use embarch_study_designer::{
 };
 
 use crate::api::{internal_err, AppState};
-use crate::dev_bench_link::DevBenchLink;
+use crate::dev_bench_link::{DevBenchLink, Received};
 use crate::stream_store::{self, StreamStore};
 use crate::token_store;
 
@@ -599,6 +599,13 @@ pub struct HelloAckInfo {
 /// whole duration.
 const POST_ACK_DRAIN_MS: u64 = 250;
 
+/// How many undecodable frames one study's link tolerates before Core stops
+/// reading it. See the `Received::Undecodable` arm in the study loop: one
+/// unreadable frame is a lost frame, and a link producing them without pause
+/// is noise there is no point reading to the deadline. Set far above what the
+/// known fault produces (one per failing step) and far below a spin.
+const MAX_UNDECODABLE_FRAMES: u64 = 10;
+
 /// Reads whatever `LogLine`s dev-bench sends immediately after `HelloAck`, into
 /// the debug file, before this function's caller does anything else with the
 /// link.
@@ -624,13 +631,22 @@ fn drain_post_ack_log_lines(link: &mut DevBenchLink) {
     let deadline = Instant::now() + Duration::from_millis(POST_ACK_DRAIN_MS);
     loop {
         match link.recv(deadline) {
-            Ok(Some(DevBenchMessage::LogLine { text })) => {
+            Ok(Received::Message(DevBenchMessage::LogLine { text })) => {
                 crate::dev_bench_log::append(None, text.as_str());
                 tracing::info!("dev-bench (at handshake): {text}");
             }
             // The ordinary exit: the window closed with nothing more waiting.
-            Ok(None) => break,
-            Ok(Some(other)) => {
+            Ok(Received::Deadline) => break,
+            // A boot record that would not decode is still evidence that the
+            // bench said something, and this window is exactly where a bench
+            // explains why it just rebooted. Recorded, not fatal — the
+            // handshake already succeeded by the time this runs.
+            Ok(Received::Undecodable(what)) => {
+                tracing::warn!("dev-bench sent an undecodable frame at handshake: {what}");
+                crate::dev_bench_log::note(None, &format!("undecodable frame at handshake: {what}"));
+                break;
+            }
+            Ok(Received::Message(other)) => {
                 tracing::warn!(
                     "dev-bench sent {other:?} between HelloAck and StudyStart, which nothing                      in the protocol calls for; it has been consumed"
                 );
@@ -679,16 +695,29 @@ async fn open_and_handshake(
         // than looping forever.
         let ack = loop {
             match link.recv(deadline) {
-                Ok(Some(DevBenchMessage::LogLine { text })) => {
+                Ok(Received::Message(DevBenchMessage::LogLine { text })) => {
                     crate::dev_bench_log::append(None, text.as_str());
                     tracing::info!("dev-bench (pre-handshake): {text}");
+                    continue;
+                }
+                // Same reasoning as the `LogLine` skip above, for a line that
+                // arrived corrupt: this is the window where a bench that just
+                // crashed is emptying its held log buffer, and one unreadable
+                // line out of that flush must not decide the handshake. The
+                // deadline still bounds the loop.
+                Ok(Received::Undecodable(what)) => {
+                    tracing::warn!("dev-bench sent an undecodable frame before HelloAck: {what}");
+                    crate::dev_bench_log::note(
+                        None,
+                        &format!("undecodable frame before HelloAck: {what}"),
+                    );
                     continue;
                 }
                 other => break other,
             }
         };
         match ack {
-            Ok(Some(DevBenchMessage::HelloAck {
+            Ok(Received::Message(DevBenchMessage::HelloAck {
                 schema_version,
                 compatible,
                 firmware_version,
@@ -748,8 +777,16 @@ async fn open_and_handshake(
                 drain_post_ack_log_lines(&mut link);
                 Ok((link, info))
             }
-            Ok(Some(other)) => Err(format!("expected HelloAck from dev-bench, got {other:?} instead")),
-            Ok(None) => Err(format!(
+            Ok(Received::Message(other)) => {
+                Err(format!("expected HelloAck from dev-bench, got {other:?} instead"))
+            }
+            // Unreachable: the loop above `continue`s on this variant. Named
+            // rather than caught by a wildcard so that adding a variant to
+            // `Received` is a compile error here and not a silent arm.
+            Ok(Received::Undecodable(what)) => {
+                Err(format!("expected HelloAck from dev-bench, got an undecodable frame: {what}"))
+            }
+            Ok(Received::Deadline) => Err(format!(
                 "timed out after {HANDSHAKE_TIMEOUT_MS}ms waiting for HelloAck from dev-bench"
             )),
             Err(e) => Err(format!("error waiting for HelloAck from dev-bench: {e:?}")),
@@ -1243,7 +1280,7 @@ fn run_study_to_completion(
 
     let outcome = loop {
         match link.recv(deadline) {
-            Ok(Some(DevBenchMessage::StepResult { step_index, result })) => {
+            Ok(Received::Message(DevBenchMessage::StepResult { step_index, result })) => {
                 if let Err(e) = writer.write_step(&result) {
                     break Err(format!("failed to write step {step_index}'s result to events.json: {e:?}"));
                 }
@@ -1263,11 +1300,39 @@ fn run_study_to_completion(
                 }
                 deadline = next_deadline(&capture.study, next_expected, Instant::now());
             }
-            Ok(Some(DevBenchMessage::StudyDone { completed })) => {
+            Ok(Received::Message(DevBenchMessage::StudyDone { completed })) => {
                 tracing::info!(study_id, completed, "study run finished (StudyDone)");
-                break Ok(());
+                // **`completed` is not decoration, and ignoring it reported a
+                // dead study as a successful one.** dev-bench sets it false
+                // exactly when it stopped early because a step failed with
+                // `continue_on_fail: false`
+                // (`embarch-study-designer`'s `StudyDone` doc). Core used to
+                // `break Ok(())` on either value, so a run that died at step 5
+                // of 11 came back `status: completed, reason: null` with the
+                // failure visible only to someone who read every step outcome
+                // in the result body. Found 2026-08-27 on real hardware, on a
+                // study that lost its link to a DUT-side supervision timeout.
+                //
+                // The reason names the step and quotes its own words rather
+                // than saying "a step failed": the `Fail` reason dev-bench
+                // sent is the diagnosis, and it is already in hand here.
+                if completed {
+                    break Ok(());
+                }
+                break Err(match writer.last_failed_step() {
+                    Some((name, why)) => format!(
+                        "dev-bench stopped the study early: step '{name}' failed ({why})"
+                    ),
+                    // No `Fail` outcome on record and dev-bench still says it
+                    // stopped early — which is what a *lost* `StepResult`
+                    // looks like from here (the undecodable-frame arm below).
+                    // Said plainly rather than guessed at.
+                    None => "dev-bench stopped the study early, and the StepResult saying which \
+                             step failed did not arrive"
+                        .to_string(),
+                });
             }
-            Ok(Some(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.taps, id) {
+            Ok(Received::Message(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.taps, id) {
                 Some(tap) => {
                     tracing::info!(study_id, id, name = tap.name.as_str(), "stream tap opened");
                     open_taps.insert(id);
@@ -1278,7 +1343,7 @@ fn run_study_to_completion(
                     "dev-bench opened a stream id this study never declared; ignoring it"
                 ),
             },
-            Ok(Some(DevBenchMessage::StreamClose { id, dropped })) => {
+            Ok(Received::Message(DevBenchMessage::StreamClose { id, dropped })) => {
                 open_taps.remove(&id);
                 let name = tap_for(&capture.taps, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
                 if dropped > 0 {
@@ -1299,7 +1364,7 @@ fn run_study_to_completion(
                     tracing::info!(study_id, id, name, "stream tap closed");
                 }
             }
-            Ok(Some(DevBenchMessage::StreamChunkBatch { id, records })) => {
+            Ok(Received::Message(DevBenchMessage::StreamChunkBatch { id, records })) => {
                 let Some(tap) = tap_for(&capture.taps, id).cloned() else {
                     tracing::warn!(
                         study_id,
@@ -1320,7 +1385,7 @@ fn run_study_to_completion(
                     write_stream_record(&capture, &tap, record);
                 }
             }
-            Ok(Some(DevBenchMessage::LogLine { text })) => {
+            Ok(Received::Message(DevBenchMessage::LogLine { text })) => {
                 // `info!`, not `debug!`, for the ordinary case. dev-bench
                 // never chatters on this channel -- every LogLine is the
                 // firmware deliberately choosing to tell the host something
@@ -1406,13 +1471,41 @@ fn run_study_to_completion(
                     );
                 }
             }
-            Ok(Some(other)) => {
+            Ok(Received::Message(other)) => {
                 // Hello/HelloAck/StudyStart are Core->dev-bench (or
                 // handshake-only) messages; dev-bench shouldn't send them
                 // back once a study is running. Not fatal on its own.
                 tracing::warn!(study_id, "unexpected message from dev-bench mid-study: {other:?}");
             }
-            Ok(None) => {
+            // **One unreadable frame costs the frame, not the link.** See
+            // `Received::Undecodable`: the frame this was found on was the
+            // `StepResult` explaining why a step failed, and refusing it took
+            // the link down and reported the whole study as a transport
+            // error that never mentioned a step at all. Now the loop keeps
+            // reading — dev-bench's own `LogLine`s and its `StudyDone` are
+            // still coming, and those say what happened.
+            //
+            // Recorded three ways rather than logged once, because the byte
+            // dump is the only evidence this fault leaves: `core.log` for the
+            // person reading Core's account, the study's own dev-bench file
+            // for the person reading the run, and the run's failure reason if
+            // nothing better turns up.
+            Ok(Received::Undecodable(what)) => {
+                tracing::error!(study_id, "{what}");
+                crate::dev_bench_log::note(Some(&study_id), &format!("UNDECODABLE FRAME: {what}"));
+                // A link that has turned to noise is a different thing from a
+                // link that lost one frame, and the difference is a count. Ten
+                // is chosen to be far above what this fault produces (one per
+                // failing step) and far below a loop that spins to the
+                // deadline on garbage.
+                if link.undecodable_frames() >= MAX_UNDECODABLE_FRAMES {
+                    break Err(format!(
+                        "dev-bench link gave {} undecodable frames; giving up on it. Last one: {what}",
+                        link.undecodable_frames()
+                    ));
+                }
+            }
+            Ok(Received::Deadline) => {
                 break Err(format!(
                     "step timed out — no message received from dev-bench before the deadline \
                      (waiting on step index {next_expected})"
@@ -2159,6 +2252,12 @@ struct EventsJsonWriter {
     wrote_any_step: bool,
     provenance: Provenance,
     streams: Vec<StreamRef>,
+    /// The last step this run recorded a `Fail` outcome for, as (name,
+    /// reason). Kept so a `StudyDone { completed: false }` can say *which*
+    /// step stopped the study in its own words — dev-bench sends the
+    /// diagnosis once, in the `StepResult`, and nothing else on the wire
+    /// repeats it.
+    last_failed_step: Option<(String, String)>,
 }
 
 impl EventsJsonWriter {
@@ -2180,6 +2279,7 @@ impl EventsJsonWriter {
             wrote_any_step: false,
             provenance: provenance.clone(),
             streams: Vec::new(),
+            last_failed_step: None,
         })
     }
 
@@ -2189,7 +2289,17 @@ impl EventsJsonWriter {
         }
         serde_json::to_writer(&mut self.file, result)?;
         self.wrote_any_step = true;
+        if let Outcome::Fail { reason } = &result.outcome {
+            self.last_failed_step =
+                Some((result.step_name.as_str().to_string(), reason.as_str().to_string()));
+        }
         Ok(())
+    }
+
+    /// The last `Fail` outcome recorded, as (step name, reason) — see
+    /// `last_failed_step`'s own comment for why it is kept.
+    fn last_failed_step(&self) -> Option<(&str, &str)> {
+        self.last_failed_step.as_ref().map(|(n, r)| (n.as_str(), r.as_str()))
     }
 
     /// One [`StreamRef`] per declared tap, handed over once the capture is
@@ -3253,6 +3363,58 @@ mod tests {
         let jobs = empty_registry();
         update_job(&jobs, "missing", |job| job.current_step = Some(1));
         assert!(jobs.lock().unwrap().get("missing").is_none());
+    }
+
+    /// A `Fail` outcome with a reason, for the `StudyDone { completed: false }`
+    /// path — the fixture the `Pass` one below cannot stand in for.
+    fn failed_step_result(name: &str, reason: &str) -> StepResult {
+        StepResult {
+            outcome: Outcome::Fail { reason: heapless::String::try_from(reason).unwrap() },
+            ..test_step_result(name)
+        }
+    }
+
+    /// **A study that stopped early must be able to say which step stopped it,
+    /// in that step's own words.** dev-bench sends the diagnosis exactly once,
+    /// in the `StepResult`, and `StudyDone { completed: false }` carries no
+    /// reason of its own — so if the writer does not remember the last `Fail`,
+    /// Core has nothing to report but a boolean. Found 2026-08-27: a run that
+    /// died at step 5 of 11 to a DUT-side supervision timeout came back
+    /// `status: completed, reason: null`.
+    #[test]
+    fn the_writer_remembers_the_last_failed_step_for_an_early_stop() {
+        let dir = std::env::temp_dir().join(format!("embarch-lastfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = EventsJsonWriter::start(
+            &dir,
+            "test-study",
+            &provenance_for(
+                &study_with_steps(&[1_000]),
+                "gbench1",
+                &no_run_params(),
+                Default::default(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(writer.last_failed_step(), None, "nothing has failed yet");
+        writer.write_step(&test_step_result("connect")).unwrap();
+        assert_eq!(writer.last_failed_step(), None, "a Pass must not register as a failure");
+
+        writer
+            .write_step(&failed_step_result(
+                "batchmgr-stop",
+                "disconnected during service discovery (HCI 0x08, supervision tim",
+            ))
+            .unwrap();
+        assert_eq!(
+            writer.last_failed_step(),
+            Some((
+                "batchmgr-stop",
+                "disconnected during service discovery (HCI 0x08, supervision tim"
+            )),
+            "the reason is the diagnosis and must survive verbatim"
+        );
     }
 
     fn test_step_result(name: &str) -> StepResult {
