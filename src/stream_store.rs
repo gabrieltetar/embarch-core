@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use embarch_study_designer::{
     limits::MAX_STREAM_NAME_LEN, GattTranscriptEntry, Sample, StreamEncoding, StreamRef,
-    StreamSource, StreamTap,
+    StreamSource, StreamTap, StructLayout,
 };
 use serde::{Deserialize, Serialize};
 
@@ -495,6 +495,7 @@ impl StreamStore {
     pub fn create(
         results_dir: &Path,
         taps: &[StreamTap],
+        decoders: &[StructLayout],
         max_bytes: u64,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
@@ -521,7 +522,9 @@ impl StreamStore {
                 raw: SegmentedFile::new(&dir, &raw_file, None, max_bytes),
                 rendered: rendered_file
                     .as_ref()
-                    .map(|f| SegmentedFile::new(&dir, f, rendered_header(&tap.encoding), max_bytes)),
+                    .map(|f| {
+                        SegmentedFile::new(&dir, f, rendered_header(&tap.encoding, decoders), max_bytes)
+                    }),
                 arrival: arrival_file.as_ref().map(|f| ArrivalLog {
                     // **Deliberately unrotated** (`max_bytes` 0), unlike every
                     // other file here. A row is ~24 bytes against a frame of a
@@ -694,7 +697,9 @@ fn raw_extension(encoding: &StreamEncoding) -> &'static str {
 
 fn rendered_extension(encoding: &StreamEncoding) -> Option<&'static str> {
     match encoding {
-        StreamEncoding::Samples { .. } | StreamEncoding::GattTranscript => Some("csv"),
+        StreamEncoding::Samples { .. }
+        | StreamEncoding::GattTranscript
+        | StreamEncoding::Struct { .. } => Some("csv"),
         // `Raw` has nothing declared to decode against; `Text`'s raw file is
         // already its rendering; `OutpostTrace` needs a manifest Core cannot
         // yet be given, and renders nothing rather than guessing (decision
@@ -711,11 +716,27 @@ fn rendered_extension(encoding: &StreamEncoding) -> Option<&'static str> {
 /// The header line a rendered file opens with — the crate's own column list
 /// plus the one column Core itself appends (`core_rx_utc_ms`, decision 30).
 /// Core holds no other column knowledge, here or anywhere.
-fn rendered_header(encoding: &StreamEncoding) -> Option<String> {
+fn rendered_header(encoding: &StreamEncoding, decoders: &[StructLayout]) -> Option<String> {
     match encoding {
         StreamEncoding::Samples { .. } => Some(format!("{},core_rx_utc_ms", Sample::csv_header())),
         StreamEncoding::GattTranscript => {
             Some(format!("{},core_rx_utc_ms", GattTranscriptEntry::csv_header()))
+        }
+        // The decoded columns come from the engineer's own declared layout
+        // (`embarch-study-designer/design.md` §3 decision 52) — Core supplies
+        // the fixed columns around them and nothing else, exactly as it does
+        // for the two above.
+        //
+        // `payload_hex`/`decode_note` are always present, not only on a
+        // failed row: a reader must be able to tell a payload that didn't fit
+        // the layout from one that did without the columns shifting under
+        // them mid-file.
+        StreamEncoding::Struct { decoder } => {
+            let layout = decoders.get(usize::from(*decoder))?;
+            let columns = layout.column_header().ok()?;
+            Some(format!(
+                "rx_utc_ms,step_index,step_name,{columns},payload_hex,decode_note,core_rx_utc_ms"
+            ))
         }
         _ => None,
     }
@@ -844,7 +865,7 @@ mod tests {
             tap(2, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript),
         ];
 
-        let store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
 
         let index = read_index(store.dir()).unwrap().unwrap();
         assert_eq!(index.streams.len(), 3);
@@ -868,7 +889,7 @@ mod tests {
     fn a_text_taps_raw_file_is_its_rendering_and_gets_no_second_copy() {
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(0, "console", StreamSource::DevBenchLog, StreamEncoding::Text)];
-        let store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
         let index = read_index(store.dir()).unwrap().unwrap();
         assert_eq!(index.streams[0].raw_file, "console.txt");
         assert_eq!(index.streams[0].rendered_file, None);
@@ -889,7 +910,7 @@ mod tests {
             StreamSource::Signal { name: heapless::String::try_from("outpost-uart").unwrap() },
             StreamEncoding::OutpostTrace,
         )];
-        let mut store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
         store.write_raw(0, b"\x01\x02\x03");
 
         let index = read_index(store.dir()).unwrap().unwrap();
@@ -912,7 +933,7 @@ mod tests {
             ),
             tap(1, "power", StreamSource::PowerFrontEnd { sample_hz: 1000 }, samples()),
         ];
-        StreamStore::create(dir, &taps, 0).unwrap()
+        StreamStore::create(dir, &taps, &[], 0).unwrap()
     }
 
     /// The arrival log's whole job: a row per frame, keyed by the same frame
@@ -984,7 +1005,7 @@ mod tests {
             StreamSource::Signal { name: heapless::String::try_from("outpost-uart").unwrap() },
             StreamEncoding::OutpostTrace,
         )];
-        let store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
 
         update_index(store.dir(), |entry| {
             entry.rendered_file = Some("outpost.trace.csv".to_string());
@@ -1007,7 +1028,7 @@ mod tests {
             tap(0, "a/b:c", StreamSource::DevBenchLog, StreamEncoding::Raw),
             tap(1, "a b c", StreamSource::DevBenchLog, StreamEncoding::Raw),
         ];
-        let mut store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
         store.write_raw(0, b"x");
         store.write_raw(1, b"y");
 
@@ -1030,7 +1051,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(0, "raw", StreamSource::DevBenchLog, StreamEncoding::Raw)];
         // 4-byte cap: every 4-byte write past the first rotates.
-        let mut store = StreamStore::create(dir.path(), &taps, 4).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 4).unwrap();
 
         store.write_raw(0, b"aaaa");
         assert!(!store.refs()[0].truncated, "nothing has been lost yet");
@@ -1058,7 +1079,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let taps =
             vec![tap(0, "power", StreamSource::PowerFrontEnd { sample_hz: 1 }, samples())];
-        let mut store = StreamStore::create(dir.path(), &taps, 60).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 60).unwrap();
 
         for i in 0..8 {
             store.write_rendered_row(0, &format!("{i},step,1.0,volts,0,{i}"));
@@ -1080,7 +1101,7 @@ mod tests {
     fn a_zero_cap_disables_rotation_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(0, "raw", StreamSource::DevBenchLog, StreamEncoding::Raw)];
-        let mut store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
         for _ in 0..64 {
             store.write_raw(0, b"0123456789");
         }
@@ -1093,7 +1114,7 @@ mod tests {
     fn a_write_larger_than_the_cap_is_written_whole_rather_than_split() {
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(0, "raw", StreamSource::DevBenchLog, StreamEncoding::Raw)];
-        let mut store = StreamStore::create(dir.path(), &taps, 4).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 4).unwrap();
         store.write_raw(0, b"0123456789");
         assert_eq!(fs::read(store.dir().join("raw.bin")).unwrap(), b"0123456789");
     }
@@ -1102,7 +1123,7 @@ mod tests {
     fn dropped_records_at_the_source_reach_truncated_too() {
         let dir = tempfile::tempdir().unwrap();
         let taps = vec![tap(0, "raw", StreamSource::DevBenchLog, StreamEncoding::Raw)];
-        let mut store = StreamStore::create(dir.path(), &taps, 0).unwrap();
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
         store.write_raw(0, b"ok");
         assert!(!store.refs()[0].truncated);
         store.mark_lost_at_source(0);

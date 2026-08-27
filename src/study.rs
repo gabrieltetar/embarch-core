@@ -161,7 +161,8 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // no blank/duplicate/reserved name, no step range that could never open.
     // Computed by the crate, not restated here, so Core holds no second copy
     // of the rules to drift from.
-    validate_taps(&study.streams, study.steps.len() as u32).map_err(|e| e.to_string())?;
+    validate_taps(&study.streams, study.steps.len() as u32, study.decoders.len())
+        .map_err(|e| e.to_string())?;
 
     // `embarch-study-designer/design.md` §3 decision 40: both requirements
     // are mandatory and `"any"` is an explicit legal value, so a *blank* one
@@ -1073,7 +1074,12 @@ fn run_study_to_completion(
 
     // `streams/` and its index, before a single byte has arrived (decision
     // 30(b)). One file per tap, named by the tap.
-    let store = match StreamStore::create(&results_dir, &taps, stream_store::stream_max_bytes()) {
+    let store = match StreamStore::create(
+        &results_dir,
+        &taps,
+        &study.decoders,
+        stream_store::stream_max_bytes(),
+    ) {
         Ok(store) => store,
         Err(e) => {
             fail_job(&jobs, &events_tx, &study_id, format!("failed to create the study's streams/ directory: {e:?}"));
@@ -1822,11 +1828,94 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // arrived late name every record before it. See
             // `render_outpost_traces`, which runs once the capture is closed.
         }
+        StreamEncoding::Struct { decoder } => {
+            // The record's bytes are one instance of the layout the engineer
+            // declared (`embarch-study-designer/design.md` §3 decision 52) —
+            // for a `GattNotify` tap, exactly one notification's raw ATT
+            // value, with nothing wrapped around it.
+            write_struct_rows(capture, tap.id, current_step, decoder, record);
+        }
         StreamEncoding::Raw => {
             // Nothing declared, so nothing rendered. `Raw` is the honest
             // default for a payload nobody gave a meaning.
         }
     }
+}
+
+/// Renders one record through its tap's declared [`StructLayout`], appending
+/// one CSV row per repetition (`embarch-study-designer/design.md` §3
+/// decision 52).
+///
+/// **A payload that doesn't fit the layout still gets a row.** Its decoded
+/// columns are empty and `payload_hex`/`decode_note` carry the bytes and the
+/// reason — never a dropped record and never a forced decode. The raw `.bin`
+/// is already on disk before this runs either way, so a wrong layout costs a
+/// rendering that can be redone, not a capture that cannot.
+fn write_struct_rows(
+    capture: &Capture,
+    tap_id: u8,
+    step_index: u32,
+    decoder: u8,
+    record: &StreamRecord,
+) {
+    let payload = record.bytes.as_slice();
+    let Some(layout) = capture.study.decoders.get(usize::from(decoder)) else {
+        // Unreachable: `validate_taps` refuses a tap naming a decoder the
+        // study doesn't declare, before the study is ever accepted. Logged
+        // rather than panicked, since a capture in flight is worth more than
+        // an assertion.
+        tracing::warn!(
+            study_id = capture.study_id,
+            decoder,
+            "a Struct-encoded tap names a decoder this study doesn't declare; raw bytes kept"
+        );
+        return;
+    };
+
+    let step_name = capture
+        .study
+        .steps
+        .get(step_index as usize)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
+    // A step name carrying a comma or a quote would break the column; the
+    // crate refuses one rather than quoting (`csv_escape_ok`), and the same
+    // rule applies here so both rendered files agree on what a legal name is.
+    let step_name = if step_name.contains([',', '"']) { "" } else { step_name };
+    // `rx_utc_ms` is the capturing node's own stamp, the same convention
+    // every other rendered row here uses; `core_rx_utc_ms` is appended last,
+    // once, below.
+    let prefix = format!("{},{step_index},{step_name},", record.rx_utc_ms);
+
+    let rows: Vec<String> = match layout.row_count(payload) {
+        Ok(count) => (0..count)
+            .filter_map(|i| layout.row(payload, i).ok())
+            .map(|columns| format!("{prefix}{columns},,"))
+            .collect(),
+        Err(e) => {
+            // One row, so the record is visibly present and visibly
+            // undecoded, rather than absent and indistinguishable from a
+            // notification that never arrived.
+            // Unquoted: `DecodeError`'s rendering carries no comma and no
+            // quote by construction, asserted in that type's own tests, for
+            // exactly this reason.
+            vec![format!("{prefix}{},{},{e}", layout.empty_columns(), hex_of(payload))]
+        }
+    };
+
+    let mut store = capture.store.lock().unwrap();
+    let now = current_utc_ms();
+    for row in rows {
+        store.write_rendered_row(tap_id, &format!("{row},{now}"));
+    }
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Appends one decoded `Sample` to its tap's rendered CSV, labelled with
@@ -2416,7 +2505,7 @@ mod tests {
         // actually routes on.
         let mut taps: Vec<StreamTap> = study.streams.iter().cloned().collect();
         taps.push(dev_bench_log_tap(&study.streams));
-        let store = StreamStore::create(dir, &taps, 0).unwrap();
+        let store = StreamStore::create(dir, &taps, &study.decoders, 0).unwrap();
         let (events_tx, _rx) = broadcast::channel(64);
         Capture {
             study,
@@ -2462,6 +2551,7 @@ mod tests {
             HVec::new();
         let streams_crc_value = streams_crc(&streams).unwrap();
         Study {
+            decoders: Default::default(),
             name: heapless::String::try_from("test-study").unwrap(),
             requires: embarch_study_designer::Requirements::any(),
             steps,
@@ -2470,6 +2560,146 @@ mod tests {
             streams_crc: streams_crc_value,
             dev_bench_log_level: Default::default(),
         }
+    }
+
+    // ---- write_struct_rows (embarch-study-designer/design.md §3 decision 52) ----
+
+    /// `ppg_packet`: a two-field header then a repeating pair — the shape a
+    /// real sensor notification actually has, and the whole reason
+    /// `StreamEncoding::Samples` was not enough.
+    fn ppg_layout() -> embarch_study_designer::StructLayout {
+        use embarch_study_designer::{ScalarType, StructField, StructLayout};
+        let field = |name: &str, ty| StructField {
+            name: heapless::String::try_from(name).unwrap(),
+            ty,
+        };
+        StructLayout {
+            name: heapless::String::try_from("ppg_packet").unwrap(),
+            header: heapless::Vec::from_slice(&[
+                field("seq", ScalarType::U16Le),
+                field("timestamp", ScalarType::U32Le),
+            ])
+            .unwrap(),
+            repeat: heapless::Vec::from_slice(&[
+                field("green", ScalarType::I16Le),
+                field("red", ScalarType::I16Le),
+            ])
+            .unwrap(),
+        }
+    }
+
+    fn study_with_struct_tap() -> Study {
+        use embarch_study_designer::Uuid;
+        let mut study = study_with_taps(
+            &[1_000, 2_000],
+            &[tap(
+                0,
+                "ppg",
+                StreamSource::GattNotify {
+                    service_uuid: Uuid::parse("6e400001-b5a3-f393-e0a9-e50e24dcca9e").unwrap(),
+                    characteristic_uuid: Uuid::parse("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+                        .unwrap(),
+                },
+                StreamEncoding::Struct { decoder: 0 },
+            )],
+        );
+        study.decoders.push(ppg_layout()).unwrap();
+        study
+    }
+
+    fn struct_record(rx_utc_ms: u64, payload: &[u8]) -> StreamRecord {
+        StreamRecord { rx_utc_ms, bytes: heapless::Vec::from_slice(payload).unwrap() }
+    }
+
+    #[test]
+    fn a_struct_encoded_record_renders_one_row_per_repetition() {
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_struct_tap();
+        let capture = test_capture(dir.path(), study);
+        let tap = capture.study.streams[0].clone();
+
+        // seq = 41, timestamp = 90146 (0x00016022), then two (green, red) pairs.
+        let mut payload = vec![0x29, 0x00, 0x22, 0x60, 0x01, 0x00];
+        payload.extend_from_slice(&[0x01, 0x00, 0x02, 0x00]);
+        payload.extend_from_slice(&[0xff, 0xff, 0xfe, 0xff]);
+        write_stream_record(&capture, &tap, &struct_record(4_242, &payload));
+
+        let csv = std::fs::read_to_string(dir.path().join("streams").join("ppg.csv")).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "a header plus one row per repetition, got: {csv}");
+        assert_eq!(
+            lines[0],
+            concat!(
+                "rx_utc_ms,step_index,step_name,rep_index,seq,timestamp,green,red,",
+                "payload_hex,decode_note,core_rx_utc_ms"
+            ),
+            "the decoded columns are the engineer's declared layout, the rest are Core's"
+        );
+        // The header's values are denormalized onto every row, which is what
+        // makes each row independently analyzable.
+        assert!(lines[1].starts_with("4242,0,step-0,0,41,90146,1,2,,"), "row 0: {}", lines[1]);
+        assert!(lines[2].starts_with("4242,0,step-0,1,41,90146,-1,-2,,"), "row 1: {}", lines[2]);
+
+        // The raw bytes go down regardless of any decode (decision 30(b)).
+        let raw = std::fs::read(dir.path().join("streams").join("ppg.bin")).unwrap();
+        assert_eq!(raw, payload, "the raw capture is written before anything is decoded");
+    }
+
+    #[test]
+    fn a_payload_that_does_not_fit_the_layout_still_gets_a_row() {
+        // The failure this whole family of decisions keeps being opened by is
+        // a capture that is silently absent. A record that arrived and could
+        // not be decoded must be visibly present and visibly undecoded — not
+        // missing, which is indistinguishable from a notification that never
+        // came.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), study_with_struct_tap());
+        let tap = capture.study.streams[0].clone();
+
+        write_stream_record(&capture, &tap, &struct_record(7, &[0x01, 0x02, 0x03]));
+
+        let csv = std::fs::read_to_string(dir.path().join("streams").join("ppg.csv")).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 2, "a header plus the undecoded row, got: {csv}");
+        assert!(lines[1].starts_with("7,0,step-0,,,,,,010203,"), "row: {}", lines[1]);
+        assert!(lines[1].contains("layout header needs 6"), "the reason is named: {}", lines[1]);
+        assert!(
+            !lines[1].contains('"'),
+            "the reason needs no quoting, so no column can be split by it: {}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[0].matches(',').count(),
+            lines[1].matches(',').count(),
+            "an undecoded row must not shift every later column left"
+        );
+
+        let raw = std::fs::read(dir.path().join("streams").join("ppg.bin")).unwrap();
+        assert_eq!(raw, vec![0x01, 0x02, 0x03], "a failed decode costs a rendering, not a capture");
+    }
+
+    #[test]
+    fn a_struct_tap_declaring_no_repetitions_renders_no_rows_and_no_error() {
+        // A DUT sending a header with an empty sample array is a real thing;
+        // a row invented for it would be invented data.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), study_with_struct_tap());
+        let tap = capture.study.streams[0].clone();
+
+        write_stream_record(&capture, &tap, &struct_record(9, &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]));
+
+        // A rendered file is created lazily on its first row, so "no rows"
+        // is either an absent file or a header-only one. Both say the same
+        // thing and neither invents a sample.
+        let rows = std::fs::read_to_string(dir.path().join("streams").join("ppg.csv"))
+            .map(|csv| csv.lines().count().saturating_sub(1))
+            .unwrap_or(0);
+        assert_eq!(rows, 0, "an empty repetition list must not become a row");
+
+        // The bytes still landed: nothing about "no rows to render" means
+        // "nothing arrived".
+        let raw = std::fs::read(dir.path().join("streams").join("ppg.bin")).unwrap();
+        assert_eq!(raw.len(), 6);
     }
 
     // ---- write_transcript_entry (design.md §3 decision 36) ----
@@ -2704,7 +2934,6 @@ mod tests {
             // embarch-study-designer/design.md §3 decisions 31/32 — new
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
-            gatt_activity: None,
             // Decision 44's `security_level`, likewise: this fixture has no
             // link, and `None` is what a step with no connection reports.
             security_level: None,

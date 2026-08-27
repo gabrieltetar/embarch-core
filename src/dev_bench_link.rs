@@ -38,6 +38,12 @@ pub struct DevBenchLink {
     /// more than one frame's worth at once), so this carries the remainder
     /// across calls to [`Self::recv`].
     buf: Vec<u8>,
+    /// How many empty frames (a bare `0x00` with nothing before it) this
+    /// link has skipped — see [`Self::recv`] for what produces one. Counted
+    /// rather than only logged so a link that is quietly resyncing over and
+    /// over is visible as a number, not as a pattern someone has to notice
+    /// in a log.
+    empty_frames: u64,
 }
 
 impl DevBenchLink {
@@ -48,7 +54,7 @@ impl DevBenchLink {
             .timeout(READ_TIMEOUT)
             .open()
             .with_context(|| format!("failed to open dev-bench serial port '{port_name}'"))?;
-        Ok(Self { port, buf: Vec::new() })
+        Ok(Self { port, buf: Vec::new(), empty_frames: 0 })
     }
 
     /// Postcard-encodes `msg`, COBS-frames it (trailing `0x00` delimiter
@@ -119,6 +125,44 @@ impl DevBenchLink {
         }
     }
 
+    /// Splits the next complete `0x00`-delimited frame off the front of
+    /// `buf`, skipping any *empty* ones and counting them into
+    /// `empty_frames`. Returns `None` when no complete frame is buffered yet.
+    ///
+    /// **An empty segment — a `0x00` with nothing before it — is not a frame
+    /// that failed to decode, it is the absence of one.** COBS never encodes
+    /// a message to zero bytes, so no sender can legitimately produce this.
+    /// What does produce it is the wire going quiet mid-stream: a bench that
+    /// reset (the line idles, and the first thing the driver hands back is a
+    /// null), or a delimiter arriving twice across a resync.
+    ///
+    /// Skipping it rather than failing the study is what lets the *next*
+    /// frames through, and those are the ones worth having — a bench that
+    /// just rebooted sends its panic dump and its boot record as ordinary
+    /// `LogLine`s. Treating this as a fatal decode error tore the link down
+    /// before any of that could arrive, which is precisely how a firmware
+    /// crash spent a session presenting as a protocol bug.
+    ///
+    /// Pure, and separate from `recv`, so the framing is testable without a
+    /// serial port — the same reason `describe_undecodable_frame` is.
+    fn take_frame(buf: &mut Vec<u8>, empty_frames: &mut u64) -> Option<Vec<u8>> {
+        loop {
+            let pos = buf.iter().position(|&b| b == 0)?;
+
+            if pos == 0 {
+                buf.drain(..=pos);
+                *empty_frames += 1;
+                tracing::debug!(
+                    empty_frames = *empty_frames,
+                    "skipped an empty frame on the dev-bench link (a stray delimiter — \
+                     usually a bench that reset mid-stream)"
+                );
+                continue;
+            }
+            return Some(buf.drain(..=pos).collect());
+        }
+    }
+
     /// Reads and decodes one `DevBenchMessage`, blocking (via bounded,
     /// polled reads) until either a complete `0x00`-delimited frame arrives
     /// or `deadline` passes.
@@ -128,8 +172,7 @@ impl DevBenchLink {
     /// (a read error) or a frame arrived but didn't decode.
     pub fn recv(&mut self, deadline: Instant) -> Result<Option<DevBenchMessage>> {
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == 0) {
-                let mut frame: Vec<u8> = self.buf.drain(..=pos).collect();
+            if let Some(mut frame) = Self::take_frame(&mut self.buf, &mut self.empty_frames) {
                 // Kept for the error path below: `from_bytes_cobs` decodes
                 // in place, so by the time it fails `frame` no longer holds
                 // what arrived on the wire.
@@ -160,6 +203,60 @@ impl DevBenchLink {
 mod tests {
     use super::*;
     use embarch_study_designer::{StreamRecord, DEV_BENCH_WIRE_SCHEMA_VERSION};
+
+    /// The failure this whole path exists for, at the framing layer: a bench
+    /// that resets mid-stream leaves a bare delimiter behind, and the frames
+    /// *after* it — the panic dump and boot record that say why it reset —
+    /// are the ones worth reading. Before this, the stray null was a fatal
+    /// decode error and took the link down before any of them arrived.
+    #[test]
+    fn a_stray_delimiter_is_skipped_and_the_next_frame_still_arrives() {
+        let log = DevBenchMessage::LogLine {
+            text: heapless::String::try_from("<err> os: E_CPU_EXCEPTION").unwrap(),
+        };
+        let mut buf: Vec<u8> = vec![0x00];
+        buf.extend(postcard::to_stdvec_cobs(&log).unwrap());
+
+        let mut empty = 0u64;
+        let mut frame = DevBenchLink::take_frame(&mut buf, &mut empty)
+            .expect("the frame after the stray delimiter must still be readable");
+        assert_eq!(empty, 1, "the skipped delimiter must be counted");
+
+        let decoded: DevBenchMessage = postcard::from_bytes_cobs(&mut frame).unwrap();
+        match decoded {
+            DevBenchMessage::LogLine { text } => {
+                assert_eq!(text.as_str(), "<err> os: E_CPU_EXCEPTION")
+            }
+            other => panic!("expected the LogLine back, got {other:?}"),
+        }
+    }
+
+    /// A run of them — what a line that stays idle for a while actually
+    /// produces — collapses to one skip per null, not to a lost frame.
+    #[test]
+    fn a_run_of_stray_delimiters_is_skipped_as_a_run() {
+        let log = DevBenchMessage::LogLine { text: heapless::String::try_from("up").unwrap() };
+        let mut buf: Vec<u8> = vec![0x00, 0x00, 0x00];
+        buf.extend(postcard::to_stdvec_cobs(&log).unwrap());
+
+        let mut empty = 0u64;
+        assert!(DevBenchLink::take_frame(&mut buf, &mut empty).is_some());
+        assert_eq!(empty, 3);
+    }
+
+    /// The other half: with nothing but nulls buffered there is no frame yet,
+    /// and `take_frame` must say so rather than hand back an empty one — a
+    /// `recv` that got `Some(vec![])` here would try to decode it and fail
+    /// the study, which is the bug this fixes wearing a different hat.
+    #[test]
+    fn nothing_but_delimiters_yields_no_frame() {
+        let mut buf: Vec<u8> = vec![0x00, 0x00];
+        let mut empty = 0u64;
+
+        assert!(DevBenchLink::take_frame(&mut buf, &mut empty).is_none());
+        assert_eq!(empty, 2);
+        assert!(buf.is_empty(), "every consumed null must be drained");
+    }
 
     /// The one thing the old bare "failed to decode DevBenchMessage" could
     /// not tell you: which message, and how big. Pinned because the *offset*
