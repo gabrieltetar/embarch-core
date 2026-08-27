@@ -24,8 +24,9 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 use embarch_study_designer::{
     limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
-    dev_bench_log_tap, requirement_satisfied, samples_in, steps_crc, streams_crc,
-    validate_taps, DevBenchMessage, GattTranscriptEntry, Provenance, Requirements, Sample,
+    dev_bench_log_tap, protocols_crc, requirement_satisfied, samples_in, steps_crc, streams_crc,
+    validate_protocol, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Provenance,
+    Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
     VersionOverride, VersionSource, VersionSubject,
     DEV_BENCH_WIRE_SCHEMA_VERSION,
@@ -197,6 +198,64 @@ fn validate_study(study: &Study) -> Result<(), String> {
              the submitted taps don't match their own checksum",
             study.streams_crc
         ));
+    }
+
+    // The **third** seal (`embarch-study-designer/design.md` §3 decision 58),
+    // checked independently of the other two for the same reason they are
+    // checked independently of each other: a mismatch says which of the three
+    // halves of a `Study` is corrupt.
+    //
+    // Sealed at all — unlike `decoders`, which is covered by none of the three
+    // — because dev-bench *executes* a protocol rather than rendering with it.
+    // Corrupting one in flight would have a firmware writing different bytes to
+    // a DUT's control point than the study said it should.
+    let recomputed = protocols_crc(&study.protocols).map_err(|_| {
+        "failed to recompute protocols_crc (a protocol's encoding is unexpectedly large)"
+            .to_string()
+    })?;
+    if recomputed != study.protocols_crc {
+        return Err(format!(
+            "protocols_crc mismatch: submitted study.protocols_crc is {}, but recomputing over study.protocols gives {recomputed} — \
+             the submitted protocols don't match their own checksum",
+            study.protocols_crc
+        ));
+    }
+
+    // Every index inside each manifest, checked by the crate rather than
+    // restated here — the posture `validate_taps` above already takes, so Core
+    // holds no second copy of the rules to drift from. What this catches is a
+    // `goto`, an `on_event` or a `write` naming something the protocol does not
+    // declare, each of which reaches a hand-written C array subscript on
+    // dev-bench.
+    for (i, protocol) in study.protocols.iter().enumerate() {
+        validate_protocol(protocol)
+            .map_err(|e| format!("protocols[{i}] ({}) is not executable: {e}", protocol.name))?;
+    }
+
+    // The two indices `validate_protocol` structurally cannot see, because
+    // they live on a `Step` rather than inside a manifest. Both reach a C array
+    // subscript on dev-bench, and §3 decision 18's rule is that Core names the
+    // specific failure rather than letting a raw index fail.
+    for (i, step) in study.steps.iter().enumerate() {
+        let Action::RunProtocol { protocol, entry_state } = step.action else {
+            continue;
+        };
+        let Some(def) = study.protocols.get(protocol as usize) else {
+            return Err(format!(
+                "steps[{i}] ('{}') runs protocol {protocol}, but this study carries {} — \
+                 a RunProtocol step indexes study.protocols, and nothing else resolves it",
+                step.name,
+                study.protocols.len()
+            ));
+        };
+        if entry_state as usize >= def.states.len() {
+            return Err(format!(
+                "steps[{i}] ('{}') enters protocol {protocol} ('{}') at state {entry_state}, but it declares {} states",
+                step.name,
+                def.name,
+                def.states.len()
+            ));
+        }
     }
 
     Ok(())
@@ -858,6 +917,8 @@ pub async fn post_study_handler(
     let steps_crc_value = study.steps_crc;
     let streams = study.streams.clone();
     let streams_crc_value = study.streams_crc;
+    let protocols = study.protocols.clone();
+    let protocols_crc_value = study.protocols_crc;
     let requires = study.requires.clone();
     let dev_bench_log_level = study.dev_bench_log_level;
     let reported = hello.firmware_version.clone();
@@ -880,6 +941,14 @@ pub async fn post_study_handler(
                 streams,
                 streams_crc: streams_crc_value,
                 dev_bench_log_level,
+                // The manifest itself, not a reference to one: Core cannot
+                // read the firmware repo, and dev-bench is the node that
+                // *executes* this (`embarch-study-designer/design.md` §3
+                // decisions 58/60). `decoders` still does not ride along and
+                // never will — a layout decides how the host renders a byte
+                // that was already captured, and dev-bench renders nothing.
+                protocols,
+                protocols_crc: protocols_crc_value,
             })
             .map_err(|e| format!("failed to send StudyStart to dev-bench: {e:?}"))
         });
@@ -2805,6 +2874,181 @@ mod tests {
 
 
 
+    // ---- `.eap` protocols (embarch-study-designer/design.md §3 decisions
+    //      58-62) ----
+
+    /// The smallest executable manifest: one source, one frame, an active
+    /// entry state that writes and transitions, and both terminal states.
+    ///
+    /// Hand-built from the `eap` types rather than parsed from an `.eap`
+    /// file, because parsing is behind the `eap-parse` feature and Core
+    /// deliberately does not carry it — Core receives a manifest already
+    /// resolved into the `Study`, which is the whole point of §3 decision
+    /// 58's build-time resolution.
+    fn protocol_def() -> embarch_study_designer::ProtocolDef {
+        use embarch_study_designer::{
+            ActiveState, EventArm, FrameDef, ProtocolDef, ProtocolSource, StateDef, StateKind,
+            TerminalOutcome, Uuid, WriteAction, WriteField,
+        };
+        use embarch_study_designer::{Operand, ScalarType};
+
+        let mut sources = heapless::Vec::new();
+        sources
+            .push(ProtocolSource {
+                name: heapless::String::try_from("ctrl").unwrap(),
+                service_uuid: Uuid::parse("6e400001-b5a3-f393-e0a9-e50e24dcca9e").unwrap(),
+                characteristic_uuid: Uuid::parse("6e400002-b5a3-f393-e0a9-e50e24dcca9e").unwrap(),
+            })
+            .unwrap();
+
+        let mut frames = heapless::Vec::new();
+        frames
+            .push(FrameDef {
+                name: heapless::String::try_from("reply").unwrap(),
+                source: 0,
+                select_if: None,
+                fields: heapless::Vec::new(),
+                spans: heapless::Vec::new(),
+            })
+            .unwrap();
+
+        let mut write_fields = heapless::Vec::new();
+        write_fields
+            .push(WriteField { ty: ScalarType::U8, value: Operand::Literal(1) })
+            .unwrap();
+
+        let mut on_event = heapless::Vec::new();
+        on_event
+            .push(EventArm {
+                frame: 0,
+                remember: heapless::Vec::new(),
+                when: heapless::Vec::new(),
+                otherwise: Some(1),
+            })
+            .unwrap();
+
+        let mut states = embarch_study_designer::bounded::Bounded::new();
+        states
+            .push(StateDef {
+                name: heapless::String::try_from("start").unwrap(),
+                kind: StateKind::Active(ActiveState {
+                    on_enter: Some(WriteAction {
+                        source: 0,
+                        fields: write_fields,
+                        with_response: true,
+                    }),
+                    on_event,
+                    on_timeout: None,
+                }),
+            })
+            .unwrap();
+        states
+            .push(StateDef {
+                name: heapless::String::try_from("done").unwrap(),
+                kind: StateKind::Terminal(TerminalOutcome::Pass),
+            })
+            .unwrap();
+
+        ProtocolDef {
+            name: heapless::String::try_from("handshake").unwrap(),
+            sources,
+            frames,
+            session: heapless::Vec::new(),
+            states,
+        }
+    }
+
+    /// A study whose one step runs `protocol_def()`, with both affected
+    /// seals recomputed so it is genuinely submittable.
+    fn study_with_protocol(protocol: u8, entry_state: u8) -> Study {
+        use embarch_study_designer::Step;
+
+        let mut study = study_with_steps(&[]);
+        study.protocols.push(protocol_def()).unwrap();
+        study.protocols_crc = protocols_crc(&study.protocols).unwrap();
+        study
+            .steps
+            .push(Step {
+                name: heapless::String::try_from("handshake").unwrap(),
+                action: Action::RunProtocol { protocol, entry_state },
+                timeout_ms: 30_000,
+                continue_on_fail: false,
+                delay_before_ms: 0,
+            })
+            .unwrap();
+        study.steps_crc = steps_crc(&study.steps).unwrap();
+        study
+    }
+
+    #[test]
+    fn validate_study_accepts_a_study_that_runs_a_protocol() {
+        let study = study_with_protocol(0, 0);
+        assert!(validate_study(&study).is_ok(), "{:?}", validate_study(&study));
+    }
+
+    /// The third seal is checked independently of the other two, so a
+    /// corrupt manifest is reported as a `protocols_crc` failure and leaves
+    /// both other verdicts alone — the property having three of them exists
+    /// for, and the reason each is a sibling rather than a widening.
+    #[test]
+    fn validate_study_rejects_a_protocols_crc_mismatch_by_name() {
+        let mut study = study_with_protocol(0, 0);
+        study.protocols_crc = study.protocols_crc.wrapping_add(1);
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("protocols_crc mismatch"), "{err}");
+        assert!(!err.contains("steps_crc"), "the steps seal is unaffected: {err}");
+        assert!(!err.contains("streams_crc"), "the streams seal is unaffected: {err}");
+    }
+
+    /// `Action::RunProtocol.protocol` indexes `Study.protocols`, and nothing
+    /// else resolves it. Both this and the entry-state check below exist
+    /// because each index reaches a hand-written C array subscript on
+    /// dev-bench — §3 decision 18's rule is that Core names the specific
+    /// failure rather than letting a raw index fail.
+    #[test]
+    fn validate_study_rejects_a_run_protocol_step_naming_a_protocol_that_is_not_there() {
+        let study = study_with_protocol(1, 0);
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("runs protocol 1"), "{err}");
+        assert!(err.contains("this study carries 1"), "{err}");
+    }
+
+    #[test]
+    fn validate_study_rejects_a_run_protocol_step_entering_at_a_state_that_is_not_there() {
+        let study = study_with_protocol(0, 7);
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("at state 7"), "{err}");
+        assert!(err.contains("declares 2 states"), "{err}");
+    }
+
+    /// The crate's own `validate_protocol` is *called*, not reimplemented —
+    /// the posture `validate_taps` already takes, so there is no second copy
+    /// of the rules to drift from. This asserts the call happens by feeding
+    /// it a manifest only that function can reject.
+    #[test]
+    fn validate_study_runs_the_crates_own_protocol_validation() {
+        use embarch_study_designer::{StateDef, StateKind, TerminalOutcome};
+
+        let mut study = study_with_protocol(0, 0);
+        // A `goto` past the end of `states`. Nothing in Core knows this rule;
+        // `validate_protocol` does.
+        study.protocols[0].states.push(StateDef {
+            name: heapless::String::try_from("stray").unwrap(),
+            kind: StateKind::Terminal(TerminalOutcome::Fail),
+        }).unwrap();
+        let embarch_study_designer::StateKind::Active(active) =
+            &mut study.protocols[0].states[0].kind
+        else {
+            panic!("state 0 is active");
+        };
+        active.on_event[0].otherwise = Some(9);
+        study.protocols_crc = protocols_crc(&study.protocols).unwrap();
+
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("is not executable"), "{err}");
+        assert!(err.contains("state 9"), "{err}");
+    }
+
     /// The two seals are checked independently, so a corrupt tap list is
     /// reported as a `streams_crc` failure and leaves `steps_crc`'s verdict
     /// alone — which is the property having two of them exists for.
@@ -3044,6 +3288,72 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `StepResult.protocol` reaches `events.json` (embarch-study-designer/
+    /// design.md §3 decision 62), and it does so through serde rather than
+    /// through anything this file writes by hand.
+    ///
+    /// Asserted rather than assumed. `EventsJsonWriter` hand-writes the
+    /// *envelope* — `study_name`, the `steps` array's brackets, `provenance`,
+    /// `streams` — and serializes each `StepResult` with serde, so a new
+    /// field on that type lands automatically while a new field on
+    /// `StudyResult` does not. `validations` was hardcoded here for a whole
+    /// milestone as a `[]` Core had never evaluated anything into, which is
+    /// exactly why the distinction is worth a test rather than a reading.
+    #[test]
+    fn events_json_carries_a_protocol_runs_final_state() {
+        use embarch_study_designer::result::ProtocolOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = EventsJsonWriter::start(
+            dir.path(),
+            "test-study",
+            &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default()),
+        )
+        .unwrap();
+
+        let mut result = test_step_result("handshake");
+        // The step timed out while the machine was sitting in `aborting` —
+        // the case the two fields exist to tell apart, and the one where
+        // reading either from the other would be wrong.
+        result.outcome = embarch_study_designer::Outcome::TimedOut;
+        result.protocol = Some(ProtocolOutcome {
+            final_state: heapless::String::try_from("aborting").unwrap(),
+            outcome: embarch_study_designer::Outcome::Fail {
+                reason: heapless::String::try_from("protocol reached terminal state aborting")
+                    .unwrap(),
+            },
+        });
+        writer.write_step(&result).unwrap();
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let step = &json["steps"][0];
+
+        assert_eq!(step["outcome"], "TimedOut", "the step's own outcome");
+        assert_eq!(step["protocol"]["final_state"], "aborting");
+        assert_eq!(
+            step["protocol"]["outcome"]["Fail"]["reason"],
+            "protocol reached terminal state aborting"
+        );
+
+        // And a step that ran no protocol says so, rather than omitting the
+        // key: `#[serde(default)]` makes an absent key legal on the way in,
+        // but on the way out a reader should not have to tell "no protocol
+        // ran" apart from "this Core is too old to say".
+        let mut writer2 = EventsJsonWriter::start(
+            dir.path(),
+            "test-study",
+            &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default()),
+        )
+        .unwrap();
+        writer2.write_step(&test_step_result("advertise")).unwrap();
+        writer2.finish().unwrap();
+        let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["steps"][0]["protocol"].is_null(), "a non-protocol step reports null");
     }
 
     #[test]
