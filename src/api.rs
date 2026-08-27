@@ -88,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
+        .route("/study/{study_id}/steps", get(study::study_steps_handler))
         .route("/study/{study_id}/streams", get(study::stream_index_handler))
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
         .route("/study/{study_id}/power-data", get(study::power_data_handler))

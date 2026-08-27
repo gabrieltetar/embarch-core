@@ -1012,6 +1012,16 @@ pub async fn post_study_handler(
     })
     .await;
 
+    // **When step 0's window opens.** Core has just finished handing
+    // dev-bench the study, so from here on it is waiting for step 0's
+    // `StepResult` — which is exactly what the step row above the trace
+    // draws as step 0's band. Taken here rather than inside
+    // `run_study_to_completion`, because that function's first act is to
+    // create directories and a stream store, and charging that to the DUT's
+    // first step would misplace every band after it by however long the disk
+    // took.
+    let study_start_utc_ms = current_utc_ms();
+
     let (link, overrides) = match started {
         Ok((Ok(overrides), link)) => (link, overrides),
         Ok((Err(rejection), _link)) => {
@@ -1066,6 +1076,7 @@ pub async fn post_study_handler(
                 events_tx,
                 provenance,
                 manifest_slot,
+                study_start_utc_ms,
             )
         })
         .await;
@@ -1122,6 +1133,7 @@ struct Capture {
 /// (design.md §5.1 steps 8+, §5.2, and `embarch-core/design.md` §3 decisions
 /// 30/31). Entirely blocking — called from `spawn_blocking` by
 /// [`post_study_handler`].
+#[allow(clippy::too_many_arguments)]
 fn run_study_to_completion(
     mut link: DevBenchLink,
     study: Study,
@@ -1130,6 +1142,7 @@ fn run_study_to_completion(
     events_tx: broadcast::Sender<StudyEvent>,
     provenance: Provenance,
     manifest_slot: crate::outpost_manifest::ManifestSlot,
+    study_start_utc_ms: u64,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -1269,6 +1282,16 @@ fn run_study_to_completion(
     let mut signal_taps: HashMap<u8, SignalTapReader> = HashMap::new();
     let mut next_expected: usize = 0;
     let mut deadline = next_deadline(&capture.study, next_expected, Instant::now());
+    // The **beginning** of the step Core is currently waiting for, on Core's
+    // own wall clock. Step 0's is when `StudyStart` went out; every later
+    // step's is when the previous step's `StepResult` arrived, because that
+    // is the instant dev-bench moved on to it. Both edges of a step come from
+    // here rather than from the wire: `StepResult` deliberately carries no
+    // timestamp (that would be a dev-bench wire bump, a schema version and a
+    // third clock in the picture), and Core's own arrival stamp is the same
+    // posture the reserved `dev-bench` tap and `outpost.arrival.csv` already
+    // take.
+    let mut step_started_utc_ms = study_start_utc_ms;
 
     if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, 0) {
         stop_signal_taps(&mut signal_taps);
@@ -1281,9 +1304,26 @@ fn run_study_to_completion(
     let outcome = loop {
         match link.recv(deadline) {
             Ok(Received::Message(DevBenchMessage::StepResult { step_index, result })) => {
-                if let Err(e) = writer.write_step(&result) {
+                let step_ended_utc_ms = current_utc_ms();
+                // `delay_before_ms` comes from the `Study` Core is holding, so
+                // the split between "waiting because the study said to" and
+                // "running" costs nothing to record. It falls *inside* the
+                // step's window, which is correct — dev-bench sleeps it as
+                // part of dispatching the step (`next_deadline`'s own comment)
+                // — and a row that did not separate the two would report
+                // `close-nus-window` as a five-second step.
+                let delay_before_ms = capture
+                    .study
+                    .steps
+                    .get(step_index as usize)
+                    .map(|s| s.delay_before_ms)
+                    .unwrap_or(0);
+                if let Err(e) =
+                    writer.write_step(&result, step_started_utc_ms, step_ended_utc_ms, delay_before_ms)
+                {
                     break Err(format!("failed to write step {step_index}'s result to events.json: {e:?}"));
                 }
+                step_started_utc_ms = step_ended_utc_ms;
                 let _ = events_tx.send(StudyEvent::StepCompleted {
                     study_id: study_id.clone(),
                     step_index,
@@ -2302,11 +2342,37 @@ impl EventsJsonWriter {
         })
     }
 
-    fn write_step(&mut self, result: &StepResult) -> anyhow::Result<()> {
+    /// One step, plus the two edges of the window Core waited for it across
+    /// and the delay the study declared before it.
+    ///
+    /// The three extra keys are **flattened onto** the `StepResult` rather
+    /// than nested beside it, so a reader that already knows this file's step
+    /// shape keeps working and `serde(flatten)` streams straight into the
+    /// writer — no per-step `serde_json::Value` tree, which is the sort of
+    /// accumulate-then-write this whole type exists to avoid.
+    fn write_step(
+        &mut self,
+        result: &StepResult,
+        started_utc_ms: u64,
+        ended_utc_ms: u64,
+        delay_before_ms: u32,
+    ) -> anyhow::Result<()> {
+        #[derive(Serialize)]
+        struct TimedStep<'a> {
+            #[serde(flatten)]
+            result: &'a StepResult,
+            started_utc_ms: u64,
+            ended_utc_ms: u64,
+            delay_before_ms: u32,
+        }
+
         if self.wrote_any_step {
             write!(self.file, ",")?;
         }
-        serde_json::to_writer(&mut self.file, result)?;
+        serde_json::to_writer(
+            &mut self.file,
+            &TimedStep { result, started_utc_ms, ended_utc_ms, delay_before_ms },
+        )?;
         self.wrote_any_step = true;
         if let Outcome::Fail { reason } = &result.outcome {
             self.last_failed_step =
@@ -2603,6 +2669,153 @@ fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexRespons
             })
             .collect(),
     }
+}
+
+// ---- GET /study/{study_id}/steps -------------------------------------------
+
+/// One step as `events.json` records it, reduced to what a reader placing it
+/// on a timeline needs.
+///
+/// `outcome` is flattened to a bare string plus a separate `reason` rather
+/// than served as [`Outcome`]'s own externally-tagged JSON. A caller drawing a
+/// band wants "which of the three, and why not" — not to re-implement the
+/// enum's wire shape to find out.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyStepEntryResponse {
+    /// Position in the study's own `steps`, which is the order this file was
+    /// written in — `events.json` streams one entry per `StepResult` as it
+    /// arrives, so the index is the array's and needs no separate field on
+    /// disk to be trustworthy.
+    pub index: usize,
+    pub step_name: String,
+    /// `"Pass"`, `"Fail"` or `"TimedOut"`.
+    pub outcome: String,
+    /// dev-bench's own words, on a `Fail` and never otherwise.
+    pub reason: Option<String>,
+    /// The delay the study declared before this step. `None` for a study run
+    /// before Core recorded it.
+    pub delay_before_ms: Option<u32>,
+    /// When Core started waiting for this step, and when its `StepResult`
+    /// arrived — both on Core's wall clock, in UTC milliseconds. `None` for a
+    /// study run before 2026-08-27, when Core did not record them; said as
+    /// absent rather than filled in with a guess.
+    pub started_utc_ms: Option<u64>,
+    pub ended_utc_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyStepsResponse {
+    pub study_name: Option<String>,
+    /// Whether every step here carries both of its stamps. The one thing a
+    /// caller has to branch on, computed once here rather than by each caller
+    /// scanning for a `None`.
+    pub timed: bool,
+    pub steps: Vec<StudyStepEntryResponse>,
+}
+
+/// `events.json`'s own shape, read back. Every added field is
+/// `#[serde(default)]` because this file is written by whatever Core was
+/// installed when the study ran, and a capture from before the stamps existed
+/// is an expected input rather than a corrupt one.
+#[derive(Debug, Deserialize)]
+struct EventsFileForSteps {
+    #[serde(default)]
+    study_name: Option<String>,
+    #[serde(default)]
+    steps: Vec<EventsFileStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsFileStep {
+    #[serde(default)]
+    step_name: String,
+    #[serde(default)]
+    outcome: serde_json::Value,
+    #[serde(default)]
+    started_utc_ms: Option<u64>,
+    #[serde(default)]
+    ended_utc_ms: Option<u64>,
+    #[serde(default)]
+    delay_before_ms: Option<u32>,
+}
+
+/// Splits [`Outcome`]'s serialized form into a name and, for a `Fail`, the
+/// reason dev-bench sent. Anything else is reported verbatim rather than
+/// coerced into one of the three — a shape this build does not recognise is
+/// news, not a `Fail`.
+fn outcome_name_and_reason(outcome: &serde_json::Value) -> (String, Option<String>) {
+    match outcome {
+        serde_json::Value::String(s) => (s.clone(), None),
+        serde_json::Value::Object(map) => match map.iter().next() {
+            Some((name, body)) => (
+                name.clone(),
+                body.get("reason").and_then(|r| r.as_str()).map(|r| r.to_string()),
+            ),
+            None => ("(unrecorded)".to_string(), None),
+        },
+        other => (other.to_string(), None),
+    }
+}
+
+/// Every step this study recorded, with the two edges of the window Core
+/// waited for each across.
+///
+/// A disk read like `stream_index_handler`, not a registry lookup: the job
+/// registry is in memory and a study outlives the Core process that ran it,
+/// which is exactly the case a post-hoc trace is being read in.
+pub async fn study_steps_handler(
+    Path(study_id): Path<String>,
+) -> Result<Json<StudyStepsResponse>, (StatusCode, String)> {
+    let dir = study_results_dir(&study_id).map_err(internal_err)?;
+    let path = dir.join("events.json");
+    let text = tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
+        .await
+        .map_err(internal_err)?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "study '{study_id}' has no events.json (it never finished, or Core has since                      swept it)"
+                ),
+            ),
+            _ => internal_err(e),
+        })?;
+    let parsed: EventsFileForSteps = serde_json::from_str(&text).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("study '{study_id}' has an events.json this build cannot read: {e}"),
+        )
+    })?;
+
+    Ok(Json(steps_response(parsed)))
+}
+
+/// [`study_steps_handler`]'s whole body minus the disk read, so the shaping
+/// is testable without a writable results root.
+fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
+    let steps: Vec<StudyStepEntryResponse> = parsed
+        .steps
+        .into_iter()
+        .enumerate()
+        .map(|(index, s)| {
+            let (outcome, reason) = outcome_name_and_reason(&s.outcome);
+            StudyStepEntryResponse {
+                index,
+                step_name: s.step_name,
+                outcome,
+                reason,
+                delay_before_ms: s.delay_before_ms,
+                started_utc_ms: s.started_utc_ms,
+                ended_utc_ms: s.ended_utc_ms,
+            }
+        })
+        .collect();
+    // An empty study is **not** timed. "Every step carries a stamp" is
+    // vacuously true of no steps, and a caller reading `timed: true` off an
+    // empty list would go looking for a time base that is not there.
+    let timed = !steps.is_empty()
+        && steps.iter().all(|s| s.started_utc_ms.is_some() && s.ended_utc_ms.is_some());
+    StudyStepsResponse { study_name: parsed.study_name, timed, steps }
 }
 
 // ---- GET /study/{study_id}/stream/{name}, and the three routes it replaces --
@@ -3417,14 +3630,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.last_failed_step(), None, "nothing has failed yet");
-        writer.write_step(&test_step_result("connect")).unwrap();
+        writer.write_step(&test_step_result("connect"), 0, 0, 0).unwrap();
         assert_eq!(writer.last_failed_step(), None, "a Pass must not register as a failure");
 
         writer
-            .write_step(&failed_step_result(
-                "batchmgr-stop",
-                "disconnected during service discovery (HCI 0x08, supervision tim",
-            ))
+            .write_step(
+                &failed_step_result(
+                    "batchmgr-stop",
+                    "disconnected during service discovery (HCI 0x08, supervision tim",
+                ),
+                0,
+                0,
+                0,
+            )
             .unwrap();
         assert_eq!(
             writer.last_failed_step(),
@@ -3434,6 +3652,103 @@ mod tests {
             )),
             "the reason is the diagnosis and must survive verbatim"
         );
+    }
+
+    /// **The two edges of a step, and the delay it declared, land in
+    /// `events.json`.** Until 2026-08-27 a step entry carried `step_name`,
+    /// `outcome`, `captured_data`, `gatt_services`, `security_level` and
+    /// `protocol` — and no time at all — so nothing downstream could say
+    /// which step was running at a given instant. That is the one piece of
+    /// context that turns an outpost timeline into a diagnosis.
+    ///
+    /// The stamps are Core's own (`current_utc_ms`), not dev-bench's:
+    /// `StepResult` deliberately carries no timestamp, because putting one
+    /// there would be a wire bump, a schema version, and a third clock in a
+    /// picture that already has two.
+    #[test]
+    fn the_writer_records_both_edges_of_a_step_and_the_delay_it_declared() {
+        let dir = std::env::temp_dir().join(format!("embarch-stepstamps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = EventsJsonWriter::start(
+            &dir,
+            "timed-study",
+            &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default()),
+        )
+        .unwrap();
+        writer.write_step(&test_step_result("ble-speed-fast"), 1_700_000_000_000, 1_700_000_000_250, 0).unwrap();
+        writer
+            .write_step(&test_step_result("close-nus-window"), 1_700_000_000_250, 1_700_000_005_400, 5_000)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let text = std::fs::read_to_string(dir.join("events.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let steps = value["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["step_name"], "ble-speed-fast");
+        assert_eq!(steps[0]["started_utc_ms"], 1_700_000_000_000u64);
+        assert_eq!(steps[0]["ended_utc_ms"], 1_700_000_000_250u64);
+        assert_eq!(steps[0]["delay_before_ms"], 0);
+        // The second step's window opens exactly where the first's closed —
+        // Core is waiting for step 1 from the instant step 0 reported in.
+        assert_eq!(steps[1]["started_utc_ms"], 1_700_000_000_250u64);
+        assert_eq!(steps[1]["delay_before_ms"], 5_000);
+        // Flattened onto the step, not nested beside it, so a reader that
+        // already knows this file's step shape keeps working.
+        assert!(steps[0].get("outcome").is_some(), "the StepResult's own fields survive the flatten");
+        assert!(steps[0].get("result").is_none(), "the StepResult must not be nested under a key");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /study/{id}/steps` reduces `Outcome`'s externally-tagged JSON to
+    /// a name plus a reason. A caller drawing a band wants "which of the
+    /// three, and why not" — not to re-implement the enum's wire shape.
+    #[test]
+    fn the_steps_response_splits_an_outcome_into_a_name_and_a_reason() {
+        let parsed: EventsFileForSteps = serde_json::from_str(
+            r#"{"study_name":"s","steps":[
+                 {"step_name":"a","outcome":"Pass","started_utc_ms":10,"ended_utc_ms":20,"delay_before_ms":0},
+                 {"step_name":"b","outcome":{"Fail":{"reason":"HCI 0x08"}},"started_utc_ms":20,"ended_utc_ms":30,"delay_before_ms":3000},
+                 {"step_name":"c","outcome":"TimedOut","started_utc_ms":30,"ended_utc_ms":150030,"delay_before_ms":0}]}"#,
+        )
+        .unwrap();
+        let out = steps_response(parsed);
+        assert!(out.timed);
+        assert_eq!(out.steps[0].outcome, "Pass");
+        assert_eq!(out.steps[0].reason, None);
+        assert_eq!(out.steps[1].outcome, "Fail");
+        assert_eq!(out.steps[1].reason.as_deref(), Some("HCI 0x08"));
+        assert_eq!(out.steps[1].delay_before_ms, Some(3_000));
+        assert_eq!(out.steps[2].outcome, "TimedOut");
+        assert_eq!(out.steps[2].index, 2, "the index is the array's own order");
+    }
+
+    /// A study run before Core recorded the stamps is an expected input, not
+    /// a corrupt one — it reads back with every stamp absent and `timed`
+    /// false, so a caller draws nothing rather than bands at invented
+    /// positions.
+    #[test]
+    fn a_study_from_before_the_stamps_reads_back_as_untimed() {
+        let parsed: EventsFileForSteps = serde_json::from_str(
+            r#"{"study_name":"s","steps":[{"step_name":"a","outcome":"Pass"}]}"#,
+        )
+        .unwrap();
+        let out = steps_response(parsed);
+        assert!(!out.timed);
+        assert_eq!(out.steps[0].started_utc_ms, None);
+        assert_eq!(out.steps[0].delay_before_ms, None);
+    }
+
+    /// "Every step carries a stamp" is vacuously true of no steps, and a
+    /// caller reading `timed: true` off an empty list would go looking for a
+    /// time base that is not there.
+    #[test]
+    fn a_study_with_no_steps_is_not_timed() {
+        let parsed: EventsFileForSteps =
+            serde_json::from_str(r#"{"study_name":"s","steps":[]}"#).unwrap();
+        assert!(!steps_response(parsed).timed);
     }
 
     fn test_step_result(name: &str) -> StepResult {
@@ -3501,7 +3816,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default())).unwrap();
-        writer.write_step(&test_step_result("step-0")).unwrap();
+        writer.write_step(&test_step_result("step-0"), 0, 0, 0).unwrap();
 
         finish_job(&jobs, &events_tx, "abc", writer);
 
@@ -3586,7 +3901,7 @@ mod tests {
                     .unwrap(),
             },
         });
-        writer.write_step(&result).unwrap();
+        writer.write_step(&result, 0, 0, 0).unwrap();
         writer.finish().unwrap();
 
         let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
@@ -3610,7 +3925,7 @@ mod tests {
             &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default()),
         )
         .unwrap();
-        writer2.write_step(&test_step_result("advertise")).unwrap();
+        writer2.write_step(&test_step_result("advertise"), 0, 0, 0).unwrap();
         writer2.finish().unwrap();
         let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3710,8 +4025,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut writer = EventsJsonWriter::start(&dir, "s", &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default())).unwrap();
-        writer.write_step(&test_step_result("a")).unwrap();
-        writer.write_step(&test_step_result("b")).unwrap();
+        writer.write_step(&test_step_result("a"), 0, 0, 0).unwrap();
+        writer.write_step(&test_step_result("b"), 0, 0, 0).unwrap();
         assert!(dir.join("events.json.partial").exists());
         assert!(!dir.join("events.json").exists());
 
