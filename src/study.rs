@@ -39,9 +39,28 @@ use crate::token_store;
 
 /// Host-side watchdog grace margin, on top of a step's own `timeout_ms`
 /// (`embarch-study-designer/design.md` §3 decision 16's amendment, §7). §7
-/// documents this exact constant as an unsized placeholder, not a validated
-/// value — 2000ms is what's used until real dev-bench timing narrows it.
-const WATCHDOG_GRACE_MS: u64 = 2_000;
+/// documented this constant as an unsized placeholder awaiting real
+/// dev-bench timing; **2026-08-27 is that timing, and 2000ms was too small.**
+///
+/// What this margin actually has to cover, which the placeholder did not
+/// account for: dev-bench decides a step is over on its own clock, and only
+/// *then* tears down subscriptions, drains its transcript queue and encodes
+/// a `StepResult` — all of which queue behind whatever stream data is still
+/// in flight on the same serial link. So the margin scales with how much a
+/// step captured, not with anything constant.
+///
+/// Measured: a 300s `RunProtocol` step that moved ~13KB of GATT notification
+/// payload plus its transcript reported *later* than 2000ms after its own
+/// deadline, so Core declared the bench dead and discarded a study whose
+/// capture was sitting complete on disk (study `84ba8e97`, close-nus-window
+/// StepResult at 05:17:59.122, give-up at 05:23:04.299 — exactly
+/// `3000 + 300_000 + 2000`).
+///
+/// 10s rather than a computed budget: the margin exists to notice a bench
+/// that has *stopped talking*, and a live bench is streaming the whole time,
+/// so over-waiting costs only how fast a genuinely dead link is called. Under-
+/// waiting throws away a completed capture, which is strictly worse.
+const WATCHDOG_GRACE_MS: u64 = 10_000;
 
 /// How long Core waits for `HelloAck` after sending `Hello` before giving up
 /// on the handshake. Core's own choice (the design doc doesn't specify one),
