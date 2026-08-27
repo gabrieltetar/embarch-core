@@ -315,7 +315,31 @@ pub fn render(
         },
     };
 
-    let mut header: Option<embarch_study_designer::outpost::OutpostHeader> = None;
+    // **The header is found before a single row is written, not when the loop
+    // reaches it.** This function's own contract is that decoding post-hoc
+    // "means a header frame that arrived late still names every record before
+    // it", and until 2026-08-27 it did not: `applied` and `cycles_per_sec`
+    // were latched inside the row loop, so every record that arrived before
+    // the first header rendered with an empty `name` and an empty `us`. On the
+    // real reference-dut captures that was ~490 of 9205 rows -- a fifth of a
+    // capture, unnamed and untimed, in a file whose header says
+    // `named: true`.
+    //
+    // Retroactive application is exactly as sound as forward application, and
+    // for the same reason: `header.is_none()` below latches the FIRST header
+    // and applies it to every frame after it, which already assumes one
+    // firmware build per capture. A record eight frames earlier came from that
+    // same build, on that same clock. What is refused is not retroactivity but
+    // *invention* -- with no header anywhere in the capture, `us` and `name`
+    // stay empty, which is the case the comment at the render site describes.
+    let header: Option<embarch_study_designer::outpost::OutpostHeader> =
+        outpost::chunks(&raw).find_map(|chunk| {
+            let mut probe = vec![0u8; chunk.len().max(64)];
+            match outpost::decode_frame(chunk, &mut probe) {
+                Ok(Frame::Header { header, .. }) => Some(header),
+                _ => None,
+            }
+        });
     let mut applied: Option<&OutpostManifest> = None;
     let mut refusal = manifest.map(|_| ManifestRefusal::None);
     if manifest.is_none() {
@@ -338,6 +362,23 @@ pub fn render(
         arrival_refusal: None,
     };
     let mut last_seq: Option<u8> = None;
+
+    // Applied here rather than in the loop, so it covers the rows the header
+    // was late for. `cycles_per_sec` likewise: it is read once, from the same
+    // header, and every row divides by it.
+    if let Some(h) = header.as_ref() {
+        outcome.firmware_build_id = Some(h.build_id.as_str().to_string());
+        if let Some(m) = manifest {
+            match m.check(h.build_id.as_str(), h.record_layout_version) {
+                Ok(()) => {
+                    applied = Some(m);
+                    refusal = None;
+                }
+                Err(why) => refusal = Some(why),
+            }
+        }
+    }
+    let cycles_per_sec = header.as_ref().map(|h| h.cycles_per_sec).unwrap_or(0);
 
     // The DUT's cycle counter is 32-bit and absolute, so a long trace wraps.
     // One unwrapper for the whole stream, in frame order, because a wrap is
@@ -381,21 +422,11 @@ pub fn render(
         last_seq = Some(seq);
 
         match frame {
-            Frame::Header { header: h, .. } => {
-                if header.is_none() {
-                    outcome.firmware_build_id = Some(h.build_id.as_str().to_string());
-                    if let Some(m) = manifest {
-                        match m.check(h.build_id.as_str(), h.record_layout_version) {
-                            Ok(()) => {
-                                applied = Some(m);
-                                refusal = None;
-                            }
-                            Err(why) => refusal = Some(why),
-                        }
-                    }
-                    header = Some(h);
-                }
-            }
+            // Already read, by the pre-pass above -- a header frame carries
+            // no records, so reaching one here has nothing left to do but let
+            // its `seq` count towards the lost-frame arithmetic, which the
+            // code above this match has already done.
+            Frame::Header { .. } => {}
             Frame::Records { records, seq } => {
                 if rx_utc_ms.is_some() {
                     outcome.stamped_frames += 1;
@@ -410,12 +441,12 @@ pub fn render(
                         outcome.dropped_at_source += u64::from(record.a);
                     }
                     // `cycles_per_sec` comes from the header frame, so a
-                    // stream whose header was lost or corrupt renders an empty
+                    // stream with no header anywhere in it renders an empty
                     // `us` column rather than a wrong one -- the cycle count
                     // itself is still exact, and inventing a rate to divide it
                     // by is the plausible-and-wrong answer this module refuses
-                    // everywhere else.
-                    let cycles_per_sec = header.as_ref().map(|h| h.cycles_per_sec).unwrap_or(0);
+                    // everywhere else. What it no longer does is leave `us`
+                    // empty merely because the header had not arrived *yet*.
                     let absolute = unwrapper.absolute(record.cycles);
                     writeln!(
                         out,
@@ -606,6 +637,69 @@ mod tests {
         }
         // And the losses are visible as losses.
         assert!(csv.contains(",gap,"), "a gap record was not rendered as a gap");
+    }
+
+    /// **A header that arrives late still names and times the records before
+    /// it.** [`render`]'s own doc comment has claimed this since it was
+    /// written, and until 2026-08-27 it was false: the manifest and
+    /// `cycles_per_sec` were latched when the loop *reached* the header frame,
+    /// so on the real reference-dut captures ~490 of 9205 rows -- every record
+    /// emitted in the first second, before the header repeat -- rendered with
+    /// an empty `name` and an empty `us`, inside a stream whose
+    /// `index.json` said `named: true`.
+    ///
+    /// The fixture's own first frame is its header, because the firmware emits
+    /// one at startup, so the case has to be constructed: the header frame is
+    /// moved behind two record frames, which is exactly what a capture that
+    /// began mid-stream looks like.
+    #[test]
+    fn a_header_arriving_late_still_names_and_times_the_rows_before_it() {
+        // COBS frames, 0x00-delimited, delimiters kept with their frame.
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut cur = Vec::new();
+        for &b in REAL_CAPTURE {
+            cur.push(b);
+            if b == 0 {
+                frames.push(std::mem::take(&mut cur));
+            }
+        }
+        assert!(frames.len() > 4, "the fixture must have frames to reorder");
+        let head = frames.remove(0);
+        frames.insert(2, head);
+        let reordered: Vec<u8> = frames.concat();
+
+        let manifest = parse(REAL_MANIFEST).expect("the real manifest parses");
+        let dir = scratch_dir("late-header");
+        let raw = dir.join("outpost.bin");
+        let out = dir.join("outpost.trace.csv");
+        std::fs::write(&raw, &reordered).unwrap();
+        let outcome = render(&raw, &out, None, Some(&manifest)).expect("renders");
+        let csv = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(outcome.refusal, None, "the capture's own manifest was refused");
+        assert_eq!(outcome.bad_frames, 0, "reordering whole frames broke one");
+
+        // The rows from the two frames that preceded the header are the point.
+        let early: Vec<&str> =
+            csv.lines().skip(1).take_while(|l| l.starts_with("0,") || l.starts_with("1,")).collect();
+        assert!(!early.is_empty(), "the reordered capture has no pre-header rows");
+        for line in &early {
+            let us = line.split(',').nth(4).expect("a us column");
+            assert!(
+                !us.is_empty(),
+                "a row before the header rendered no us, so cycles_per_sec was not applied \
+                 retroactively: {line}"
+            );
+        }
+        // And a name, for whichever of those rows the manifest can name at all.
+        assert!(
+            early.iter().any(|l| {
+                let name = l.split(',').nth(8).unwrap_or("");
+                !name.is_empty()
+            }),
+            "no row before the header resolved a name out of the manifest"
+        );
     }
 
     #[test]
@@ -811,5 +905,33 @@ mod tests {
             slot.current().is_none(),
             "with two candidates Core must decline rather than pick one"
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_render {
+    /// Renders an arbitrary capture on disk, for measuring a real study's
+    /// bytes against a change to [`super::render`] without a deploy. Ignored
+    /// by default; drive it with
+    /// `EMBARCH_RENDER_IN=<dir with outpost.bin> cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs EMBARCH_RENDER_IN pointing at a captured study's streams dir"]
+    fn render_a_capture_from_disk() {
+        let dir = std::path::PathBuf::from(std::env::var("EMBARCH_RENDER_IN").unwrap());
+        let manifest_path = std::env::var("EMBARCH_RENDER_MANIFEST").ok();
+        let manifest = manifest_path.map(|p| {
+            super::parse(&std::fs::read_to_string(p).unwrap()).expect("the manifest parses")
+        });
+        let out = std::env::var("EMBARCH_RENDER_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| dir.join("outpost.trace.csv"));
+        let outcome = super::render(
+            &dir.join("outpost.bin"),
+            &out,
+            Some(&dir.join("outpost.arrival.csv")),
+            manifest.as_ref(),
+        )
+        .expect("renders");
+        println!("{outcome:#?}");
     }
 }
