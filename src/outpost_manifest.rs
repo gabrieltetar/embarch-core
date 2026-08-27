@@ -183,6 +183,18 @@ pub struct RenderOutcome {
     pub refusal: Option<ManifestRefusal>,
     /// The build ID the firmware reported, when a header frame was found.
     pub firmware_build_id: Option<String>,
+    /// The header's `flags` byte verbatim, when a header frame was found —
+    /// which hook families the running firmware actually compiled in
+    /// (`HeaderFlags`).
+    ///
+    /// Carried raw rather than as a set of booleans so a firmware that grows a
+    /// flag needs no change here: Core's job is to move the byte to whoever
+    /// renders it, and it has no opinion about any bit. The one bit that is
+    /// then read out of it, in `study.rs` where the index entry is written, is
+    /// `TRACE_SELF` — because a trace that excludes its own instrument is
+    /// *incomplete*, and every other thing that makes a trace incomplete is
+    /// already reported on the entry beside it.
+    pub header_flags: Option<u8>,
     /// Frames that got a receipt time out of the arrival log — the trace's only
     /// clock (`embarch-outpost/design.md` §3 decisions 17, 18). Zero means
     /// every row rendered with an empty `rx_utc_ms`: an ordered, untimed
@@ -358,6 +370,7 @@ pub fn render(
         dropped_at_source: 0,
         refusal: None,
         firmware_build_id: None,
+        header_flags: None,
         stamped_frames: 0,
         arrival_refusal: None,
     };
@@ -368,6 +381,7 @@ pub fn render(
     // header, and every row divides by it.
     if let Some(h) = header.as_ref() {
         outcome.firmware_build_id = Some(h.build_id.as_str().to_string());
+        outcome.header_flags = Some(h.flags);
         if let Some(m) = manifest {
             match m.check(h.build_id.as_str(), h.record_layout_version) {
                 Ok(()) => {

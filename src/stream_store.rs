@@ -213,6 +213,24 @@ pub struct StreamIndexEntry {
     /// have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed: Option<bool>,
+    /// Whether the firmware kept **itself** out of this trace —
+    /// `CONFIG_EMBARCH_OUTPOST_TRACE_SELF=n`, which is the default, read off
+    /// the header frame's own flags byte
+    /// (`embarch-outpost/design.md` §3 decision 19).
+    ///
+    /// The third way a trace can be incomplete, and the only one the *firmware*
+    /// decides rather than the host: no record describes the outpost's own
+    /// drain thread or its own UART's interrupt, so intervals covered by no
+    /// lane are the instrument's own rather than unexplained. `true` is the
+    /// normal, useful setting — without it a quiet DUT's trace is half a
+    /// description of its own transmission.
+    ///
+    /// A boolean beside `named`/`timed` rather than the raw flags byte, for the
+    /// reason those two exist: this is the fact a caller branches on, and
+    /// anything that wanted to branch on a *different* bit would be a caller
+    /// this suite does not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_excluded: Option<bool>,
 }
 
 impl StreamIndex {
@@ -555,6 +573,7 @@ impl StreamStore {
                 note: None,
                 named: None,
                 timed: None,
+                self_excluded: None,
             });
         }
 

@@ -1478,13 +1478,15 @@ fn render_outpost_traces(
         return;
     };
 
-    /// Per tap: the rendered file name, the human note, and the two facts a
-    /// caller branches on — whether it is named, and whether it is timed.
+    /// Per tap: the rendered file name, the human note, and the three facts a
+    /// caller branches on — whether it is named, whether it is timed, and
+    /// whether the firmware kept itself out of it.
     struct Rendered {
         file: String,
         note: String,
         named: bool,
         timed: bool,
+        self_excluded: Option<bool>,
     }
     let mut results: HashMap<String, Rendered> = HashMap::new();
 
@@ -1534,6 +1536,27 @@ fn render_outpost_traces(
                             .to_string(),
                     );
                 }
+                // A third way for a trace to be incomplete, and the only one
+                // the *firmware* decides rather than the host: with
+                // CONFIG_EMBARCH_OUTPOST_TRACE_SELF=n (the default) no record
+                // describes the outpost's own drain thread or its own UART's
+                // interrupt, so the timeline is not an account of everything
+                // the CPU did. Said out loud for the same reason the other two
+                // are — an absence of records is indistinguishable from an
+                // idle subject, and a reader must not have to infer a build
+                // option from a measurement.
+                let self_excluded = outcome
+                    .header_flags
+                    .map(|f| f & embarch_study_designer::outpost::HeaderFlags::TRACE_SELF == 0);
+                if self_excluded == Some(true) {
+                    notes.push(
+                        "SELF-EXCLUDED: the firmware kept the outpost's own drain thread and \
+                         its own UART's interrupt out of this trace \
+                         (CONFIG_EMBARCH_OUTPOST_TRACE_SELF=n), so intervals covered by no \
+                         lane are the instrument's own and are not unexplained."
+                            .to_string(),
+                    );
+                }
                 let note = notes.join(" ");
                 tracing::info!(
                     name = tap.name.as_str(),
@@ -1544,6 +1567,7 @@ fn render_outpost_traces(
                     dropped_at_source = outcome.dropped_at_source,
                     named = outcome.refusal.is_none(),
                     stamped_frames = outcome.stamped_frames,
+                    header_flags = ?outcome.header_flags,
                     "rendered an outpost trace"
                 );
                 results.insert(
@@ -1553,6 +1577,7 @@ fn render_outpost_traces(
                         note,
                         named: outcome.refusal.is_none(),
                         timed: outcome.stamped_frames > 0,
+                        self_excluded,
                     },
                 );
             }
@@ -1568,6 +1593,7 @@ fn render_outpost_traces(
                         note: format!("rendering failed: {e}"),
                         named: false,
                         timed: false,
+                        self_excluded: None,
                     },
                 );
             }
@@ -1587,6 +1613,7 @@ fn render_outpost_traces(
             }
             entry.named = Some(rendered.named);
             entry.timed = Some(rendered.timed);
+            entry.self_excluded = rendered.self_excluded;
         }
     }) {
         tracing::warn!("failed to record the outpost rendering in streams/index.json: {e:?}");
@@ -2347,6 +2374,13 @@ pub struct StreamIndexEntryResponse {
     pub named: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed: Option<bool>,
+    /// A third independent fact, and the only one the **firmware** decides:
+    /// whether the outpost kept its own drain thread and its own UART's
+    /// interrupt out of this trace (`embarch-outpost/design.md` §3 decision
+    /// 19, read off the header frame's flags). `true` means intervals covered
+    /// by no lane are the instrument's own rather than unexplained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_excluded: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2410,6 +2444,7 @@ fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexRespons
                 note: e.note,
                 named: e.named,
                 timed: e.timed,
+                self_excluded: e.self_excluded,
             })
             .collect(),
     }
@@ -4138,6 +4173,7 @@ mod tests {
                     note: Some("decoded but NOT named: manifest build_id \"a\" != firmware build_id \"b\"".to_string()),
                     named: Some(false),
                     timed: Some(true),
+                    self_excluded: Some(true),
                 },
                 stream_store::StreamIndexEntry {
                     id: 1,
@@ -4150,6 +4186,7 @@ mod tests {
                     note: None,
                     named: None,
                     timed: None,
+                    self_excluded: None,
                 },
             ],
         };
@@ -4168,6 +4205,12 @@ mod tests {
         // one of them wrong.
         assert_eq!(trace.named, Some(false));
         assert_eq!(trace.timed, Some(true));
+        // And a third, which the firmware decided rather than Core: this
+        // trace carries no record of the outpost's own drain thread or its own
+        // UART's interrupt, so a reader must not treat an interval no lane
+        // covers as unexplained.
+        assert_eq!(trace.self_excluded, Some(true));
+        assert_eq!(response.streams[1].self_excluded, None, "the question is meaningless here");
         // The unrefused tap says nothing, rather than saying "fine" — an
         // absent note is what "nothing to report" looks like.
         assert_eq!(response.streams[1].note, None);
@@ -4191,6 +4234,7 @@ mod tests {
                 note: None,
                 named: None,
                 timed: None,
+                self_excluded: None,
             }],
         };
         assert!(!stream_index_response(index).streams[0].rendered);
