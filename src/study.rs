@@ -2558,6 +2558,11 @@ mod tests {
             streams,
             steps_crc: steps_crc_value,
             streams_crc: streams_crc_value,
+            // embarch-study-designer/design.md §3 decision 58: this fixture
+            // runs no protocol, and an empty list's CRC is the genuine
+            // CRC-32 of zero bytes rather than a sentinel.
+            protocols: Default::default(),
+            protocols_crc: 0,
             dev_bench_log_level: Default::default(),
         }
     }
@@ -2937,6 +2942,9 @@ mod tests {
             // Decision 44's `security_level`, likewise: this fixture has no
             // link, and `None` is what a step with no connection reports.
             security_level: None,
+            // Decision 62's `protocol`: `None` for every action kind that
+            // is not `RunProtocol`, which is every one this fixture uses.
+            protocol: None,
         }
     }
 
