@@ -32,7 +32,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use embarch_study_designer::outpost::{self, Frame, ManifestRefusal, OutpostManifest, RecordKind};
+use embarch_study_designer::outpost::{
+    self, Frame, ManifestRefusal, OutpostManifest, RecordKind, Unwrapper,
+};
 
 /// The file a study's own copy of the manifest is written to, inside that
 /// study's results directory.
@@ -337,6 +339,12 @@ pub fn render(
     };
     let mut last_seq: Option<u8> = None;
 
+    // The DUT's cycle counter is 32-bit and absolute, so a long trace wraps.
+    // One unwrapper for the whole stream, in frame order, because a wrap is
+    // only detectable against the previous record's value -- restarting it per
+    // frame would lose every wrap that happens to fall on a frame boundary.
+    let mut unwrapper = Unwrapper::new();
+
     for (frame_index, chunk) in outpost::chunks(&raw).enumerate() {
         // The frame's own receipt time, or none. Looked up by index rather
         // than by position in a filtered list on purpose: a frame that fails
@@ -401,10 +409,25 @@ pub fn render(
                     if RecordKind::from_byte(record.kind) == Some(RecordKind::Gap) {
                         outcome.dropped_at_source += u64::from(record.a);
                     }
+                    // `cycles_per_sec` comes from the header frame, so a
+                    // stream whose header was lost or corrupt renders an empty
+                    // `us` column rather than a wrong one -- the cycle count
+                    // itself is still exact, and inventing a rate to divide it
+                    // by is the plausible-and-wrong answer this module refuses
+                    // everywhere else.
+                    let cycles_per_sec = header.as_ref().map(|h| h.cycles_per_sec).unwrap_or(0);
+                    let absolute = unwrapper.absolute(record.cycles);
                     writeln!(
                         out,
                         "{}",
-                        record.to_csv_row(frame_index as u64, seq, rx_utc_ms, applied)
+                        record.to_csv_row(
+                            frame_index as u64,
+                            u32::from(seq),
+                            rx_utc_ms,
+                            absolute,
+                            cycles_per_sec,
+                            applied,
+                        )
                     )?;
                 }
             }
@@ -438,7 +461,7 @@ mod tests {
         "schema": 1,
         "build_id": "v1.0-dirty+opabc+mdef",
         "outpost_version": "abc",
-        "record_layout_version": 2,
+        "record_layout_version": 3,
         "markers": {"0": "WORK_BEGIN"},
         "threads": {"0x20001234": "main"},
         "isrs": {"7": "nrfx_isr"},
@@ -464,7 +487,7 @@ mod tests {
     #[test]
     fn a_manifest_from_a_different_record_layout_is_refused_at_the_door() {
         let json =
-            MANIFEST_JSON.replace("\"record_layout_version\": 2", "\"record_layout_version\": 1");
+            MANIFEST_JSON.replace("\"record_layout_version\": 3", "\"record_layout_version\": 2");
         assert!(parse(&json).unwrap_err().contains("record layout version"));
     }
 
@@ -568,7 +591,7 @@ mod tests {
             "this capture deliberately overflows the ring; its gap records must be counted"
         );
 
-        assert!(csv.starts_with("frame_index,frame_seq,rx_utc_ms,kind,a,b,name\n"));
+        assert!(csv.starts_with("frame_index,frame_seq,rx_utc_ms,cycles,us,kind,a,b,name\n"));
         // Nobody stamped this capture, so every row's time column is empty —
         // stated rather than filled in.
         assert_eq!(outcome.stamped_frames, 0);
