@@ -29,6 +29,11 @@ pub const DEV_BENCH_BAUD: u32 = 1_000_000;
 /// pattern `serial.rs`'s `read_log` already uses.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How much of an unframed tail rides in a study's failure reason. The full
+/// text goes to the bench's own debug file instead — see
+/// [`DevBenchLink::unframed_tail_full`] for why the two differ.
+const UNFRAMED_TAIL_REASON_CAP: usize = 192;
+
 /// One open serial connection to `embarch-dev-bench`, speaking
 /// COBS-framed/postcard-encoded `DevBenchMessage`s one at a time.
 pub struct DevBenchLink {
@@ -103,6 +108,63 @@ impl DevBenchLink {
     /// than looping on garbage until the step deadline.
     pub fn undecodable_frames(&self) -> u64 {
         self.undecodable_frames
+    }
+
+    /// Bytes that arrived and never became a frame, rendered as hex and
+    /// ASCII — or `None` when there are none.
+    ///
+    /// **These were completely invisible, and they are the one thing on this
+    /// link that explains a bench that stopped talking.** `recv` buffers until
+    /// a `0x00` delimiter, so anything arriving without one accumulates in
+    /// `buf` forever and is never logged, never counted, never reported. That
+    /// is precisely the shape of the evidence that matters here: dev-bench's
+    /// `zephyr,console` *is* this UART, and an ESP32 that resets puts its ROM
+    /// and bootloader banner on it as plain ASCII at a different baud —
+    /// text, no nulls anywhere in it. So the run that finally proved dev-bench
+    /// was rebooting mid-frame
+    /// (`embarch-dev-bench/design.md` §4) reported "no message received from
+    /// dev-bench before the deadline" while holding the bench's own account of
+    /// the reset in a private `Vec`. The uptime comparison that cracked it
+    /// took another handshake to do what these bytes could have said outright.
+    ///
+    /// Rendered rather than returned raw so the caller cannot accidentally
+    /// treat it as protocol data, and capped for the same reason
+    /// `describe_undecodable_frame` caps: a link that has been quietly
+    /// filling this for a whole study should not put a kilobyte in one log
+    /// line.
+    pub fn unframed_tail(&self) -> Option<String> {
+        Self::describe_unframed_tail(&self.buf, UNFRAMED_TAIL_REASON_CAP)
+    }
+
+    /// The same text with nothing elided, for the study's own `dev-bench`
+    /// file. **The cap and the absence of one are both deliberate**: a
+    /// failure reason travels through an HTTP response and a job registry and
+    /// must stay a sentence, while the bench's debug file is exactly where the
+    /// whole banner belongs — and the line naming the reset cause can sit
+    /// several hundred bytes into it, past any cap a reason could carry.
+    pub fn unframed_tail_full(&self) -> Option<String> {
+        Self::describe_unframed_tail(&self.buf, usize::MAX)
+    }
+
+    /// Pure, and separate from [`Self::unframed_tail`], for the same reason
+    /// `describe_undecodable_frame` and `take_frame` are: testable with no
+    /// serial port in the way.
+    fn describe_unframed_tail(buf: &[u8], cap: usize) -> Option<String> {
+        if buf.is_empty() {
+            return None;
+        }
+        let head: Vec<u8> = buf.iter().take(cap).copied().collect();
+        let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = head
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        Some(format!(
+            "{} byte(s) arrived without a frame delimiter; first {}: {} | {ascii}",
+            buf.len(),
+            head.len(),
+            hex.join(" ")
+        ))
     }
 
     /// Postcard-encodes `msg`, COBS-frames it (trailing `0x00` delimiter
@@ -447,6 +509,53 @@ mod tests {
         let msg = DevBenchLink::describe_undecodable_frame(&[0x01], 1);
         assert!(msg.contains("frame too short"), "{msg}");
         assert!(!msg.contains("Hello"), "must not name a variant it cannot read: {msg}");
+    }
+
+    /// **An unframed tail is reported, because it is what a reset looks like
+    /// on this wire.** dev-bench's console is this same UART, so an ESP32 that
+    /// reboots writes its bootloader banner here as plain ASCII with no `0x00`
+    /// anywhere in it — which `recv` buffers and, before this, never mentioned.
+    #[test]
+    fn bytes_that_never_form_a_frame_are_reported_with_their_text() {
+        let banner = b"rst:0xc (RTC_SW_CPU_RST),boot:0x8";
+        let tail = DevBenchLink::describe_unframed_tail(banner, UNFRAMED_TAIL_REASON_CAP)
+            .expect("a non-empty buffer must be reported");
+        assert_eq!(
+            banner.iter().position(|&b| b == 0),
+            None,
+            "the fixture must have no delimiter — that is the whole reason these bytes hide"
+        );
+        assert!(tail.contains("33 byte(s)"), "{tail}");
+        // The ASCII column is the whole point: this is the line that names the
+        // reset, and nobody should have to decode it out of hex.
+        assert!(tail.contains("rst:0xc (RTC_SW_CPU_RST)"), "{tail}");
+
+        assert!(
+            DevBenchLink::describe_unframed_tail(&[], UNFRAMED_TAIL_REASON_CAP).is_none(),
+            "an empty buffer reports nothing"
+        );
+    }
+
+    /// **The reason elides and the debug file does not**, and the line naming
+    /// a reset cause is exactly the kind that sits past the cap: the real
+    /// capture that proved this fault was 699 bytes whose first 192 were still
+    /// inside the bootloader's SPI-flash preamble.
+    #[test]
+    fn the_uncapped_tail_keeps_what_the_reason_elides() {
+        let mut banner = b"I (soc_init): ESP Simple boot\r\n".repeat(8);
+        banner.extend_from_slice(b"rst:0xc (RTC_SW_CPU_RST)");
+        assert!(banner.len() > UNFRAMED_TAIL_REASON_CAP);
+
+        let capped = DevBenchLink::describe_unframed_tail(&banner, UNFRAMED_TAIL_REASON_CAP)
+            .expect("reported");
+        let full = DevBenchLink::describe_unframed_tail(&banner, usize::MAX).expect("reported");
+
+        assert!(!capped.contains("RTC_SW_CPU_RST"), "the cap must actually elide: {capped}");
+        assert!(full.contains("rst:0xc (RTC_SW_CPU_RST)"), "{full}");
+        // Both still state the true total, so a capped reason never reads as
+        // the whole of what arrived.
+        let total = format!("{} byte(s)", banner.len());
+        assert!(capped.contains(&total) && full.contains(&total));
     }
 
     /// A bench flashed from a newer `main` than this Core is a real and

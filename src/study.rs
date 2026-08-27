@@ -1506,9 +1506,28 @@ fn run_study_to_completion(
                 }
             }
             Ok(Received::Deadline) => {
+                // **What arrived and never became a frame goes in the failure
+                // reason, because on this link that text *is* the diagnosis.**
+                // dev-bench's `zephyr,console` is the same UART that carries
+                // this protocol, so a bench that resets writes its bootloader
+                // banner here as plain ASCII with no `0x00` in it — which
+                // `recv` buffers and nothing ever mentioned. A run that timed
+                // out this way once reported only "no message received" while
+                // holding the bench's own account of its reset in a private
+                // buffer (`embarch-dev-bench/design.md` §4).
+                if let Some(full) = link.unframed_tail_full() {
+                    crate::dev_bench_log::note(
+                        Some(&study_id),
+                        &format!("UNFRAMED BYTES ON THE LINK: {full}"),
+                    );
+                }
+                let tail = match link.unframed_tail() {
+                    Some(tail) => format!(". {tail}"),
+                    None => String::new(),
+                };
                 break Err(format!(
                     "step timed out — no message received from dev-bench before the deadline \
-                     (waiting on step index {next_expected})"
+                     (waiting on step index {next_expected}){tail}"
                 ));
             }
             Err(e) => break Err(format!("dev-bench connection error: {e:?}")),
