@@ -627,9 +627,20 @@ async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::har
 /// `hw_lock` to avoid racing it rather than because it touches hardware
 /// itself. dev-bench must already be enrolled via `/probes/enroll` first —
 /// this only ever amends that existing row.
+/// `interface` answers a question `serial` structurally cannot: a debug
+/// probe exposing two VCOM ports gives **both** of them the same USB serial,
+/// so neither this endpoint's `serial` nor the enrolled probe's own can
+/// narrow that pair down to a port. The nRF54L15DK is that case — its
+/// `zephyr,console` is `uart20`, wired to VCOM1 at interface 2, while
+/// detection's undeclared fallback guesses the lowest interface and lands on
+/// a port that accepts bytes and never answers. Either field may be sent
+/// alone; sending neither is a 400 rather than a silent no-op.
 #[derive(Deserialize)]
 struct SetDevBenchLinkRequest {
-    serial: String,
+    #[serde(default)]
+    serial: Option<String>,
+    #[serde(default)]
+    interface: Option<u8>,
 }
 
 async fn set_dev_bench_link_handler(
@@ -637,12 +648,27 @@ async fn set_dev_bench_link_handler(
     Json(req): Json<SetDevBenchLinkRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = state.hw_lock.lock().await;
-    let serial = req.serial;
+    let SetDevBenchLinkRequest { serial, interface } = req;
 
-    tokio::task::spawn_blocking(move || embarch_topology::hardware::set_dev_bench_link_port_serial(&serial))
-        .await
-        .map_err(internal_err)?
-        .map_err(internal_err)?;
+    if serial.is_none() && interface.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "POST /dev-bench/link needs at least one of 'serial' or 'interface'".to_string(),
+        ));
+    }
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(serial) = serial {
+            embarch_topology::hardware::set_dev_bench_link_port_serial(&serial)?;
+        }
+        if let Some(interface) = interface {
+            embarch_topology::hardware::set_dev_bench_link_port_interface(interface)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(internal_err)?
+    .map_err(internal_err)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
