@@ -148,6 +148,23 @@ struct StatusResponse {
     /// processes undetected — which is exactly the failure the split was
     /// made to prevent.
     study_designer_schema_version: u32,
+    /// This Core binary's own crate version — `CARGO_PKG_VERSION`, the same
+    /// string `embarch-core --version` prints, resolved at compile time
+    /// (decision 13, amended 2026-09-03).
+    ///
+    /// **Mechanical on purpose.** The version was reachable only by running
+    /// the binary, so nothing talking to Core *over HTTP* could say which
+    /// build answered — and a deploy that silently did not land looks
+    /// exactly like one that did (`embarch-dev-workflow.md` §4a). Reading it
+    /// off `env!` rather than a hand-maintained constant is the whole point:
+    /// `Cargo.toml`'s version already tracks the release tags, so this field
+    /// cannot drift from the build that serves it.
+    ///
+    /// A consumer should **warn, not refuse**, on a difference from whatever
+    /// Core version it was built or tested against — decision 13's posture on
+    /// skew, unchanged. There is deliberately no separate hand-bumped
+    /// `contract_version` beside this; decision 13's amendment has why.
+    core_version: &'static str,
 }
 
 async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> {
@@ -160,6 +177,7 @@ async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> 
         status: "ok",
         probes,
         study_designer_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
+        core_version: env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -1468,6 +1486,73 @@ mod tests {
         assert!(
             body.contains("no captured streams"),
             "expected the handler's own 404, got: {body}"
+        );
+    }
+
+    // ---- GET /status's serialized shape --------------------------------
+    //
+    // `interfaces.md`'s `/status` row is the published contract, and this
+    // sub-project has shipped that row describing fields the code did not
+    // emit (decision 13's own note: "the endpoint table described all three
+    // fields as shipped for months when none were"). These two tests are
+    // what makes that class of drift a test failure instead of a doc bug:
+    // the key set is pinned exactly, so **adding** a field to the response
+    // without editing the doc row fails just as loudly as removing one.
+
+    #[test]
+    fn status_response_serializes_exactly_the_documented_fields() {
+        let json = serde_json::to_value(StatusResponse {
+            status: "ok",
+            probes: Vec::new(),
+            study_designer_schema_version: 7,
+            core_version: "9.9.9",
+        })
+        .unwrap();
+
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("a struct serializes to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "core_version",
+                "probes",
+                "status",
+                "study_designer_schema_version",
+            ],
+            "GET /status's field set changed — update embarch-doc/embarch-core/interfaces.md's \
+             /status row in the same commit"
+        );
+        assert_eq!(json["core_version"], "9.9.9");
+    }
+
+    /// The served `core_version` is the compiled-in crate version, not a
+    /// hand-maintained constant that could disagree with the binary — the
+    /// property that makes the field worth trusting at all.
+    #[tokio::test]
+    async fn status_serves_this_binary_s_own_crate_version() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["core_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            body.get("contract_version").is_none(),
+            "no hand-bumped contract_version is served (decision 13, amended \
+             2026-09-03); if one is added, say so in interfaces.md"
         );
     }
 }
