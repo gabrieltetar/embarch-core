@@ -21,7 +21,47 @@ permissions:
   contents: write
 
 jobs:
+  # embarch-umbrella decisions 27/29: no release may build a binary whose
+  # `--version` disagrees with the tag that produced it. This job gates the
+  # build matrix, so a mismatch costs one ubuntu runner-minute rather than
+  # four cross-compiles (one of them a `cross`/Docker aarch64 link) and an
+  # uploaded asset — the decision's "failing the release outright" rather
+  # than catching it afterwards. `doctor` check 1 compares installed binaries
+  # against the suite manifest and therefore inherits this gap; it can only
+  # detect a mismatch that already got shipped.
+  #
+  # Deliberately toolchain-free: it reads `[package] version` out of
+  # Cargo.toml with awk rather than `cargo metadata`, because this repo's
+  # manifest has sibling path dependencies that only resolve once the other
+  # checkouts exist — and the point is to fail before any of that setup runs.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo.toml version must match the pushed tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "ref $GITHUB_REF_NAME is not a tag (workflow_dispatch); nothing to compare"
+            exit 0
+          fi
+          version=$(awk -F'"' '
+            /^\[package\]/ { p = 1; next }
+            /^\[/          { p = 0 }
+            p && /^[[:space:]]*version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ]; then
+            echo "::error::could not read [package] version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Cargo.toml version $version does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          echo "Cargo.toml $version matches tag $GITHUB_REF_NAME"
+
   build:
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
