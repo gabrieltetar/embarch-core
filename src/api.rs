@@ -1252,10 +1252,26 @@ mod tests {
 
     // ---- build_router requires the bearer token on every route ----
     //
-    // There used to be one deliberate exemption (`GET /enroll`'s static
-    // page); retired 2026-08-24 (`embarch-ui/milestone-1.md` §4.9). These
-    // tests exist so "every route is protected" stays verified, not just
-    // eyeballed at the `build_router` call site.
+    // `embarch-doc/embarch-core/spec.md` states every route requires
+    // `Authorization: Bearer <token>`, "no exceptions" — there used to be
+    // exactly one deliberate exemption (`GET /enroll`'s static page),
+    // retired 2026-08-24 (`embarch-ui/milestone-1.md` §4.9).
+    //
+    // That invariant used to be checked by one hand-written test per route,
+    // and the two lists drifted exactly as you would expect: on 2026-09-06,
+    // twelve of the twenty-six registered paths had a test and fourteen —
+    // including every `/study*` route, the newest surface — had none. So the
+    // list is derived from `build_router`'s own source instead
+    // (`embarch-doc/embarch-core/decisions/platform.md` decision 42).
+    // `every_registered_route_has_an_auth_case` fails when a
+    // registered path has no row in `AUTH_CASES`, and the two sweeps below
+    // drive every row through the real router with no token and with a wrong
+    // one. Adding a route without adding its row is a test failure rather
+    // than a silently open path.
+    //
+    // Nothing here touches hardware: `auth_middleware` is a `.layer` on the
+    // whole router, so it rejects before axum routes the request at all and
+    // no handler — probe, serial port or study — ever runs.
 
     use tower::ServiceExt as _;
 
@@ -1263,66 +1279,129 @@ mod tests {
         build_router(AppState::new("test-token".to_string()))
     }
 
-    #[tokio::test]
-    async fn status_still_requires_the_bearer_token_after_the_router_split() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    /// The prefix a `build_router` registration line starts with. A `const`
+    /// so that this file's own source contains the literal only here, on a
+    /// line the scan below skips.
+    const ROUTE_MARKER: &str = ".route(\"";
+
+    /// One row per `(method, registered path, concrete URI)` that
+    /// `build_router` wires up. The path is matched against the source; the
+    /// URI is what actually gets sent, which is why the parameterised routes
+    /// carry a substituted segment for `{study_id}` / `{name}`. A path with
+    /// two methods gets two rows.
+    const AUTH_CASES: &[(&str, &str, &str)] = &[
+        ("GET", "/status", "/status"),
+        ("POST", "/flash", "/flash"),
+        ("POST", "/reset", "/reset"),
+        ("GET", "/serial-log", "/serial-log"),
+        ("GET", "/dev-bench/port", "/dev-bench/port"),
+        ("GET", "/dev-bench/hello", "/dev-bench/hello"),
+        ("POST", "/resolve-chip", "/resolve-chip"),
+        ("POST", "/probes/enroll", "/probes/enroll"),
+        ("GET", "/probes/enrolled", "/probes/enrolled"),
+        ("POST", "/dev-bench/link", "/dev-bench/link"),
+        ("POST", "/signals", "/signals"),
+        ("GET", "/signals", "/signals"),
+        ("DELETE", "/signals/{name}", "/signals/outpost"),
+        ("GET", "/serial-ports", "/serial-ports"),
+        ("POST", "/validate", "/validate"),
+        ("GET", "/alerts", "/alerts"),
+        ("GET", "/logs/recent", "/logs/recent"),
+        ("GET", "/logs/stream", "/logs/stream"),
+        ("POST", "/study", "/study"),
+        ("GET", "/study/{study_id}", "/study/abc"),
+        ("GET", "/study/{study_id}/events", "/study/abc/events"),
+        ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
+        ("GET", "/study/{study_id}/streams", "/study/abc/streams"),
+        ("GET", "/study/{study_id}/stream/{name}", "/study/abc/stream/power"),
+        ("GET", "/study/{study_id}/power-data", "/study/abc/power-data"),
+        ("GET", "/study/{study_id}/waveform-data", "/study/abc/waveform-data"),
+        ("GET", "/study/{study_id}/gatt-data", "/study/abc/gatt-data"),
+    ];
+
+    /// Every path `build_router` registers, read out of this file's own
+    /// source. Reading the text is the only way in: axum exposes no route
+    /// iterator, so a built `Router` cannot be asked what it serves.
+    fn registered_route_paths() -> Vec<String> {
+        include_str!("api.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(ROUTE_MARKER))
+            .map(|l| l[ROUTE_MARKER.len()..].split('"').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_registered_route_has_an_auth_case() {
+        let registered = registered_route_paths();
+        assert!(
+            registered.len() > 20,
+            "the scan for `{ROUTE_MARKER}` found {} route registrations, which is fewer \
+             than `build_router` has ever had — the scan broke, not the router.",
+            registered.len()
+        );
+
+        for path in &registered {
+            assert!(
+                AUTH_CASES.iter().any(|(_, p, _)| p == path),
+                "`{path}` is registered in `build_router` but has no row in `AUTH_CASES`, \
+                 so nothing asserts it requires the bearer token. Add the row — `spec.md` \
+                 says every route requires it, no exceptions."
+            );
+        }
+
+        for (_, path, _) in AUTH_CASES {
+            assert!(
+                registered.iter().any(|p| p == path),
+                "`AUTH_CASES` covers `{path}`, which `build_router` no longer registers. \
+                 Drop the row; a stale row is the same drift in the other direction."
+            );
+        }
     }
 
     #[tokio::test]
-    async fn probes_enrolled_still_requires_the_bearer_token_after_the_router_split() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/probes/enrolled").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    async fn every_registered_route_rejects_a_missing_bearer_token() {
+        for (method, path, uri) in AUTH_CASES {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri(*uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} (sent as {uri}) answered a request with no \
+                 Authorization header"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn dev_bench_link_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/dev-bench/link")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"serial":"abc"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn declare_signal_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/signals")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"name":"outpost","origin_role":"dut","direction":"dut-to-host",
-                            "route":{"kind":"direct","port_serial":"ABC123"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn list_signals_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/signals").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    async fn every_registered_route_rejects_a_wrong_bearer_token() {
+        for (method, path, uri) in AUTH_CASES {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri(*uri)
+                        .header("authorization", "Bearer not-the-token")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} (sent as {uri}) answered a request carrying the wrong \
+                 bearer token"
+            );
+        }
     }
 
     /// **The other half of a mirror no crate can see both sides of.**
@@ -1355,87 +1434,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_signal_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/signals/outpost")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn serial_ports_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/serial-ports").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn stream_index_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .uri("/study/whatever/streams")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn validate_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/validate")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"role":"dut"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn alerts_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/alerts").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn logs_recent_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/logs/recent").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn logs_stream_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(Request::builder().uri("/logs/stream").body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
     async fn status_succeeds_with_the_correct_bearer_token() {
         let response = test_router()
             .oneshot(
@@ -1448,20 +1446,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn stream_data_requires_the_bearer_token() {
-        let response = test_router()
-            .oneshot(
-                Request::builder()
-                    .uri("/study/abc/stream/power")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The parameterised route (`design.md` §3 decision 30) is actually
