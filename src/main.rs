@@ -96,9 +96,12 @@ enum Command {
     /// List probe-rs target names, optionally narrowed by a case-insensitive
     /// substring — design.md §3 decision 34. Pure enumeration: no probe is
     /// opened and no board need be attached, same posture as
-    /// `detect-dev-bench`. This is where the value for an
-    /// `embarch-api` `soc_chip_overrides` entry comes from when a SoC isn't
-    /// in the built-in table, replacing the `cargo install probe-rs-tools`
+    /// `detect-dev-bench`. This is where the target name for a **new
+    /// `SOC_TO_CHIP` entry** comes from when a SoC isn't in the built-in
+    /// table. That table is compiled into this binary (`src/chip_resolve.rs`)
+    /// and has no config file anywhere: adding a SoC means editing Core's
+    /// source, rebuilding and redeploying. `embarch-api` has no per-project
+    /// override field for it. Replaces the `cargo install probe-rs-tools`
     /// detour that onboarding used to require for exactly this.
     ChipList {
         /// Case-insensitive substring; omit to list every target. Substring,

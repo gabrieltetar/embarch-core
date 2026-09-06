@@ -20,9 +20,13 @@ use probe_rs::config::Registry;
 /// Table covers this suite's real Nordic hardware family (the nRF54L15DK
 /// `embarch-dev-bench` hosts on, plus its siblings) rather than every chip
 /// probe-rs knows about — extend when a real repo's board scan turns up a
-/// SoC name not listed here. Keys are Zephyr SoC names, lowercased, as they
-/// appear in a board's directory/`board.yml` (e.g. `soc/nordic/nrf54l/`);
-/// values are the exact probe-rs target name `get_target_by_name` expects.
+/// SoC name not listed here. This `const` is the **only** place a mapping
+/// can be added: it is compiled in, and there is no config file — in this
+/// crate or in `embarch-api` — that can override or extend it, so a new SoC
+/// costs a source edit, a rebuild and a redeploy. Keys are Zephyr SoC names,
+/// lowercased, as they appear in a board's directory/`board.yml` (e.g.
+/// `soc/nordic/nrf54l/`); values are the exact probe-rs target name
+/// `get_target_by_name` expects.
 const SOC_TO_CHIP: &[(&str, &str)] = &[
     ("nrf51822", "nRF51822_xxAA"),
     ("nrf52805", "nRF52805_xxAA"),
@@ -49,9 +53,9 @@ const SOC_TO_CHIP: &[(&str, &str)] = &[
 
 /// The SoC named didn't resolve — either it's not in `SOC_TO_CHIP` at all, or
 /// the table's entry no longer matches a real probe-rs target. Either way
-/// the caller's next step is the same manual fallback
-/// (`embarch-core/design.md` §10's `chip-list` item, or `probe-rs chip list`
-/// today), so both cases collapse into one error rather than being
+/// the caller's next step is the same manual fallback — `embarch-core
+/// chip-list` for the real target name, then a `SOC_TO_CHIP` edit and a
+/// rebuild — so both cases collapse into one error rather than being
 /// distinguished — a caller can't act differently on "unmapped" vs.
 /// "mapped but stale" anyway.
 #[derive(Debug)]
@@ -61,7 +65,7 @@ impl std::fmt::Display for UnmappedSoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "no known probe-rs chip mapping for SoC '{}' — run `probe-rs chip list` (or `embarch-core detect-dev-bench`'s sibling chip-list item, once it exists) to find the right target name and configure it manually",
+            "no known probe-rs chip mapping for SoC '{}' — run `embarch-core chip-list <part>` for the right probe-rs target name, then add the SoC/target pair to `SOC_TO_CHIP` in embarch-core's `chip_resolve.rs` and rebuild. The table is compiled in; there is no config file that can override it",
             self.0
         )
     }
@@ -102,7 +106,7 @@ pub fn resolve(soc: &str) -> Result<String, UnmappedSoc> {
 /// **Substring, deliberately not `Registry::search_chips`.** That method
 /// prefix-matches (with `x` as a wildcard), which is the wrong shape for the
 /// job this exists to do: someone who knows their part is a "54L15" and is
-/// hunting for the string to put in a `soc_chip_overrides` entry gets nothing
+/// hunting for the string to add to `SOC_TO_CHIP` gets nothing
 /// from a prefix search, because the name they want is `nRF54L15_xxAA`. The
 /// whole point of the fallback is that the user does *not* already know how
 /// the name starts. Note the contrast with [`resolve`] directly above, which
@@ -179,8 +183,8 @@ mod tests {
         assert!(chip_list(Some("definitely-not-a-real-chip")).is_empty());
     }
 
-    /// `chip_list` is the fallback a `soc_chip_overrides` value is read out
-    /// of, so what it prints has to be a name `resolve`'s own validation step
+    /// `chip_list` is where the value for a new `SOC_TO_CHIP` entry is read
+    /// out of, so what it prints has to be a name `resolve`'s own validation step
     /// (`get_target_by_name`) will accept. Checked rather than assumed.
     #[test]
     fn chip_list_names_are_resolvable_targets() {
