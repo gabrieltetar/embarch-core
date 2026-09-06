@@ -96,6 +96,17 @@ pub struct StudyJob {
     /// already succeeded and `StudyStart` has already been sent, so by the
     /// time a caller can observe it, the study is genuinely running).
     pub status: String,
+    /// **The 0-based index of the last step that finished**, and `None` until
+    /// one has. Not a count of finished steps and not the step now running:
+    /// a completed two-step study reports `current_step: 1`, so
+    /// `current_step + 1` is the number of steps that have finished and
+    /// `"step {current_step} of {total_steps}"` reads one short at the moment
+    /// the run ends. That is the stated contract
+    /// (`embarch-core/interfaces.md`, `GET /study/{id}`), not an accident of
+    /// this line — see `advance_step_counters` for why it is not the same
+    /// number as the capture's private `open_step_index`, and
+    /// `embarch-core/decisions.md` decision 43 for why the meaning was
+    /// documented rather than renumbered.
     pub current_step: Option<u32>,
     pub total_steps: Option<u32>,
     pub reason: Option<String>,
@@ -109,6 +120,9 @@ pub struct StudyJob {
 #[derive(Serialize)]
 pub struct StudyJobResponse {
     pub status: String,
+    /// Copied verbatim from [`StudyJob::current_step`] — **the 0-based index
+    /// of the last step that finished**, `None` until one has. See that
+    /// field's doc for what a caller rendering it has to add.
     pub current_step: Option<u32>,
     pub total_steps: Option<u32>,
     pub result: Option<serde_json::Value>,
@@ -1122,9 +1136,48 @@ struct Capture {
     study_id: String,
     events_tx: broadcast::Sender<StudyEvent>,
     store: StdMutex<StreamStore>,
-    /// Which step is open, for the `step_name` column every rendered row
-    /// carries. Read by signal threads, written by the main loop.
-    current_step: AtomicU32,
+    /// **The 0-based index of the step that is currently open** — which is
+    /// also the count of steps that have finished, and is therefore *one
+    /// more* than the public [`StudyJob::current_step`] the API reports.
+    /// Used for the `step_name` column every rendered row carries and to
+    /// scope a signal tap's `StreamScope` to a step range, so it has to name
+    /// the step being captured *now*, not the last one that ended.
+    ///
+    /// Named `current_step` until 2026-09-06, two lines from the job field of
+    /// the same name and the opposite convention; renamed rather than
+    /// renumbered because the tap machinery is right as it stands
+    /// (`embarch-core/decisions.md` decision 43). Read by signal threads,
+    /// written by the main loop.
+    open_step_index: AtomicU32,
+}
+
+/// Advance both of a run's step counters now that the step at `step_index`
+/// has finished, and return the index of the step that is now open.
+///
+/// **A study keeps two step counters with deliberately opposite conventions,
+/// and they are derived here, in one place, so nothing has to re-derive which
+/// is which:**
+///
+/// * `Capture::open_step_index` — private — becomes `step_index + 1`, the
+///   index of the step now being captured. A signal tap's `StreamScope` is a
+///   step range, so this one has to count forward or a stream would be scoped
+///   to the step that just ended.
+/// * `StudyJob::current_step` — **public**, reaching `GET /study/{id}` and
+///   every client through it — becomes `step_index` itself, the index of the
+///   last step that *finished*. A completed two-step study therefore reports
+///   `current_step: 1, total_steps: 2` (observed live, study
+///   `3785bd198cc3a62d…`, both steps `Pass`).
+///
+/// The public field's meaning is stated in `embarch-core/interfaces.md` and
+/// was documented rather than changed: `embarch-ui` renders it and the shared
+/// Core client keys its poll de-duplication on it, so renumbering it here
+/// would be a cross-repo wire change (`embarch-core/decisions.md`
+/// decision 43).
+fn advance_step_counters(capture: &Capture, jobs: &JobRegistry, study_id: &str, step_index: u32) -> u32 {
+    let open_step_index = step_index + 1;
+    capture.open_step_index.store(open_step_index, Ordering::Relaxed);
+    update_job(jobs, study_id, |job| job.current_step = Some(step_index));
+    open_step_index
 }
 
 /// Owns the dev-bench link for the rest of the study's lifetime: receives
@@ -1244,7 +1297,7 @@ fn run_study_to_completion(
         study_id: study_id.clone(),
         events_tx: events_tx.clone(),
         store: StdMutex::new(store),
-        current_step: AtomicU32::new(0),
+        open_step_index: AtomicU32::new(0),
     });
 
     // Which taps dev-bench currently has open, by `StreamTap.id`. Purely
@@ -1329,9 +1382,7 @@ fn run_study_to_completion(
                     step_index,
                     result: Box::new(result),
                 });
-                next_expected = step_index as usize + 1;
-                capture.current_step.store(next_expected as u32, Ordering::Relaxed);
-                update_job(&jobs, &study_id, |job| job.current_step = Some(step_index));
+                next_expected = advance_step_counters(&capture, &jobs, &study_id, step_index) as usize;
                 // A signal tap's `StreamScope` is a step range like any
                 // other tap's, so Core opens and closes its port on the same
                 // boundaries dev-bench uses for the taps it mediates.
@@ -2063,7 +2114,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         store.note_arrival(tap.id, &record.bytes, record.rx_utc_ms);
     }
 
-    let current_step = capture.current_step.load(Ordering::Relaxed);
+    let open_step_index = capture.open_step_index.load(Ordering::Relaxed);
 
     match tap.encoding {
         StreamEncoding::Samples { layout, unit, channel_id } => {
@@ -2074,7 +2125,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             let samples: Vec<Sample> =
                 samples_in(record, layout, unit, channel_id, sample_hz).collect();
             for sample in &samples {
-                write_sample(capture, tap.id, current_step, *sample);
+                write_sample(capture, tap.id, open_step_index, *sample);
             }
             let _ = capture.events_tx.send(StudyEvent::SampleBatch {
                 study_id: capture.study_id.clone(),
@@ -2090,10 +2141,10 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // to mean; the generic record carries no step of its own.
             match postcard::from_bytes::<GattTranscriptEntry>(&record.bytes) {
                 Ok(entry) => {
-                    write_transcript_entry(capture, tap.id, current_step, &entry);
+                    write_transcript_entry(capture, tap.id, open_step_index, &entry);
                     let _ = capture.events_tx.send(StudyEvent::GattTranscript {
                         study_id: capture.study_id.clone(),
-                        step_index: current_step,
+                        step_index: open_step_index,
                         entry: Box::new(entry),
                     });
                 }
@@ -2126,7 +2177,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // declared (`embarch-study-designer/design.md` §3 decision 52) —
             // for a `GattNotify` tap, exactly one notification's raw ATT
             // value, with nothing wrapped around it.
-            write_struct_rows(capture, tap.id, current_step, decoder, record);
+            write_struct_rows(capture, tap.id, open_step_index, decoder, record);
         }
         StreamEncoding::Raw => {
             // Nothing declared, so nothing rendered. `Raw` is the honest
@@ -3004,7 +3055,7 @@ mod tests {
             study_id: "test-study-id".to_string(),
             events_tx,
             store: StdMutex::new(store),
-            current_step: AtomicU32::new(0),
+            open_step_index: AtomicU32::new(0),
         }
     }
 
@@ -3576,6 +3627,57 @@ mod tests {
 
     fn running_job(total_steps: u32) -> StudyJob {
         StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(total_steps), reason: None }
+    }
+
+    /// The two step counters, pinned at both ends of a two-step run — the
+    /// shape that was actually observed getting this wrong (study
+    /// `3785bd198cc3a62d…`, `current_step: 1` with `total_steps: 2` and both
+    /// steps `Pass`).
+    ///
+    /// **Mid-run is the case that hides the difference**, which is why both
+    /// are asserted here: after step 0 the public field reads `0` and the
+    /// private one reads `1`, and a reader who only ever looked at a running
+    /// study would see two plausible numbers and never learn which convention
+    /// each follows. The final assertion is the one that would have caught
+    /// the live report.
+    #[test]
+    fn step_counters_hold_their_conventions_mid_run_and_at_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = empty_registry();
+        jobs.lock().unwrap().insert("s".to_string(), running_job(2));
+        let capture = test_capture(dir.path(), study_with_steps(&[1_000, 2_000]));
+
+        // Nothing has finished yet: the public field is absent, and the
+        // capture is already scoping rows to step 0.
+        assert_eq!(jobs.lock().unwrap()["s"].current_step, None);
+        assert_eq!(capture.open_step_index.load(Ordering::Relaxed), 0);
+
+        // Step 0 reported. Step 1 is open; the last step to *finish* was 0.
+        assert_eq!(advance_step_counters(&capture, &jobs, "s", 0), 1);
+        assert_eq!(jobs.lock().unwrap()["s"].current_step, Some(0));
+        assert_eq!(capture.open_step_index.load(Ordering::Relaxed), 1);
+
+        // Step 1 reported — the study is done. The public field is `1`, one
+        // less than `total_steps`, exactly as `interfaces.md` states; a
+        // caller wanting "2 of 2" adds one itself.
+        assert_eq!(advance_step_counters(&capture, &jobs, "s", 1), 2);
+        assert_eq!(capture.open_step_index.load(Ordering::Relaxed), 2);
+        let job = jobs.lock().unwrap()["s"].clone();
+        assert_eq!(job.current_step, Some(1));
+        assert_eq!(job.total_steps, Some(2));
+
+        // And at the boundary callers actually read, not just in the
+        // registry: `GET /study/{id}` serializes the same number.
+        let body = serde_json::to_value(StudyJobResponse {
+            status: "completed".to_string(),
+            current_step: job.current_step,
+            total_steps: job.total_steps,
+            result: None,
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(body["current_step"], serde_json::json!(1));
+        assert_eq!(body["total_steps"], serde_json::json!(2));
     }
 
     #[test]
@@ -4185,8 +4287,8 @@ mod tests {
         let capture = test_capture(dir.path(), study);
 
         // dev-bench has just reported step 0's result, so step 1 is open.
-        capture.current_step.store(1, Ordering::Relaxed);
-        let step = capture.current_step.load(Ordering::Relaxed);
+        capture.open_step_index.store(1, Ordering::Relaxed);
+        let step = capture.open_step_index.load(Ordering::Relaxed);
 
         let sample = Sample {
             rx_utc_ms: 1,
