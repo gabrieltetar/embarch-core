@@ -1404,24 +1404,18 @@ fn run_study_to_completion(
                 // in the result body. Found 2026-08-27 on real hardware, on a
                 // study that lost its link to a DUT-side supervision timeout.
                 //
-                // The reason names the step and quotes its own words rather
-                // than saying "a step failed": the `Fail` reason dev-bench
-                // sent is the diagnosis, and it is already in hand here.
+                // The reason is built from what the writer recorded on the
+                // way through, not from `completed` alone, and it branches:
+                // a recorded `Fail` is quoted in dev-bench's own words (that
+                // reason is the diagnosis, and it is already in hand here),
+                // a recorded `TimedOut` is named as a timeout, and only a
+                // run with no stopping outcome recorded at all reports a
+                // `StepResult` that did not arrive. See
+                // `EventsJsonWriter::early_stop_reason`.
                 if completed {
                     break Ok(());
                 }
-                break Err(match writer.last_failed_step() {
-                    Some((name, why)) => format!(
-                        "dev-bench stopped the study early: step '{name}' failed ({why})"
-                    ),
-                    // No `Fail` outcome on record and dev-bench still says it
-                    // stopped early — which is what a *lost* `StepResult`
-                    // looks like from here (the undecodable-frame arm below).
-                    // Said plainly rather than guessed at.
-                    None => "dev-bench stopped the study early, and the StepResult saying which \
-                             step failed did not arrive"
-                        .to_string(),
-                });
+                break Err(writer.early_stop_reason());
             }
             Ok(Received::Message(DevBenchMessage::StreamOpen { id })) => match tap_for(&capture.taps, id) {
                 Some(tap) => {
@@ -2362,12 +2356,25 @@ struct EventsJsonWriter {
     wrote_any_step: bool,
     provenance: Provenance,
     streams: Vec<StreamRef>,
-    /// The last step this run recorded a `Fail` outcome for, as (name,
-    /// reason). Kept so a `StudyDone { completed: false }` can say *which*
-    /// step stopped the study in its own words — dev-bench sends the
-    /// diagnosis once, in the `StepResult`, and nothing else on the wire
-    /// repeats it.
-    last_failed_step: Option<(String, String)>,
+    /// The last step this run recorded a study-stopping outcome for, as
+    /// (name, why). Kept so a `StudyDone { completed: false }` can say
+    /// *which* step stopped the study — dev-bench sends `StudyDone` with a
+    /// bare boolean, and whatever diagnosis exists arrived earlier, in the
+    /// `StepResult`.
+    last_stopping_step: Option<(String, StoppedBecause)>,
+}
+
+/// Why a step stopped a study. The two `Outcome`s that can stop one are kept
+/// apart here because they diagnose differently: a `Fail` carries dev-bench's
+/// own words and a `TimedOut` carries none.
+#[derive(Debug, PartialEq)]
+enum StoppedBecause {
+    /// dev-bench's reason string, verbatim. It sends this diagnosis exactly
+    /// once, in the `StepResult`, and nothing else on the wire repeats it.
+    Failed(String),
+    /// The step outran its declared `timeout_ms`. `Outcome::TimedOut` has no
+    /// reason field, so the exhausted timeout is the whole diagnosis.
+    TimedOut,
 }
 
 impl EventsJsonWriter {
@@ -2389,7 +2396,7 @@ impl EventsJsonWriter {
             wrote_any_step: false,
             provenance: provenance.clone(),
             streams: Vec::new(),
-            last_failed_step: None,
+            last_stopping_step: None,
         })
     }
 
@@ -2425,17 +2432,62 @@ impl EventsJsonWriter {
             &TimedStep { result, started_utc_ms, ended_utc_ms, delay_before_ms },
         )?;
         self.wrote_any_step = true;
-        if let Outcome::Fail { reason } = &result.outcome {
-            self.last_failed_step =
-                Some((result.step_name.as_str().to_string(), reason.as_str().to_string()));
+        // **Exhaustive on purpose, with no wildcard arm.** A fourth
+        // `Outcome` variant becomes a compile error here rather than
+        // joining `Pass` in the nothing-stopped-the-study bucket, which is
+        // exactly how `TimedOut` used to be lost: this was an `if let
+        // Outcome::Fail`, so a study killed by a timeout recorded nothing,
+        // and `early_stop_reason` then said the `StepResult` had not
+        // arrived — about a step this same call had just written to disk.
+        match &result.outcome {
+            Outcome::Pass => {}
+            Outcome::Fail { reason } => {
+                self.last_stopping_step = Some((
+                    result.step_name.as_str().to_string(),
+                    StoppedBecause::Failed(reason.as_str().to_string()),
+                ));
+            }
+            Outcome::TimedOut => {
+                self.last_stopping_step =
+                    Some((result.step_name.as_str().to_string(), StoppedBecause::TimedOut));
+            }
         }
         Ok(())
     }
 
-    /// The last `Fail` outcome recorded, as (step name, reason) — see
-    /// `last_failed_step`'s own comment for why it is kept.
-    fn last_failed_step(&self) -> Option<(&str, &str)> {
-        self.last_failed_step.as_ref().map(|(n, r)| (n.as_str(), r.as_str()))
+    /// The last study-stopping outcome recorded, as (step name, why) — see
+    /// `last_stopping_step`'s own comment for why it is kept.
+    fn last_stopping_step(&self) -> Option<(&str, &StoppedBecause)> {
+        self.last_stopping_step.as_ref().map(|(n, w)| (n.as_str(), w))
+    }
+
+    /// The failure reason for a `StudyDone { completed: false }`, built from
+    /// what this writer recorded on its way through the run.
+    ///
+    /// One shape per branch, and they say different things. A recorded
+    /// `Fail` names the step and quotes dev-bench's diagnosis verbatim; a
+    /// recorded `TimedOut` names the step and says it timed out, there being
+    /// no diagnosis to quote; and *only* a run that recorded no
+    /// study-stopping outcome at all reports that the `StepResult` did not
+    /// arrive.
+    fn early_stop_reason(&self) -> String {
+        match self.last_stopping_step() {
+            Some((name, StoppedBecause::Failed(why))) => {
+                format!("dev-bench stopped the study early: step '{name}' failed ({why})")
+            }
+            Some((name, StoppedBecause::TimedOut)) => {
+                format!("dev-bench stopped the study early: step '{name}' timed out")
+            }
+            // Nothing on record and dev-bench still says it stopped early —
+            // which is what a *lost* `StepResult` looks like from here. A
+            // frame that failed to decode never reaches `write_step` at all
+            // (the undecodable-frame arm of the run loop), so this arm is
+            // still reached, and is still said plainly rather than guessed
+            // at. What it no longer covers is a result that did arrive.
+            None => "dev-bench stopped the study early, and the StepResult saying which \
+                     step failed did not arrive"
+                .to_string(),
+        }
     }
 
     /// One [`StreamRef`] per declared tap, handed over once the capture is
@@ -3731,9 +3783,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(writer.last_failed_step(), None, "nothing has failed yet");
+        assert_eq!(writer.last_stopping_step(), None, "nothing has failed yet");
         writer.write_step(&test_step_result("connect"), 0, 0, 0).unwrap();
-        assert_eq!(writer.last_failed_step(), None, "a Pass must not register as a failure");
+        assert_eq!(writer.last_stopping_step(), None, "a Pass must not register as a failure");
 
         writer
             .write_step(
@@ -3747,12 +3799,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            writer.last_failed_step(),
+            writer.last_stopping_step(),
             Some((
                 "batchmgr-stop",
-                "disconnected during service discovery (HCI 0x08, supervision tim"
+                &StoppedBecause::Failed(
+                    "disconnected during service discovery (HCI 0x08, supervision tim".to_string()
+                )
             )),
             "the reason is the diagnosis and must survive verbatim"
+        );
+        assert_eq!(
+            writer.early_stop_reason(),
+            "dev-bench stopped the study early: step 'batchmgr-stop' failed (disconnected \
+             during service discovery (HCI 0x08, supervision tim)"
+        );
+    }
+
+    /// A `TimedOut` outcome, which carries no reason of its own — the
+    /// exhausted `timeout_ms` is the whole diagnosis.
+    fn timed_out_step_result(name: &str) -> StepResult {
+        StepResult { outcome: Outcome::TimedOut, ..test_step_result(name) }
+    }
+
+    /// **A step that timed out stopped the study just as much as one that
+    /// failed, and the reason must name it.** Until 2026-09-06 only the
+    /// `Fail` arm of `write_step` recorded anything, so a `StudyDone
+    /// { completed: false }` after a `TimedOut` step took the no-record arm
+    /// and reported that the `StepResult` "did not arrive" — while that same
+    /// writer had already serialized the step, `step_name` and
+    /// `outcome: "TimedOut"` and all, into `events.json.partial`. Measured on
+    /// the bench: study `dd340b2a36a39aeba94f4f15b4da61f0`, one `BleConnect`
+    /// at a stale `target_address`, `timeout_ms: 15000`. The wording sent
+    /// readers hunting a transport fault that was not there.
+    #[test]
+    fn a_timed_out_step_names_itself_in_the_early_stop_reason() {
+        let dir = std::env::temp_dir().join(format!("embarch-timedout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provenance = provenance_for(
+            &study_with_steps(&[15_000]),
+            "gbench1",
+            &no_run_params(),
+            Default::default(),
+        );
+        let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance).unwrap();
+
+        writer.write_step(&timed_out_step_result("connect"), 0, 15_003, 0).unwrap();
+        let reason = writer.early_stop_reason();
+        assert!(
+            reason.contains("'connect'"),
+            "the reason must name the step that timed out; got: {reason}"
+        );
+        assert!(
+            reason.contains("timed out"),
+            "the reason must say the step timed out; got: {reason}"
+        );
+        assert!(
+            !reason.contains("did not arrive"),
+            "a decoded result is sitting in this writer, so nothing was lost; got: {reason}"
+        );
+
+        // The `None` arm is a real case and keeps its wording: dev-bench
+        // stopped early having recorded no step outcome at all.
+        let writer = EventsJsonWriter::start(&dir, "test-study", &provenance).unwrap();
+        assert!(
+            writer.early_stop_reason().contains("did not arrive"),
+            "with no step recorded, a lost StepResult is what this looks like from here"
         );
     }
 
