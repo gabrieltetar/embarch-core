@@ -1580,4 +1580,99 @@ mod tests {
              2026-09-03); if one is added, say so in interfaces.md"
         );
     }
+
+    // ---- pinning `embarch_topology::hardware::{EnrolledBoard, Alert}` against
+    // `embarch-api`'s hand-maintained mirror -------------------------------
+    //
+    // `embarch-api/crates/embarch-core-client/src/client.rs`'s
+    // `EnrolledBoardResponse`/`AlertResponse` are hand-maintained mirrors of
+    // these two real types (`GET /probes/enrolled` and `GET /alerts` above
+    // serialise them verbatim). Only that client-side crate pinned its own
+    // shape (`an_enrolled_board_round_trips_against_the_pinned_shape`,
+    // `an_alert_round_trips_against_the_pinned_shape`) — nothing pinned the
+    // real types against the same literal, so a field added here without a
+    // matching client-side change would typecheck cleanly on both sides and
+    // fail only against a live Core (`tasks/core/024`). These two tests use
+    // the exact same JSON strings as those client-side tests; a copy, not a
+    // shared constant, because the two crates don't share a dependency this
+    // could live in without embarch-core depending on embarch-api or vice
+    // versa — if the two literals below and the client-side ones you find by
+    // searching for `ENROLLED_BOARD_RESPONSE_JSON`/`ALERT_RESPONSE_JSON` in
+    // `embarch-api/crates/embarch-core-client/src/client.rs` ever disagree,
+    // that disagreement (not just a red test here) is the finding.
+
+    const ENROLLED_BOARD_RESPONSE_JSON: &str = concat!(
+        r#"{"probe_serial":"ABC123","role":"dev-bench","chip":"nrf54l15","#,
+        r#""hardware_id":"AAAA","confirmed_at_utc_ms":1725000000000,"#,
+        r#""link_port_serial":"D607104","link_port_interface":2}"#
+    );
+
+    fn sample_enrolled_board() -> embarch_topology::hardware::EnrolledBoard {
+        embarch_topology::hardware::EnrolledBoard {
+            probe_serial: "ABC123".to_string(),
+            role: "dev-bench".to_string(),
+            chip: "nrf54l15".to_string(),
+            hardware_id: "AAAA".to_string(),
+            confirmed_at_utc_ms: 1725000000000,
+            link_port_serial: Some("D607104".to_string()),
+            link_port_interface: Some(2),
+        }
+    }
+
+    /// Pins `embarch_topology::hardware::EnrolledBoard` against the same
+    /// JSON `embarch-api`'s
+    /// `an_enrolled_board_round_trips_against_the_pinned_shape` (client.rs)
+    /// pins its own mirror type against — including `link_port_interface`,
+    /// the field that silently dropped out of the mirror for a release
+    /// (`embarch-topology` decision 20) before that test existed.
+    #[test]
+    fn enrolled_board_round_trips_against_the_client_s_pinned_shape() {
+        assert_eq!(
+            serde_json::to_string(&sample_enrolled_board()).unwrap(),
+            ENROLLED_BOARD_RESPONSE_JSON
+        );
+        assert_eq!(
+            serde_json::from_str::<embarch_topology::hardware::EnrolledBoard>(
+                ENROLLED_BOARD_RESPONSE_JSON
+            )
+            .unwrap(),
+            sample_enrolled_board()
+        );
+    }
+
+    const ALERT_RESPONSE_JSON: &str = concat!(
+        r#"{"id":"18f3a2-4242","occurred_at_utc_ms":1725000000000,"role":"dut","#,
+        r#""probe_serial":"ABC123","chip":"nrf54l15","recorded_hardware_id":"AAAA","#,
+        r#""live_hardware_id":"BBBB","reason":"hardware id mismatch"}"#
+    );
+
+    fn sample_alert() -> embarch_topology::hardware::Alert {
+        embarch_topology::hardware::Alert {
+            id: "18f3a2-4242".to_string(),
+            occurred_at_utc_ms: 1725000000000,
+            role: "dut".to_string(),
+            probe_serial: "ABC123".to_string(),
+            chip: "nrf54l15".to_string(),
+            recorded_hardware_id: "AAAA".to_string(),
+            live_hardware_id: Some("BBBB".to_string()),
+            reason: "hardware id mismatch".to_string(),
+        }
+    }
+
+    /// Pins `embarch_topology::hardware::Alert` against the same JSON
+    /// `embarch-api`'s `an_alert_round_trips_against_the_pinned_shape`
+    /// (client.rs) pins its own mirror type against.
+    ///
+    /// `Alert` (unlike `EnrolledBoard`) doesn't derive `PartialEq`, so the
+    /// deserialize-then-compare half round-trips through `to_string` instead
+    /// of a struct comparison — still asserts the same thing, that parsing
+    /// `ALERT_RESPONSE_JSON` and re-serializing it reproduces the literal
+    /// exactly.
+    #[test]
+    fn alert_round_trips_against_the_client_s_pinned_shape() {
+        assert_eq!(serde_json::to_string(&sample_alert()).unwrap(), ALERT_RESPONSE_JSON);
+        let parsed: embarch_topology::hardware::Alert =
+            serde_json::from_str(ALERT_RESPONSE_JSON).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), ALERT_RESPONSE_JSON);
+    }
 }
