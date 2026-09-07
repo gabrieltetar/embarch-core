@@ -111,12 +111,37 @@ impl FollowState {
     /// this is testable against a real temp directory without depending on
     /// `token_store::local_data_dir()`'s machine-specific resolution.
     /// Resolves the current log file (which may have rotated since the
-    /// last tick) and returns any complete lines appended since the last
-    /// recorded (path, byte offset). Offsets always land exactly after a
-    /// `\n` (either the end of a previous read, or the file's length at
-    /// rotation-detection time, and every line the file writer itself
-    /// appends is newline-terminated), so a read from `offset` is always
-    /// UTF-8-boundary-clean, not liable to split a line in half.
+    /// last tick) and returns any **complete** lines appended since the
+    /// last recorded (path, byte offset).
+    ///
+    /// **The offset advances only past a `\n` this reader has actually
+    /// seen** (decision 44). A tick can land inside the writer's own
+    /// `write` — `tracing-appender`'s worker formats an event and writes
+    /// it, and nothing makes that one atomic append — so the bytes read
+    /// here may end mid-line. Whatever follows the last `\n` in the read
+    /// is left in the file, unconsumed, and re-read on the next tick once
+    /// its newline has arrived; only the newline-terminated prefix is
+    /// published and counted into `offset`. Advancing to EOF instead
+    /// would publish the half-line as if it were a whole one and then
+    /// publish its remainder as a second "line," which is what this code
+    /// used to do while claiming it could not.
+    ///
+    /// That is also what makes the decode safe: `0x0A` cannot occur
+    /// inside a UTF-8 multi-byte sequence, so a slice ending at a `\n` is
+    /// always character-boundary-clean, and the read cannot tear a
+    /// character in half. Genuinely invalid bytes in the file (not a torn
+    /// character — nothing this crate writes produces them) are replaced
+    /// rather than raised, because erroring without advancing `offset`
+    /// would re-read the same bad bytes every 750 ms forever.
+    ///
+    /// **One anchor is not covered by that rule, deliberately:** the
+    /// file's length at rotation-detection time, below. If *that* tick
+    /// lands inside a torn write, the anchor sits mid-line and the
+    /// remainder of that one line surfaces as one short line. Closing it
+    /// would need a "we started mid-line" flag carried across ticks, for
+    /// a race that requires a 750 ms tick to land inside a microsecond
+    /// window on a file that was created moments earlier, with one
+    /// truncated line in a debug console as the whole cost.
     fn poll_in(&mut self, dir: &std::path::Path) -> Result<Vec<String>> {
         use std::io::{Read, Seek, SeekFrom};
 
@@ -138,12 +163,18 @@ impl FollowState {
             .with_context(|| format!("failed to open log file {}", latest.display()))?;
         file.seek(SeekFrom::Start(self.offset))
             .with_context(|| format!("failed to seek log file {}", latest.display()))?;
-        let mut buf = String::new();
-        let read = file
-            .read_to_string(&mut buf)
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
             .with_context(|| format!("failed to read log file {}", latest.display()))?;
-        self.offset += read as u64;
-        Ok(buf.lines().map(String::from).collect())
+
+        // Only the newline-terminated prefix is ours this tick; a trailing
+        // partial line stays in the file for the next one.
+        let Some(last_newline) = buf.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(Vec::new());
+        };
+        let complete = &buf[..=last_newline];
+        self.offset += complete.len() as u64;
+        Ok(String::from_utf8_lossy(complete).lines().map(String::from).collect())
     }
 }
 
@@ -264,6 +295,53 @@ mod tests {
         writeln!(file, "today's second line").unwrap();
         drop(file);
         assert_eq!(follow.poll_in(&dir).unwrap(), vec!["today's second line".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tick can land inside the writer's own `write` (decision 44). The
+    /// half-line it sees is not a line, and must not be published as one —
+    /// nor must its remainder arrive next tick as a second "line."
+    #[test]
+    fn follow_state_holds_a_trailing_partial_line_until_its_newline_arrives() {
+        use std::io::Write as _;
+
+        let dir = temp_log_dir("follow-partial-line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{LOG_FILE_PREFIX}.2026-08-24"));
+        std::fs::write(&path, "existing line one\n").unwrap();
+
+        let mut follow = FollowState::new();
+        assert!(follow.poll_in(&dir).unwrap().is_empty());
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+
+        // A torn write: the writer got as far as the middle of a line.
+        write!(file, "INFO first half of a").unwrap();
+        file.flush().unwrap();
+        assert!(
+            follow.poll_in(&dir).unwrap().is_empty(),
+            "a line with no newline yet is not a line — it must not be published"
+        );
+
+        // The rest of that line, plus a whole one, plus another tear.
+        write!(file, " torn line\nINFO a whole line\nINFO the next tor").unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            follow.poll_in(&dir).unwrap(),
+            vec![
+                "INFO first half of a torn line".to_string(),
+                "INFO a whole line".to_string(),
+            ],
+            "the completed line must arrive once and whole, and the new partial must be held back"
+        );
+
+        // And the held-back partial completes in its turn — once, whole.
+        writeln!(file, "n line").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        assert_eq!(follow.poll_in(&dir).unwrap(), vec!["INFO the next torn line".to_string()]);
+        assert!(follow.poll_in(&dir).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1025,7 +1025,10 @@ async fn logs_recent_handler(
 /// Live tail: polls the current log file every 750ms (`logs::FollowState`)
 /// and pushes any newly-appended lines as one SSE event per tick (a JSON
 /// array, batching whatever arrived since the last tick rather than one
-/// frame per line) — mirrors `/study/{study_id}/events`'s existing SSE
+/// frame per line). **Every element is one whole log line** — a tick that
+/// lands inside the writer's own `write` holds the trailing partial back
+/// until its newline arrives, rather than splitting one line across two
+/// frames (`logs::FollowState::poll_in`, decision 44) — mirrors `/study/{study_id}/events`'s existing SSE
 /// shape in this same file. Poll-based rather than a custom broadcasting
 /// `tracing` layer, deliberately: the latter would mean modifying
 /// `main.rs`'s `init_tracing` — foundational, already-deployed setup for a
