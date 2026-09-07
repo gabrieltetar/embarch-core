@@ -135,13 +135,16 @@ impl FollowState {
     /// would re-read the same bad bytes every 750 ms forever.
     ///
     /// **One anchor is not covered by that rule, deliberately:** the
-    /// file's length at rotation-detection time, below. If *that* tick
-    /// lands inside a torn write, the anchor sits mid-line and the
-    /// remainder of that one line surfaces as one short line. Closing it
-    /// would need a "we started mid-line" flag carried across ticks, for
-    /// a race that requires a 750 ms tick to land inside a microsecond
-    /// window on a file that was created moments earlier, with one
-    /// truncated line in a debug console as the whole cost.
+    /// file's length taken below whenever this state is not already
+    /// following that file. If *that* read lands inside a torn write, the
+    /// anchor sits mid-line and the remainder of that one line surfaces
+    /// as one short line. **Note which case that is: the branch is "first
+    /// tick" as well as "rotated", so it is reached once per subscriber,
+    /// on whatever file Core is writing — not only on a file that has
+    /// just been created.** Closing it would need a "we started mid-line"
+    /// flag carried across ticks; the reason not to is the size of the
+    /// loss — one short line at the head of a tail nobody has read yet —
+    /// and not the rarity of the case.
     fn poll_in(&mut self, dir: &std::path::Path) -> Result<Vec<String>> {
         use std::io::{Read, Seek, SeekFrom};
 
