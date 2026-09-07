@@ -1338,6 +1338,40 @@ mod tests {
             .collect()
     }
 
+    /// The number of distinct `.route(` registration lines `build_router`
+    /// carries — i.e. `registered_route_paths().len()`, **not**
+    /// `AUTH_CASES.len()`: `/signals` is one `.route()` call chaining
+    /// `.get()`/`.post()`, one line but two auth cases, so this number runs
+    /// one behind that one. Hand-counted against
+    /// `embarch-doc/embarch-core/interfaces.md`'s tables, every alias row
+    /// (`/power-data` · `/waveform-data` · `/gatt-data`) counted separately
+    /// even where the doc collapses them onto one markdown row for
+    /// readability. **Not** derived by reading that file: this crate has no
+    /// reliable relative path to it — the doc repo is a sibling checkout in
+    /// the normal layout but a *different* worktree entirely under the
+    /// fleet's one-branch-two-worktrees model (`embarch-fleet/protocol.md`
+    /// §5), so a path that resolves for a human at a desk breaks under a
+    /// worker's checkout with no signal beyond an `include_str!` compile
+    /// error naming a path nobody touched (decision 46). A pinned literal,
+    /// checked against the same source scan `AUTH_CASES` already relies on,
+    /// catches the same drift `tasks/core/018` found without that cross-repo
+    /// dependency.
+    const DOCUMENTED_ROUTE_COUNT: usize = 26;
+
+    #[test]
+    fn every_registered_route_has_a_row_in_interfaces_md() {
+        let registered = registered_route_paths();
+        assert_eq!(
+            registered.len(),
+            DOCUMENTED_ROUTE_COUNT,
+            "`build_router` now registers {} `.route(` lines; \
+             `embarch-doc/embarch-core/interfaces.md` was last counted at \
+             {DOCUMENTED_ROUTE_COUNT}. Add (or remove) the row there, then move \
+             `DOCUMENTED_ROUTE_COUNT` to match in the same commit.",
+            registered.len()
+        );
+    }
+
     #[test]
     fn every_registered_route_has_an_auth_case() {
         let registered = registered_route_paths();
