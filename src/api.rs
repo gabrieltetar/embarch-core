@@ -1359,7 +1359,7 @@ mod tests {
     const DOCUMENTED_ROUTE_COUNT: usize = 26;
 
     #[test]
-    fn every_registered_route_has_a_row_in_interfaces_md() {
+    fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
         let registered = registered_route_paths();
         assert_eq!(
             registered.len(),
