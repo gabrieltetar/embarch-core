@@ -592,7 +592,15 @@ pub struct HelloAckInfo {
     pub firmware_version: String,
     /// What the bench says its own chip ID is (`embarch-study-designer`
     /// schema v10, §3 decision 35) — empty when its build cannot answer.
-    pub hardware_id: String,
+    ///
+    /// Named `self_reported_hardware_id`, not `hardware_id`, since decision
+    /// 47 (2026-09-07, `tasks/core/020`): this route used to serve this
+    /// field as `hardware_id` and the JTAG-read one below as
+    /// `probe_hardware_id`, so a caller comparing `hardware_id` here against
+    /// `hardware_id` from `/probes/enrolled` got a different fact under the
+    /// same name — four fields apart in one response, differing only by a
+    /// swap of their two 4-byte halves.
+    pub self_reported_hardware_id: String,
     /// How that compares to the identity the JTAG side just verified, as a
     /// stable string (`match`/`mismatch`/`not-reported`/`undeclared`).
     /// Reported rather than only enforced, because `undeclared` is the
@@ -601,7 +609,10 @@ pub struct HelloAckInfo {
     /// `embarch_topology::hardware::compare_self_reported`.
     pub link_identity: String,
     /// The JTAG-read identity this was compared against, so one call to
-    /// `GET /dev-bench/hello` shows both halves.
+    /// `GET /dev-bench/hello` shows both halves. This is the probe-read ID's
+    /// one spelling *within this route*; the same value is spelled
+    /// `hardware_id` on `/probes/enroll`, `/probes/enrolled` and
+    /// `POST /validate` — decision 47 has why that gap is not closed here.
     pub probe_hardware_id: String,
 }
 
@@ -774,7 +785,7 @@ async fn open_and_handshake(
                     schema_version,
                     compatible,
                     firmware_version: firmware_version.to_string(),
-                    hardware_id: hardware_id.to_string(),
+                    self_reported_hardware_id: hardware_id.to_string(),
                     link_identity: describe_identity(identity).to_string(),
                     probe_hardware_id: probe_hardware_id.clone(),
                 };
