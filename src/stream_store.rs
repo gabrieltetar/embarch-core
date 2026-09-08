@@ -681,6 +681,10 @@ impl StreamStore {
                 truncated: tap.lost_at_source
                     || tap.raw.truncated
                     || tap.rendered.as_ref().is_some_and(|r| r.truncated),
+                // Filled in after the capture closes, by
+                // `study::verify_declared_records` — the store has the bytes'
+                // lengths, not their meaning.
+                records: None,
             })
             .collect()
     }

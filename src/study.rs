@@ -1359,7 +1359,7 @@ fn run_study_to_completion(
 
     if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, 0) {
         stop_signal_taps(&mut signal_taps);
-        finish_streams(&capture, &mut writer);
+        finish_streams(&capture, &mut writer, &results_dir);
         render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
         fail_job(&jobs, &events_tx, &study_id, msg);
         return;
@@ -1688,7 +1688,7 @@ fn run_study_to_completion(
     // Whatever happened, Core's own ports close and the capture's `streams`
     // are sealed into the writer before the job's status is decided.
     stop_signal_taps(&mut signal_taps);
-    finish_streams(&capture, &mut writer);
+    finish_streams(&capture, &mut writer, &results_dir);
     // On the failure path too: a study that stopped early still captured
     // whatever ran before it did, and a trace of the run that went wrong is
     // the one most worth reading.
@@ -1704,8 +1704,105 @@ fn run_study_to_completion(
 /// path, including a failure: a failed study's `.partial` file is a
 /// diagnostic artifact, and a diagnostic that omits what the capture
 /// actually produced is worth less than one that includes it.
-fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter) {
-    writer.set_streams(capture.store.lock().unwrap().refs());
+fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter, results_dir: &FsPath) {
+    let mut refs = capture.store.lock().unwrap().refs();
+    verify_declared_records(results_dir, &capture.study.record_checks, &mut refs);
+    writer.set_streams(refs);
+}
+
+/// Runs every `Study.record_checks` entry against the capture it names and
+/// folds the answer onto that tap's `StreamRef`.
+///
+/// **This is the only end-to-end statement a result carries.** `truncated`
+/// says a *link* reported losing something; a record's own CRC says whether
+/// the bytes on disk are the bytes the DUT computed it over, across the flash
+/// read, the unacknowledged BLE notifications, dev-bench's queues, this UART,
+/// the deframer and the write. A 10 h drain came back `truncated: false` with
+/// three of 598 records damaged, and this is what would have said so.
+///
+/// Post-hoc, on the raw file, after the capture is closed — the same posture
+/// `render_outpost_traces` takes and for the same reason: a check that had to
+/// keep up with the live stream would be a second thing that could fall
+/// behind, which is the fault this whole pass is about.
+///
+/// A read failure costs the check, never the capture: the bytes are already on
+/// disk and a study that ran is still a study that ran.
+fn verify_declared_records(
+    results_dir: &FsPath,
+    checks: &[embarch_study_designer::records::RecordCheck],
+    refs: &mut [embarch_study_designer::streams::StreamRef],
+) {
+    if checks.is_empty() {
+        return;
+    }
+    let streams_dir = results_dir.join(stream_store::STREAMS_DIR);
+    let index = match stream_store::read_index(&streams_dir) {
+        Ok(Some(index)) => index,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("could not read the stream index to check records: {e:?}");
+            return;
+        }
+    };
+
+    for check in checks.iter() {
+        let Some(entry) = index.streams.iter().find(|e| e.id == check.stream_id) else {
+            tracing::warn!(
+                id = check.stream_id,
+                "a record check names a stream id this study never captured; skipping it"
+            );
+            continue;
+        };
+        // `StreamTap::id` is enforced to equal its index in `Study.streams`,
+        // and `refs()` is in that same declaration order — so the id indexes
+        // `refs` directly. Checked rather than assumed, because being wrong
+        // here would attribute one capture's integrity to another's.
+        let Some(target) = refs.get_mut(usize::from(check.stream_id)) else {
+            continue;
+        };
+        if target.name.as_str() != entry.name {
+            tracing::warn!(
+                id = check.stream_id,
+                declared = target.name.as_str(),
+                captured = entry.name.as_str(),
+                "stream id does not name the same tap in the index as in the refs; \
+                 skipping its record check rather than reporting the wrong capture's"
+            );
+            continue;
+        }
+
+        let path = streams_dir.join(&entry.raw_file);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    id = check.stream_id,
+                    path = %path.display(),
+                    "could not read a capture to check its records: {e:?}"
+                );
+                continue;
+            }
+        };
+        let report = embarch_study_designer::records::verify_records(&bytes, &check.framing);
+        if report.all_verified() {
+            tracing::info!(
+                id = check.stream_id,
+                name = target.name.as_str(),
+                records = report.total,
+                "every record in this capture verified"
+            );
+        } else {
+            tracing::warn!(
+                id = check.stream_id,
+                name = target.name.as_str(),
+                total = report.total,
+                verified = report.verified,
+                leading_bytes = report.leading_bytes,
+                "this capture has records that do not verify; see `records` on its StreamRef"
+            );
+        }
+        target.records = Some(report);
+    }
 }
 
 /// Decodes every `OutpostTrace` tap's captured bytes into a `*.trace.csv`,
@@ -3128,6 +3225,47 @@ async fn serve_capture(
 
 #[cfg(test)]
 mod tests {
+
+    /// Checks `verify_records` against a real capture rather than a
+    /// constructed one, when `EMBARCH_RECORDS_FIXTURE` names one.
+    ///
+    /// **Ground truth this was written against**: study
+    /// `872aef3c466dd465c66e671412a97760`'s `bds-data.bin`, 9537173 bytes of
+    /// GWF1 PPG records from a 10 h drain, whose damage was characterised
+    /// independently before any of this existed -- 598 records, 595 verifying,
+    /// three damaged at offsets 3340812, 5077323 and 8944504 by three lost
+    /// `StreamChunkBatch` frames (976 bytes = four 244-byte notifications).
+    ///
+    /// Skipped when the variable is unset, because a 9.5 MB fixture does not
+    /// belong in a repository and a synthetic one cannot prove agreement with
+    /// a capture the DUT actually produced. Run it as:
+    ///
+    /// ```text
+    /// EMBARCH_RECORDS_FIXTURE=/path/to/bds-data.bin \
+    ///   cargo test records_fixture -- --nocapture
+    /// ```
+    #[test]
+    fn a_real_capture_reports_the_records_that_actually_verify() {
+        let Ok(path) = std::env::var("EMBARCH_RECORDS_FIXTURE") else {
+            eprintln!("EMBARCH_RECORDS_FIXTURE unset; skipping the real-capture check");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("the fixture named by the env var");
+        let framing = embarch_study_designer::records::RecordFraming::MagicPrefixedCrc32Le {
+            magic: heapless::Vec::from_slice(b"GWF1").unwrap(),
+        };
+        let report = embarch_study_designer::records::verify_records(&bytes, &framing);
+        eprintln!(
+            "{path}: {} records, {} verified, {} leading bytes, bad at {:?}",
+            report.total, report.verified, report.leading_bytes, report.bad_offsets
+        );
+        assert!(report.total > 0, "a GWF1 capture has records");
+        assert_eq!(
+            report.total - report.verified,
+            report.bad_offsets.len() as u32,
+            "with a capture this size the offset list is not capped, so the two must agree"
+        );
+    }
     use super::*;
     use embarch_study_designer::RESERVED_DEV_BENCH_STREAM_NAME;
     use embarch_study_designer::{
@@ -3213,6 +3351,7 @@ mod tests {
             protocols: Default::default(),
             protocols_crc: 0,
             dev_bench_log_level: Default::default(),
+            record_checks: Default::default(),
         }
     }
 
@@ -4227,7 +4366,7 @@ mod tests {
         let mut writer =
             EventsJsonWriter::start(dir.path(), "s", &provenance_for(&capture.study, "gbench1", &no_run_params(), Default::default()))
                 .unwrap();
-        finish_streams(&capture, &mut writer);
+        finish_streams(&capture, &mut writer, dir.path());
         writer.finish().unwrap();
 
         let bytes = std::fs::read(dir.path().join("events.json")).unwrap();
