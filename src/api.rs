@@ -846,12 +846,16 @@ async fn dev_bench_port_handler(
 // ---- POST /validate ---------------------------------------------------
 
 /// Explicit, non-destructive live re-check of an already-enrolled board's
-/// identity (`embarch_topology::hardware::validate_role`, design.md §3
+/// identity (`embarch_topology::hardware::validate_role_timed`, design.md §3
 /// decision 28) — the exact same check `flash`/`reset`/the dev-bench
 /// handshake already run mid-attach (decisions 8, 22), callable on its own,
 /// any time, without an actual `flash`/`reset`/`run_study` call to trigger
 /// it. Takes `hw_lock` like `/flash`/`/reset` — it opens the same physical
 /// probe connection those do, and shouldn't be allowed to race either.
+/// Calls the `_timed` variant (`embarch-topology` decision 26) so the
+/// response can carry `validated_at_utc_ms` — the instant *this* call's
+/// check passed — alongside the unchanged `confirmed_at_utc_ms` from the
+/// enrolled record (`embarch-core` decision below).
 #[derive(Deserialize)]
 struct ValidateRequest {
     role: String,
@@ -865,6 +869,14 @@ struct ValidateOkResponse {
     chip: String,
     hardware_id: String,
     confirmed_at_utc_ms: u64,
+    /// The instant *this* live check's hardware-ID compare passed — distinct
+    /// from `confirmed_at_utc_ms` above, which names *enrolment* time and
+    /// does not move on a re-check (`embarch-topology` decision 26;
+    /// `embarch-core` decision below). Two `/validate` calls minutes or days
+    /// apart used to come back with identical `confirmed_at_utc_ms`, which a
+    /// caller reading it as freshness could mistake for a plausible, wrong
+    /// answer in the safe-looking direction.
+    validated_at_utc_ms: u64,
 }
 
 /// Mirrors `embarch_topology::hardware::TopologyMismatch`'s fields — a
@@ -891,23 +903,27 @@ async fn validate_handler(
     let _guard = state.hw_lock.lock().await;
     let role = req.role;
 
-    let result = tokio::task::spawn_blocking(move || embarch_topology::hardware::validate_role(&role))
+    let result = tokio::task::spawn_blocking(move || embarch_topology::hardware::validate_role_timed(&role))
         .await
         .map_err(internal_err)?;
 
     match result {
-        Ok(board) => Ok((
-            StatusCode::OK,
-            Json(ValidateOkResponse {
-                ok: true,
-                role: board.role,
-                probe_serial: board.probe_serial,
-                chip: board.chip,
-                hardware_id: board.hardware_id,
-                confirmed_at_utc_ms: board.confirmed_at_utc_ms,
-            }),
-        )
-            .into_response()),
+        Ok(validation) => {
+            let board = validation.board;
+            Ok((
+                StatusCode::OK,
+                Json(ValidateOkResponse {
+                    ok: true,
+                    role: board.role,
+                    probe_serial: board.probe_serial,
+                    chip: board.chip,
+                    hardware_id: board.hardware_id,
+                    confirmed_at_utc_ms: board.confirmed_at_utc_ms,
+                    validated_at_utc_ms: validation.validated_at_utc_ms,
+                }),
+            )
+                .into_response())
+        }
         Err(e) => {
             // A topology mismatch is an expected, structured outcome of a
             // non-destructive check — not a Core failure — so it's a `409
