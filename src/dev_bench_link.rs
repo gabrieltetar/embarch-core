@@ -15,7 +15,10 @@ use anyhow::{Context, Result};
 use embarch_study_designer::DevBenchMessage;
 use serialport::SerialPort;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The Core↔dev-bench UART link runs at 1 Mbaud
 /// (`embarch-study-designer/design.md` §3 decision 25) — a fact that
@@ -34,10 +37,52 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 /// [`DevBenchLink::unframed_tail_full`] for why the two differ.
 const UNFRAMED_TAIL_REASON_CAP: usize = 192;
 
+/// How much the reader thread asks for per `read`. Larger than the 256 the
+/// inline reader used: the thread has nothing else to do, and the fewer
+/// syscalls it makes per second the less of the driver's buffer it is
+/// responsible for.
+const READ_CHUNK_BYTES: usize = 4096;
+
+/// How long [`DevBenchLink::recv`] waits on the reader thread before
+/// re-checking its own deadline. Only a poll granularity — the reader is
+/// already blocking on the port for [`READ_TIMEOUT`], so this decides
+/// deadline precision and nothing about throughput.
+const READER_POLL: Duration = Duration::from_millis(20);
+
+/// What the reader thread hands back.
+enum ReaderEvent {
+    /// Bytes off the wire, in arrival order.
+    Bytes(Vec<u8>),
+    /// The port failed. The reader thread has exited; the string is the
+    /// error, kept as text because `std::io::Error` is not `Clone` and this
+    /// only ever gets formatted into a context.
+    Failed(String),
+}
+
+/// Where [`DevBenchLink::recv`] gets its bytes.
+///
+/// **The threaded variant is the point, and the inline one is a fallback.**
+/// See [`DevBenchLink::open`] for what goes wrong when the study loop reads
+/// the port itself.
+enum Source {
+    /// A dedicated thread owns a clone of the port and does nothing but read.
+    Threaded {
+        rx: Receiver<ReaderEvent>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    },
+    /// `try_clone` failed, so reads happen on the caller's thread as they
+    /// always did. Never seen in practice; kept because a platform quirk in
+    /// handle duplication must not take the whole bench down.
+    Inline,
+}
+
 /// One open serial connection to `embarch-dev-bench`, speaking
 /// COBS-framed/postcard-encoded `DevBenchMessage`s one at a time.
 pub struct DevBenchLink {
     port: Box<dyn SerialPort>,
+    /// Where `recv` sources bytes from — see [`Source`].
+    source: Source,
     /// Bytes read off the wire but not yet consumed into a complete,
     /// delimited frame — a blocking serial read can return partial data (or
     /// more than one frame's worth at once), so this carries the remainder
@@ -108,12 +153,69 @@ pub enum Received {
 impl DevBenchLink {
     /// Opens `port_name` at [`DEV_BENCH_BAUD`]. Does not send `Hello` or do
     /// anything else protocol-level — that's `study.rs`'s job.
+    ///
+    /// **Reading happens on a dedicated thread, and that is a fix rather than
+    /// tidiness.** `study.rs`'s loop calls `write_stream_record` inline for
+    /// every record a `StreamChunkBatch` carries, so for the duration of each
+    /// filesystem write nobody was reading the port. This link has no flow
+    /// control (see below) and runs at 1 Mbaud, which fills the driver's
+    /// default ~4 KB receive buffer in about 40 ms — so any write that took
+    /// longer than that dropped a contiguous run of bytes, mid-frame, with
+    /// nothing to detect it but a frame that then failed to decode. A 10 h PPG
+    /// drain lost three frames that way (study
+    /// `872aef3c466dd465c66e671412a97760`: 976 bytes, 3 of 598 records).
+    ///
+    /// The channel is deliberately unbounded. A bounded one would block the
+    /// reader when the study loop fell behind, which is precisely the failure
+    /// being removed; the link's own ceiling is ~100 KB/s and the loop drains
+    /// it continuously, so the queue is a burst absorber and not a buffer that
+    /// grows.
     pub fn open(port_name: &str) -> Result<Self> {
         let port = serialport::new(port_name, DEV_BENCH_BAUD)
             .timeout(READ_TIMEOUT)
             .open()
             .with_context(|| format!("failed to open dev-bench serial port '{port_name}'"))?;
-        Ok(Self { port, buf: Vec::new(), empty_frames: 0, undecodable_frames: 0 })
+
+        let source = match port.try_clone() {
+            Ok(mut read_half) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_reader = Arc::clone(&stop);
+                let join = std::thread::Builder::new()
+                    .name("dev-bench-reader".to_string())
+                    .spawn(move || {
+                        let mut chunk = [0u8; READ_CHUNK_BYTES];
+                        while !stop_reader.load(Ordering::Relaxed) {
+                            match read_half.read(&mut chunk) {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    if tx.send(ReaderEvent::Bytes(chunk[..n].to_vec())).is_err() {
+                                        return; // the link went away
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                                Err(e) => {
+                                    let _ = tx.send(ReaderEvent::Failed(e.to_string()));
+                                    return;
+                                }
+                            }
+                        }
+                    })
+                    .context("failed to spawn the dev-bench reader thread")?;
+                Source::Threaded { rx, stop, join: Some(join) }
+            }
+            Err(e) => {
+                // Not fatal: reading on the caller's thread is what this did
+                // before, bytes-at-risk and all.
+                tracing::warn!(
+                    "could not clone the dev-bench serial port ({e}); reading it on the study \
+                     thread instead, which risks losing bytes under load"
+                );
+                Source::Inline
+            }
+        };
+
+        Ok(Self { port, source, buf: Vec::new(), empty_frames: 0, undecodable_frames: 0 })
     }
 
     /// How many frames this link has read that would not decode. Read by
@@ -428,12 +530,84 @@ impl DevBenchLink {
                 return Ok(Received::Deadline);
             }
 
-            let mut chunk = [0u8; 256];
-            match self.port.read(&mut chunk) {
-                Ok(0) => {}
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => return Err(e).context("error reading from dev-bench serial port"),
+            self.fill_once()?;
+        }
+    }
+
+    /// Waits up to [`READER_POLL`] for the reader thread's next bytes, then
+    /// takes everything else already queued behind them.
+    ///
+    /// **The drain-behind is what absorbs a burst.** Returning after one
+    /// message would hand `recv` one chunk per poll, so a backlog the reader
+    /// collected while the caller was writing to disk would be paid off at
+    /// `READ_CHUNK_BYTES` per `READER_POLL` instead of at once. That rate
+    /// (~200 KB/s) still happens to exceed this 1 Mbaud link, which is exactly
+    /// why this needs a test rather than a bench run to hold it in place.
+    ///
+    /// Pure with respect to the port, so it is testable without one.
+    fn drain_reader(rx: &Receiver<ReaderEvent>, buf: &mut Vec<u8>) -> Result<()> {
+        match rx.recv_timeout(READER_POLL) {
+            Ok(ReaderEvent::Bytes(bytes)) => buf.extend_from_slice(&bytes),
+            Ok(ReaderEvent::Failed(e)) => {
+                anyhow::bail!("error reading from dev-bench serial port: {e}")
+            }
+            Err(RecvTimeoutError::Timeout) => return Ok(()),
+            // The reader exited without reporting why, which only happens if
+            // it saw `stop` — and nothing sets that while a caller is still
+            // in `recv`.
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("the dev-bench reader thread stopped unexpectedly")
+            }
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(ReaderEvent::Bytes(bytes)) => buf.extend_from_slice(&bytes),
+                Ok(ReaderEvent::Failed(e)) => {
+                    anyhow::bail!("error reading from dev-bench serial port: {e}")
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// One helping of bytes into `self.buf`, from wherever this link reads.
+    ///
+    /// Drains everything already queued before waiting, so a burst the reader
+    /// thread collected while the caller was writing to disk is consumed in
+    /// one pass rather than one `READER_POLL` at a time.
+    fn fill_once(&mut self) -> Result<()> {
+        match &self.source {
+            Source::Threaded { rx, .. } => Self::drain_reader(rx, &mut self.buf),
+            Source::Inline => {
+                let mut chunk = [0u8; READ_CHUNK_BYTES];
+                match self.port.read(&mut chunk) {
+                    Ok(0) => Ok(()),
+                    Ok(n) => {
+                        self.buf.extend_from_slice(&chunk[..n]);
+                        Ok(())
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+                    Err(e) => Err(e).context("error reading from dev-bench serial port"),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DevBenchLink {
+    /// Stops the reader thread and waits for it.
+    ///
+    /// The join is bounded in practice by [`READ_TIMEOUT`]: the thread is
+    /// either blocked in a read that times out within 200 ms or already on its
+    /// way round the loop to see `stop`. Waiting rather than detaching so the
+    /// port handle is closed before the next study opens the same port —
+    /// open-per-study means that happens immediately.
+    fn drop(&mut self) {
+        if let Source::Threaded { stop, join, .. } = &mut self.source {
+            stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = join.take() {
+                let _ = handle.join();
             }
         }
     }
@@ -592,6 +766,58 @@ mod tests {
             DevBenchLink::cobs_decode_prefix(&[0x03, 0x03, 0x07, 0x02, 0x09], 8),
             vec![0x03, 0x07, 0x00, 0x09, 0x00]
         );
+    }
+
+    /// A backlog the reader thread built up while the caller was busy is
+    /// consumed in one pass, not one chunk per poll.
+    #[test]
+    fn a_readers_backlog_is_drained_in_one_pass() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for part in [b"aaa".as_slice(), b"bbb".as_slice(), b"ccc".as_slice()] {
+            tx.send(ReaderEvent::Bytes(part.to_vec())).unwrap();
+        }
+        let mut buf = Vec::new();
+        DevBenchLink::drain_reader(&rx, &mut buf).expect("a queued backlog is not an error");
+        assert_eq!(buf, b"aaabbbccc", "all three chunks, in arrival order, in one call");
+    }
+
+    /// A port error reaches the caller as a link failure rather than being
+    /// swallowed by the thread that saw it -- the reader has already exited by
+    /// then, so nothing else would ever report it.
+    #[test]
+    fn a_reader_side_port_error_surfaces_to_the_caller() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ReaderEvent::Bytes(b"partial".to_vec())).unwrap();
+        tx.send(ReaderEvent::Failed("Access denied".to_string())).unwrap();
+        let mut buf = Vec::new();
+        let err = DevBenchLink::drain_reader(&rx, &mut buf).expect_err("the port failed");
+        assert!(err.to_string().contains("Access denied"), "{err}");
+        // And the bytes that did arrive before the failure are kept: they may
+        // hold the frame that explains it.
+        assert_eq!(buf, b"partial");
+    }
+
+    /// Nothing queued is not an error and not a busy-wait -- it is the poll
+    /// granularity `recv` re-checks its own deadline on.
+    #[test]
+    fn an_idle_reader_yields_nothing_without_failing() {
+        let (_tx, rx) = std::sync::mpsc::channel::<ReaderEvent>();
+        let mut buf = Vec::new();
+        let started = Instant::now();
+        DevBenchLink::drain_reader(&rx, &mut buf).expect("idle is not an error");
+        assert!(buf.is_empty());
+        assert!(started.elapsed() >= READER_POLL, "it waited for the poll interval");
+    }
+
+    /// A reader thread that has gone away without saying why must not read as
+    /// a quiet link: `recv` would loop to the deadline on it.
+    #[test]
+    fn a_vanished_reader_is_a_link_failure_not_silence() {
+        let (tx, rx) = std::sync::mpsc::channel::<ReaderEvent>();
+        drop(tx);
+        let mut buf = Vec::new();
+        let err = DevBenchLink::drain_reader(&rx, &mut buf).expect_err("the reader is gone");
+        assert!(err.to_string().contains("stopped unexpectedly"), "{err}");
     }
 
     /// `StepResult` arriving short of what its COBS code byte promised, which
