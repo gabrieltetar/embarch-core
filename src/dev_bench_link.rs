@@ -83,10 +83,23 @@ pub struct DevBenchLink {
 pub enum Received {
     /// A frame arrived and decoded.
     Message(DevBenchMessage),
-    /// A frame arrived and did not decode; the string is
-    /// [`DevBenchLink::describe_undecodable_frame`]'s account of it, ready to
-    /// log. The link is still live and the caller should keep reading.
-    Undecodable(String),
+    /// A frame arrived and did not decode. The link is still live and the
+    /// caller should keep reading.
+    ///
+    /// `stream_id` carries the attribution: `Some(id)` when the frame was a
+    /// `StreamChunkBatch` and its prefix said which capture it was feeding, so
+    /// the caller can mark that tap's capture incomplete instead of throwing
+    /// the bytes away silently. `None` for every other variant, and for a
+    /// frame too short to say — the caller's cue to be conservative rather
+    /// than to assume nothing was lost. See
+    /// [`DevBenchLink::undecodable_stream_id`].
+    Undecodable {
+        /// [`DevBenchLink::describe_undecodable_frame`]'s account of it, ready
+        /// to log.
+        what: String,
+        /// The capture this frame was carrying bytes for, when it is knowable.
+        stream_id: Option<u8>,
+    },
     /// The deadline passed with no complete frame buffered. The caller's
     /// watchdog case, not an error.
     Deadline,
@@ -263,6 +276,68 @@ impl DevBenchLink {
         )
     }
 
+    /// `StreamChunkBatch`'s variant index, the one undecodable frame whose
+    /// loss is attributable to a specific capture. Named rather than spelled
+    /// `3` at the use site so it cannot drift from [`Self::describe_tag`].
+    const TAG_STREAM_CHUNK_BATCH: u8 = 3;
+
+    /// Partially COBS-decodes `head`, stopping at whatever it can reach.
+    ///
+    /// Not `cobs::decode` (or postcard's) because `head` is a *prefix* of a
+    /// frame that already failed to decode: a decoder that insists on a
+    /// well-formed whole gives nothing back on precisely the input this
+    /// exists for. Bounded by `max` so a long frame's prefix cannot cost more
+    /// than the caller asked for.
+    fn cobs_decode_prefix(head: &[u8], max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+
+        while i < head.len() && out.len() < max {
+            let code = usize::from(head[i]);
+            if code == 0 {
+                break; // the frame delimiter — nothing further belongs to it
+            }
+            i += 1;
+            let take = (code - 1).min(head.len() - i).min(max - out.len());
+            out.extend_from_slice(&head[i..i + take]);
+            i += take;
+            // A block shorter than its code byte claimed means the prefix ran
+            // out mid-block; the implicit zero it would have ended with never
+            // arrived, so do not invent one.
+            if take < code - 1 {
+                break;
+            }
+            if code < 0xFF && out.len() < max {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    /// The stream id an undecodable frame was carrying bytes for, when the
+    /// frame is a `StreamChunkBatch` and its prefix reaches far enough to say.
+    ///
+    /// **This is what stops a lost frame being a silent short capture.**
+    /// dev-bench counts its own drops and reports them on `StreamClose`, and
+    /// Core counts its own undecodable frames — but nothing joined the two, so
+    /// a frame Core threw away never reached the tap's `truncated` flag. A
+    /// 10 h PPG drain lost three `StreamChunkBatch` frames (976 bytes, 4
+    /// notifications) and `list-study-streams` reported the capture
+    /// `truncated: false`, which is the one thing that flag exists to prevent.
+    ///
+    /// Only the variant and one `u8` field are needed, so a two-byte decode is
+    /// enough and a frame truncated anywhere past its second byte still
+    /// attributes correctly: postcard writes an enum as varint(variant) then
+    /// the variant's fields positionally, and `StreamChunkBatch`'s first field
+    /// is `id: u8`.
+    pub(crate) fn undecodable_stream_id(head: &[u8]) -> Option<u8> {
+        let decoded = Self::cobs_decode_prefix(head, 2);
+        match (decoded.first(), decoded.get(1)) {
+            (Some(&Self::TAG_STREAM_CHUNK_BATCH), Some(&id)) => Some(id),
+            _ => None,
+        }
+    }
+
     /// `DevBenchMessage`'s variant index -> its name. Hand-maintained
     /// against `embarch-study-designer`'s `protocol.rs`, in the same
     /// append-only order postcard encodes positionally — an unknown index is
@@ -341,9 +416,10 @@ impl DevBenchLink {
                     Ok(msg) => Ok(Received::Message(msg)),
                     Err(_) => {
                         self.undecodable_frames += 1;
-                        Ok(Received::Undecodable(Self::describe_undecodable_frame(
-                            &head, framed_len,
-                        )))
+                        Ok(Received::Undecodable {
+                            what: Self::describe_undecodable_frame(&head, framed_len),
+                            stream_id: Self::undecodable_stream_id(&head),
+                        })
                     }
                 };
             }
@@ -441,6 +517,83 @@ mod tests {
 
     /// **A frame short of its own declared length says so, and says by how
     /// much.** This is the fault that cost three studies to characterise: a
+    /// The three frames a 10 h PPG drain actually lost (study
+    /// `872aef3c466dd465c66e671412a97760`, 2026-09-08), pinned as the
+    /// regression this attribution exists for.
+    ///
+    /// All three are `StreamChunkBatch` for stream id 0 — the run's `bds-data`
+    /// tap — and between them they cost 976 bytes, four 244-byte
+    /// notifications, damaging 3 of 598 records. Every one of them was thrown
+    /// away with `truncated: false` reported on the capture. Their prefixes go
+    /// in verbatim: a hand-built frame would only prove the decoder agrees
+    /// with itself.
+    #[test]
+    fn the_three_frames_a_ten_hour_drain_lost_attribute_to_their_capture() {
+        // COBS code 0x02 opens a one-byte block, so the variant index is
+        // followed immediately by the implicit zero the block ends with --
+        // which *is* the `id: u8` field, and is why a two-byte decode is
+        // enough. Getting this wrong reads id 9, 12 and 9 off the next code
+        // byte and attributes the loss to taps that never existed.
+        for head in [
+            [0x02u8, 0x03, 0x09, 0x01, 0x86, 0xc4, 0xcc, 0x07, 0xf4, 0x01].as_slice(),
+            [0x02u8, 0x03, 0x0c, 0x01, 0xdd, 0xf0, 0xdc, 0x0a, 0xf4, 0x01].as_slice(),
+            [0x02u8, 0x03, 0x09, 0x01, 0xfd, 0xcc, 0xd5, 0x11, 0xf4, 0x01].as_slice(),
+        ] {
+            assert_eq!(
+                DevBenchLink::undecodable_stream_id(head),
+                Some(0),
+                "the bds-data tap is id 0 and every one of these frames was feeding it"
+            );
+        }
+    }
+
+    /// A non-zero stream id rides inside the first COBS block rather than
+    /// being the zero that ends it, so the two encodings must both attribute.
+    #[test]
+    fn a_non_zero_stream_id_is_attributed_from_inside_the_cobs_block() {
+        // payload 03 05 ... -> one block of two non-zero bytes, code 0x03.
+        let head = [0x03u8, 0x03, 0x05, 0x04, 0x11, 0x22, 0x33];
+        assert_eq!(DevBenchLink::undecodable_stream_id(&head), Some(5));
+    }
+
+    /// Every other variant, and a frame too short to say, must decline to
+    /// attribute — a wrong tap marked incomplete is its own lie, and the
+    /// caller's fallback (mark every open tap) is the honest answer instead.
+    #[test]
+    fn only_a_stream_chunk_batch_attributes_and_a_short_frame_declines() {
+        // StepResult (variant 7) carrying a step index, not a stream id.
+        let step_result = [0x03u8, 0x07, 0x05, 0x04, 0x11];
+        assert_eq!(DevBenchLink::undecodable_stream_id(&step_result), None);
+        // A LogLine (variant 5).
+        assert_eq!(DevBenchLink::undecodable_stream_id(&[0x02u8, 0x05, 0x04, 0x61]), None);
+        // Nothing at all, and a bare delimiter.
+        assert_eq!(DevBenchLink::undecodable_stream_id(&[]), None);
+        assert_eq!(DevBenchLink::undecodable_stream_id(&[0x00u8]), None);
+        // A `StreamChunkBatch` whose first block was cut short before the id:
+        // code 0x04 promises three non-zero bytes and one arrived, so the
+        // implicit zero that would have been `id: 0` never came. Declining
+        // here is what sends the caller to its mark-every-open-tap fallback.
+        // NOT to be confused with `[0x02, 0x03]`, which is a *complete*
+        // one-byte block whose implicit zero is a real id 0 -- the shape all
+        // three of the frames the 10 h drain lost actually had.
+        assert_eq!(DevBenchLink::undecodable_stream_id(&[0x04u8, 0x03]), None);
+        assert_eq!(DevBenchLink::undecodable_stream_id(&[0x02u8, 0x03]), Some(0));
+    }
+
+    /// The prefix decoder must not invent the zero a truncated block never
+    /// delivered: doing so turns "this frame stopped mid-field" into a
+    /// confident wrong id.
+    #[test]
+    fn a_block_cut_short_does_not_gain_the_zero_it_never_carried() {
+        // Code 0x05 promises four non-zero bytes; only two arrived.
+        assert_eq!(DevBenchLink::cobs_decode_prefix(&[0x05, 0x03, 0x07], 8), vec![0x03, 0x07]);
+        // The full block, by contrast, does end in its implicit zero.
+        assert_eq!(
+            DevBenchLink::cobs_decode_prefix(&[0x03, 0x03, 0x07, 0x02, 0x09], 8),
+            vec![0x03, 0x07, 0x00, 0x09, 0x00]
+        );
+    }
+
     /// `StepResult` arriving short of what its COBS code byte promised, which
     /// reads identically to a field-layout disagreement until the two numbers
     /// are put side by side (`embarch-dev-bench/design.md` §4).

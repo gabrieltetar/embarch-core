@@ -666,7 +666,7 @@ fn drain_post_ack_log_lines(link: &mut DevBenchLink) {
             // bench said something, and this window is exactly where a bench
             // explains why it just rebooted. Recorded, not fatal — the
             // handshake already succeeded by the time this runs.
-            Ok(Received::Undecodable(what)) => {
+            Ok(Received::Undecodable { what, .. }) => {
                 tracing::warn!("dev-bench sent an undecodable frame at handshake: {what}");
                 crate::dev_bench_log::note(None, &format!("undecodable frame at handshake: {what}"));
                 break;
@@ -730,7 +730,7 @@ async fn open_and_handshake(
                 // crashed is emptying its held log buffer, and one unreadable
                 // line out of that flush must not decide the handshake. The
                 // deadline still bounds the loop.
-                Ok(Received::Undecodable(what)) => {
+                Ok(Received::Undecodable { what, .. }) => {
                     tracing::warn!("dev-bench sent an undecodable frame before HelloAck: {what}");
                     crate::dev_bench_log::note(
                         None,
@@ -808,7 +808,7 @@ async fn open_and_handshake(
             // Unreachable: the loop above `continue`s on this variant. Named
             // rather than caught by a wildcard so that adding a variant to
             // `Received` is a compile error here and not a silent arm.
-            Ok(Received::Undecodable(what)) => {
+            Ok(Received::Undecodable { what, .. }) => {
                 Err(format!("expected HelloAck from dev-bench, got an undecodable frame: {what}"))
             }
             Ok(Received::Deadline) => Err(format!(
@@ -1586,9 +1586,53 @@ fn run_study_to_completion(
             // person reading Core's account, the study's own dev-bench file
             // for the person reading the run, and the run's failure reason if
             // nothing better turns up.
-            Ok(Received::Undecodable(what)) => {
+            Ok(Received::Undecodable { what, stream_id }) => {
                 tracing::error!(study_id, "{what}");
                 crate::dev_bench_log::note(Some(&study_id), &format!("UNDECODABLE FRAME: {what}"));
+                // **A frame Core throws away is captured bytes that stopped
+                // existing, and until this it was not recorded as such.**
+                // dev-bench counts its own drops onto `StreamClose.dropped`
+                // and Core counts its own undecodable frames, but nothing
+                // joined the two — so a lost `StreamChunkBatch` never reached
+                // the tap's `truncated` flag. A 10 h PPG drain lost three of
+                // them (976 bytes, four notifications, 3 of 598 records
+                // damaged) and `list-study-streams` reported the capture
+                // `truncated: false`. That is the exact failure mode the flag
+                // exists to prevent, one layer up from the asymmetry
+                // dev-bench's own `tap_dropped[]` fixed.
+                //
+                // Attributed narrowly when the frame says which capture it was
+                // feeding, and conservatively when it does not: a frame too
+                // short to name its stream, or any other variant, could still
+                // have been carrying stream bytes, and over-reporting loss on
+                // an open tap is the safe direction. Marking nothing was the
+                // unsafe one.
+                match stream_id {
+                    Some(id) if tap_for(&capture.taps, id).is_some() => {
+                        let name =
+                            tap_for(&capture.taps, id).map(|t| t.name.as_str()).unwrap_or("?");
+                        capture.store.lock().unwrap().mark_lost_at_source(id);
+                        tracing::warn!(
+                            study_id,
+                            id,
+                            name,
+                            "an undecodable frame cost this capture bytes; marking it incomplete"
+                        );
+                    }
+                    _ => {
+                        for id in open_taps.iter().copied() {
+                            capture.store.lock().unwrap().mark_lost_at_source(id);
+                        }
+                        if !open_taps.is_empty() {
+                            tracing::warn!(
+                                study_id,
+                                open_taps = open_taps.len(),
+                                "an undecodable frame did not say which capture it fed; marking \
+                                 every open tap incomplete rather than assuming none lost bytes"
+                            );
+                        }
+                    }
+                }
                 // A link that has turned to noise is a different thing from a
                 // link that lost one frame, and the difference is a count. Ten
                 // is chosen to be far above what this fault produces (one per
