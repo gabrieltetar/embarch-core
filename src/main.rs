@@ -309,6 +309,25 @@ fn main() -> anyhow::Result<()> {
 /// decision existed, must keep working regardless; a file-logging setup
 /// failure is itself reported once, after falling back, rather than silently
 /// swallowed.
+///
+/// Both arms route through [`build_fallback_subscriber`] (this arm) or an
+/// equivalent explicit `.with_writer(...)` (the success arm above) rather
+/// than the bare, zero-config `tracing_subscriber::fmt::init()` — that
+/// entry point's default `MakeWriter` is `std::io::stdout`, not stderr
+/// (`tracing_subscriber` 0.3.23, `SubscriberBuilder<..., W = fn() -> io::Stdout>`),
+/// which is what previously put this arm's own "continuing with stderr
+/// only" warning on stdout: `--version`'s output is `stdout` alone
+/// (clap's built-in handling of the flag), so anything else init_tracing
+/// put there rode along in front of it, unparseable
+/// (core/tasks/015, `embarch-umbrella`'s check 1 read exactly this). ANSI
+/// colouring turned out not to be a second, independent bug: this crate
+/// never probes whether a writer is a tty (`tracing_subscriber`'s `fmt`
+/// layer decides `is_ansi` purely from the "ansi" cargo feature and the
+/// `NO_COLOR` env var — see `Layer::default()` — not from the writer at
+/// all), so the escapes in the captured output were simply riding on the
+/// same misrouted text; moving that text off stdout removes them from
+/// stdout too, with nothing left to change separately. See `decisions.md`
+/// for the numbered entry.
 fn init_tracing() {
     match build_log_file_writer() {
         Ok(file_writer) => {
@@ -317,12 +336,30 @@ fn init_tracing() {
                 .init();
         }
         Err(e) => {
-            tracing_subscriber::fmt::init();
+            let subscriber = build_fallback_subscriber(std::io::stderr);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no global tracing subscriber should be installed yet");
             tracing::warn!(
                 "failed to set up daily-rolling log file, continuing with stderr only: {e:?}"
             );
         }
     }
+}
+
+/// Builds the fallback-arm subscriber with an explicit, injectable writer
+/// instead of the bare `tracing_subscriber::fmt::init()` this replaced
+/// (whose writer can't be substituted at all — that is the whole point of
+/// a zero-config entry point, and exactly why the old code silently
+/// defaulted to stdout). Generic so a test can hand it an in-memory writer
+/// and observe that events actually flow through the writer that gets
+/// passed in, without needing a real unwritable log directory to reach
+/// this arm, and without installing a second global default subscriber
+/// in the same process (`tracing`'s global default can only be set once).
+fn build_fallback_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt().with_writer(writer).finish()
 }
 
 /// Builds the `tracing-appender` daily-rolling file writer §3 decision 16
@@ -381,3 +418,55 @@ async fn run(bind: String, port: u16) -> anyhow::Result<()> {
 
 // Log-selection unit tests (`latest_log_file`/`tail_lines`/`FollowState`)
 // moved to `logs.rs` alongside the code they test.
+
+#[cfg(test)]
+mod init_tracing_tests {
+    use super::build_fallback_subscriber;
+    use std::sync::{Arc, Mutex};
+
+    /// An in-memory `MakeWriter` so the test can observe where
+    /// `build_fallback_subscriber` actually sends bytes, without touching a
+    /// real fd — real stdout/stderr can't be captured for assertions from
+    /// inside a `cargo test` process, and that is exactly why this seam
+    /// exists (see `build_fallback_subscriber`'s doc comment).
+    #[derive(Clone, Default)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RecordingWriter {
+        type Writer = RecordingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Pins the fallback arm's writer choice: `init_tracing`'s failure arm
+    /// must route events through whatever `MakeWriter` it is handed (in
+    /// production, `std::io::stderr` — never the bare, stdout-defaulting
+    /// `tracing_subscriber::fmt::init()` this replaced, which offered no
+    /// such seam at all). This is what a packaging script or `--version`
+    /// caller relies on: nothing this arm emits can land on stdout, because
+    /// there is no code path here that can reach it.
+    #[test]
+    fn fallback_subscriber_routes_through_its_injected_writer() {
+        let writer = RecordingWriter::default();
+        let subscriber = build_fallback_subscriber(writer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("continuing with stderr only: probe");
+        });
+        let captured = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("continuing with stderr only: probe"),
+            "expected the warning to reach the injected writer, got: {captured:?}"
+        );
+    }
+}
