@@ -171,10 +171,49 @@ impl DevBenchLink {
     /// it continuously, so the queue is a burst absorber and not a buffer that
     /// grows.
     pub fn open(port_name: &str) -> Result<Self> {
-        let port = serialport::new(port_name, DEV_BENCH_BAUD)
+        let mut port = serialport::new(port_name, DEV_BENCH_BAUD)
             .timeout(READ_TIMEOUT)
+            .flow_control(serialport::FlowControl::Hardware)
             .open()
             .with_context(|| format!("failed to open dev-bench serial port '{port_name}'"))?;
+
+        // **Hardware flow control is what makes the byte loss impossible
+        // rather than merely unlikely**, and it is asked for rather than
+        // assumed. With it, the driver de-asserts RTS when its receive buffer
+        // fills and dev-bench's `uart_poll_out` waits instead of writing into
+        // a buffer with no room; dev-bench's own `uart20` asks for
+        // `hw-flow-control` to match.
+        //
+        // Verified on the nRF54L15DK: `uart20_default` assigns RTS P1.06 and
+        // CTS P1.07, the onboard J-Link OB carries both through VCOM0, and
+        // the line reads asserted in each direction.
+        //
+        // But a bench whose board does NOT wire them would hang here rather
+        // than lose a frame: with `Hardware` set, a write blocks until CTS is
+        // asserted, so Core would never even send `Hello` and the failure
+        // would present as a mute bench rather than as a missing wire. The
+        // probe below is that failure turned into a warning — this suite has
+        // had an ESP32-C5 in this seat and may again.
+        match port.read_clear_to_send() {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "dev-bench's serial port is not asserting CTS, so this board does not wire \
+                     hardware flow control; falling back to none. The link then has no backpressure \
+                     and can lose whole frames under load — see this function's own comment."
+                );
+                port.set_flow_control(serialport::FlowControl::None)
+                    .context("failed to fall back to no flow control on the dev-bench port")?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "could not read CTS on dev-bench's serial port ({e}); falling back to no flow \
+                     control rather than risking a blocked write"
+                );
+                port.set_flow_control(serialport::FlowControl::None)
+                    .context("failed to fall back to no flow control on the dev-bench port")?;
+            }
+        }
 
         let source = match port.try_clone() {
             Ok(mut read_half) => {
