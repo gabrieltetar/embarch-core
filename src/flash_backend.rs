@@ -100,12 +100,48 @@ impl Backend {
 /// gets refused rather than flashed by a backend that does not model its RRAM;
 /// the cost of a wrong refusal is an error message and an env var, and the
 /// cost of a wrong permit is an unbootable board.
+///
+/// **nRF54H is refused too, and for a different reason than nRF54L: this
+/// module does not know its RRAM story, not that it has established one.**
+/// No nRF54H part has ever been on this suite's bench, in this repo or in
+/// `embarch-topology` (whose own `classify_chip` stops at nRF54L for the same
+/// evidence gap — topology decision 25). Absence of evidence that probe-rs is
+/// unsafe here is not evidence that it is safe, so an nRF54H name gets the
+/// same named refusal as an nRF54L name this table has never seen, rather
+/// than falling through to the permissive default every other family gets.
+/// See `embarch-core` decision 49 for why this stays a second, independent
+/// judgment call rather than sharing topology's classifier.
 pub fn requires_vendor_tool(chip: &str) -> bool {
     let c = chip.to_ascii_lowercase();
     // nRF54L: code lives in RRAM. probe-rs declares one flat NVM region and no
     // RRAM-aware erase/write. This is the family the 2026-08-25 chip-erase
     // incident happened on.
-    c.starts_with("nrf54l")
+    //
+    // nRF54H: RRAM story unknown, not known-safe — see this function's doc
+    // comment. Kept as its own arm, not folded into a bare `starts_with
+    // "nrf54"`, so a future Nordic family added here has to make its own
+    // case rather than silently inheriting either of these two.
+    c.starts_with("nrf54l") || c.starts_with("nrf54h")
+}
+
+/// Why [`requires_vendor_tool`] refused `chip`, for the two messages in
+/// [`discover`] that explain the refusal to a human. Never claims an RRAM
+/// story for a family this module has no evidence about.
+fn vendor_tool_refusal_reason(chip: &str) -> &'static str {
+    if chip.to_ascii_lowercase().starts_with("nrf54l") {
+        "this part stores code in RRAM, not the NVMC flash older nRF devices \
+         use. probe-rs declares it as one flat NVM region with no RRAM-aware \
+         erase/write, and a chip erase through that path has already left this \
+         exact board unbootable (2026-08-25) — only Nordic's own runner \
+         recovered it."
+    } else {
+        "nobody here owns an nRF54H part, and nothing in this repo or in \
+         embarch-topology establishes what its code-storage and erase/write \
+         semantics are, or whether probe-rs's generic model fits them. That \
+         is an open question, not a known-safe answer, so probe-rs is \
+         refused on the same conservative terms as nRF54L until someone can \
+         check on real silicon."
+    }
 }
 
 /// The tool this chip's vendor actually supports, in the order to try.
@@ -258,11 +294,9 @@ pub fn discover(chip: &str) -> Result<Backend> {
             tracing::warn!(
                 "{FLASH_BACKEND_ENV}=probe-rs forces probe-rs for '{chip}'{}",
                 if requires_vendor_tool(chip) {
-                    " — a family Core otherwise refuses it for, because probe-rs does not \
-                     model this part's RRAM erase/write semantics. A chip erase on this \
-                     family has left a board unbootable before."
+                    format!(" — a family Core otherwise refuses it for: {}", vendor_tool_refusal_reason(chip))
                 } else {
-                    ""
+                    String::new()
                 }
             );
             return Ok(Backend::ProbeRs);
@@ -288,10 +322,7 @@ pub fn discover(chip: &str) -> Result<Backend> {
     bail!(
         "refusing to flash '{chip}' with probe-rs, and none of its vendor tools is installed \
          on the machine running embarch-core.\n\n\
-         Why the refusal: this part stores code in RRAM, not the NVMC flash older nRF devices \
-         use. probe-rs declares it as one flat NVM region with no RRAM-aware erase/write, and a \
-         chip erase through that path has already left this exact board unbootable \
-         (2026-08-25) — only Nordic's own runner recovered it.\n\n\
+         Why the refusal: {}\n\n\
          Install ONE of these, on the embarch-core machine (not the build machine):\n  \
          - nRF Util  — {}\n  \
          - SEGGER J-Link — {}\n  \
@@ -299,6 +330,7 @@ pub fn discover(chip: &str) -> Result<Backend> {
          Already installed somewhere unusual? Point Core at it with {JLINK_EXE_ENV} / \
          {NRFUTIL_EXE_ENV} / {NRFJPROG_EXE_ENV}. To override the choice entirely, set \
          {FLASH_BACKEND_ENV}.",
+        vendor_tool_refusal_reason(chip),
         install_hint("nrfutil"),
         install_hint("jlink"),
         install_hint("nrfjprog"),
@@ -510,6 +542,28 @@ mod tests {
     #[test]
     fn an_unknown_nrf54l_part_is_still_refused() {
         assert!(requires_vendor_tool("nRF54L47"));
+    }
+
+    /// `embarch-core` decision 49: nRF54H is refused too, but a silent
+    /// default is exactly the bug this rule exists to avoid — an nRF54H name
+    /// must reach the same named refusal an unrecognized nRF54L name does,
+    /// not fall through to the permissive default every other family gets.
+    #[test]
+    fn an_nrf54h_name_is_refused_too_case_and_suffix_insensitive() {
+        assert!(requires_vendor_tool("nRF54H20"));
+        assert!(requires_vendor_tool("nrf54h20_cpuapp"));
+        assert!(requires_vendor_tool("nRF54HM20A"));
+    }
+
+    /// The refusal reason for nRF54H must never claim an RRAM story this
+    /// module has no evidence for — only nRF54L's message may say "RRAM".
+    #[test]
+    fn the_nrf54h_refusal_reason_makes_no_rram_claim() {
+        let reason = vendor_tool_refusal_reason("nRF54H20");
+        assert!(!reason.to_ascii_lowercase().contains("rram"));
+        assert!(reason.contains("nobody here owns"));
+        let l_reason = vendor_tool_refusal_reason("nRF54L15");
+        assert!(l_reason.to_ascii_lowercase().contains("rram"));
     }
 
     #[test]
