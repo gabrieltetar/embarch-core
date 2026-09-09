@@ -60,7 +60,7 @@ The four env overrides this section used to document
 (`EMBARCH_DEV_BENCH_PORT`/`_SERIAL`/`_PRODUCT`/`_INTERFACE`) are gone, with no
 replacement env knob (decision 23) — they were the mechanism behind the
 incident that motivated `embarch-topology`, whose whole class of problem is
-[a stale port override winning silently over reality](../embarch-doc/embarch-topology/spec.md).
+[a stale port override winning silently over reality](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-topology/spec.md).
 Detection is now
 `embarch_topology::hardware::resolve_dev_bench_port`, keyed on that crate's
 enrollment state (`POST /probes/enroll`, `POST /dev-bench/link`) rather than
