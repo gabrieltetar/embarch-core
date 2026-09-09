@@ -501,30 +501,47 @@ fn default_duration_ms() -> u64 {
     2000
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct SerialLogResponse {
     port: String,
     lines: Vec<String>,
+    /// `true` when the capture hit `serial::serial_log_max_bytes()` before
+    /// `duration_ms` (or the source) ran out — the response is a genuine
+    /// prefix, not the whole capture.
+    truncated: bool,
 }
 
 async fn serial_log_handler(
     State(state): State<AppState>,
     Query(q): Query<SerialLogQuery>,
 ) -> Result<Json<SerialLogResponse>, (StatusCode, String)> {
+    if q.duration_ms > serial::MAX_DURATION_MS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "duration_ms={} exceeds the cap of {} ms",
+                q.duration_ms,
+                serial::MAX_DURATION_MS
+            ),
+        ));
+    }
+
     let _guard = state.hw_lock.lock().await;
 
     let port = q.port.clone();
     let baud = q.baud;
     let duration_ms = q.duration_ms;
+    let max_bytes = serial::serial_log_max_bytes();
 
-    let lines = tokio::task::spawn_blocking(move || serial::read_log(&port, baud, duration_ms))
+    let result = tokio::task::spawn_blocking(move || serial::read_log(&port, baud, duration_ms, max_bytes))
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
 
     Ok(Json(SerialLogResponse {
         port: q.port,
-        lines,
+        lines: result.lines,
+        truncated: result.truncated,
     }))
 }
 
@@ -1098,6 +1115,40 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+
+    #[tokio::test]
+    async fn serial_log_over_the_duration_cap_is_a_bad_request_naming_both_numbers() {
+        // No port is ever opened: the cap is checked before `hw_lock` is
+        // even taken, so a nonexistent port name never gets far enough to
+        // matter.
+        let state = AppState::new("t".to_string());
+        let q = SerialLogQuery {
+            port: "COM_NONEXISTENT".to_string(),
+            baud: default_baud(),
+            duration_ms: serial::MAX_DURATION_MS + 1,
+        };
+        let err = serial_log_handler(State(state), Query(q)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains(&serial::MAX_DURATION_MS.to_string()));
+        assert!(err.1.contains(&(serial::MAX_DURATION_MS + 1).to_string()));
+    }
+
+    #[tokio::test]
+    async fn serial_log_at_the_duration_cap_is_unchanged() {
+        // At-cap must not be rejected by the cap check itself; it fails
+        // later, on the nonexistent port, which is the pre-existing
+        // behavior this change must not disturb.
+        let state = AppState::new("t".to_string());
+        let q = SerialLogQuery {
+            port: "COM_NONEXISTENT".to_string(),
+            baud: default_baud(),
+            duration_ms: serial::MAX_DURATION_MS,
+        };
+        let err = serial_log_handler(State(state), Query(q)).await.unwrap_err();
+        // Not the cap's own message — it got past validation and failed
+        // opening the port instead.
+        assert_ne!(err.0, StatusCode::BAD_REQUEST);
+    }
 
     /// Hand-built `multipart/form-data` body — no HTTP client needed, this
     /// exercises exactly what `/flash` actually parses (`design.md` §9's
