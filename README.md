@@ -56,14 +56,13 @@ by matching SEGGER's USB VID `0x1366` (the DK's on-board J-Link — dev-bench's
 own SoC has no USB peripheral) plus a product-string / serial-number /
 interface-index heuristic. `404` means no port matched, which is just "the
 bench isn't plugged in"; `500` means detection itself failed or was ambiguous.
-Env overrides, in precedence order:
-
-| Variable | Effect |
-|---|---|
-| `EMBARCH_DEV_BENCH_PORT` | Skip detection, use this port name |
-| `EMBARCH_DEV_BENCH_SERIAL` | Require this J-Link serial number |
-| `EMBARCH_DEV_BENCH_PRODUCT` | Product-string needle (default `jlink`; empty = VID only) |
-| `EMBARCH_DEV_BENCH_INTERFACE` | Require this USB interface number |
+The four env overrides this section used to document
+(`EMBARCH_DEV_BENCH_PORT`/`_SERIAL`/`_PRODUCT`/`_INTERFACE`) are gone, with no
+replacement env knob (decision 23) — they were the mechanism behind the
+stale-probe incident that motivated `embarch-topology`. Detection is now
+`embarch_topology::hardware::resolve_dev_bench_port`, keyed on that crate's
+enrollment state (`POST /probes/enroll`, `POST /dev-bench/link`) rather than
+an operator-typed override.
 
 `embarch-core detect-dev-bench` runs the same detection from the CLI.
 
