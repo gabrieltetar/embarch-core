@@ -283,6 +283,10 @@ fn build(tool: &str, exe: PathBuf) -> Option<Backend> {
     }
 }
 
+/// The names [`FLASH_BACKEND_ENV`] accepts — every [`Backend::name`] value
+/// plus `"probe-rs"` itself (handled before any tool lookup, below).
+const KNOWN_BACKEND_NAMES: [&str; 4] = ["probe-rs", "jlink", "nrfutil", "nrfjprog"];
+
 /// Picks the backend for `chip`, or explains what to install.
 ///
 /// `EMBARCH_FLASH_BACKEND` wins outright, including forcing `probe-rs` back on
@@ -290,6 +294,16 @@ fn build(tool: &str, exe: PathBuf) -> Option<Backend> {
 pub fn discover(chip: &str) -> Result<Backend> {
     if let Ok(forced) = std::env::var(FLASH_BACKEND_ENV) {
         let forced = forced.trim().to_ascii_lowercase();
+        // Validated *before* any tool lookup: an unknown name (a typo, an
+        // empty value, a backend this module never supported) must fail by
+        // naming the backends that exist, not by pretending the name was a
+        // recognised tool that merely could not be found on disk.
+        if !KNOWN_BACKEND_NAMES.contains(&forced.as_str()) {
+            bail!(
+                "{FLASH_BACKEND_ENV}='{forced}' is not a known backend — expected one of: {}",
+                KNOWN_BACKEND_NAMES.join(", ")
+            );
+        }
         if forced == "probe-rs" {
             tracing::warn!(
                 "{FLASH_BACKEND_ENV}=probe-rs forces probe-rs for '{chip}'{}",
@@ -304,8 +318,16 @@ pub fn discover(chip: &str) -> Result<Backend> {
         let Some(exe) = locate(&forced) else {
             bail!("{FLASH_BACKEND_ENV}='{forced}' but no such tool was found — {}", install_hint(&forced));
         };
-        return build(&forced, exe)
-            .with_context(|| format!("{FLASH_BACKEND_ENV}='{forced}' is not a known backend"));
+        // `forced` was checked against `KNOWN_BACKEND_NAMES` above, so
+        // `build` cannot return `None` here — there is no name left this
+        // point can be reached with that `build` does not recognise. The
+        // `.with_context("... is not a known backend")` this replaced read
+        // as though it handled that case, but `build` was only ever called
+        // after `locate` had already succeeded on the same name, so the arm
+        // could not fire and no test ever exercised it. Validating up front
+        // is what actually makes the "unknown backend" failure reachable;
+        // keeping a dead arm alongside it would just be lying twice.
+        return Ok(build(&forced, exe).expect("forced backend name was validated above"));
     }
 
     if !requires_vendor_tool(chip) {
@@ -524,6 +546,78 @@ fn jlink_script(
 mod tests {
     use super::*;
 
+    /// Serialises every test that reads or sets [`FLASH_BACKEND_ENV`]. The
+    /// var is process-global and the gate does not pass `--test-threads=1`,
+    /// so two such tests running concurrently would race each other's
+    /// `set_var`/`remove_var`; this crate has no `serial_test`-style
+    /// mechanism already in its tree, so this is the smallest thing that
+    /// closes the race. Holding the guard past a panic (via `Drop`) is the
+    /// point — a `set` that never runs its cleanup must not leak into
+    /// whichever test runs next.
+    #[allow(dead_code, reason = "held only for its Drop and its lock's lifetime, never read")]
+    struct ForcedBackendGuard(std::sync::MutexGuard<'static, ()>);
+
+    impl ForcedBackendGuard {
+        fn set(value: &str) -> Self {
+            let guard = Self::lock();
+            std::env::set_var(FLASH_BACKEND_ENV, value);
+            guard
+        }
+
+        /// For a test that relies on the var being *absent* — still takes
+        /// the lock, so it cannot run interleaved with one that sets it.
+        fn unset() -> Self {
+            let guard = Self::lock();
+            std::env::remove_var(FLASH_BACKEND_ENV);
+            guard
+        }
+
+        fn lock() -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            ForcedBackendGuard(guard)
+        }
+    }
+
+    impl Drop for ForcedBackendGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(FLASH_BACKEND_ENV);
+        }
+    }
+
+    /// Minimal `tracing::Subscriber` that records each event's `message`
+    /// field, so a test can assert on a `tracing::warn!` without pulling in
+    /// a test-capture crate this workspace does not already depend on.
+    struct CapturingSubscriber {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap_or_else(|p| p.into_inner()).push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     #[test]
     fn nrf54l_requires_a_vendor_tool_and_other_families_do_not() {
         assert!(requires_vendor_tool("nRF54L15"));
@@ -569,6 +663,7 @@ mod tests {
     #[test]
     fn a_non_vendor_family_discovers_probe_rs_without_any_tool_installed() {
         // No env overrides in play for this chip, and no vendor tool needed.
+        let _guard = ForcedBackendGuard::unset();
         assert_eq!(discover("esp32c5").unwrap(), Backend::ProbeRs);
     }
 
@@ -640,6 +735,7 @@ mod tests {
     /// only says "no backend" moves the problem rather than closing it.
     #[test]
     fn the_refusal_message_names_every_tool_and_its_override() {
+        let _guard = ForcedBackendGuard::unset();
         // Guard against a developer machine that happens to have one of these.
         if preferred_for("nRF54L15").iter().any(|t| locate(t).is_some()) {
             return;
@@ -650,5 +746,67 @@ mod tests {
         assert!(err.contains("J-Link"));
         assert!(err.contains(FLASH_BACKEND_ENV));
         assert!(err.contains(JLINK_EXE_ENV));
+    }
+
+    /// An unrecognised name — never a known tool that merely was not found on
+    /// this machine — must fail by naming the backends that actually exist.
+    #[test]
+    fn forced_unknown_name_lists_the_known_backends() {
+        let _guard = ForcedBackendGuard::set("openocd");
+        let err = discover("nRF54L15").unwrap_err().to_string();
+        assert!(err.contains("probe-rs"), "{err}");
+        assert!(err.contains("jlink"), "{err}");
+        assert!(err.contains("nrfutil"), "{err}");
+        assert!(err.contains("nrfjprog"), "{err}");
+        // And not the "no such tool was found" install-hint message, which
+        // implies openocd was a recognised backend that just was not on disk.
+        assert!(!err.contains("no such tool was found"), "{err}");
+    }
+
+    #[test]
+    fn forced_empty_value_lists_the_known_backends() {
+        let _guard = ForcedBackendGuard::set("");
+        let err = discover("nRF54L15").unwrap_err().to_string();
+        assert!(err.contains("is not a known backend"), "{err}");
+        assert!(err.contains("probe-rs") && err.contains("nrfjprog"), "{err}");
+    }
+
+    #[test]
+    fn forced_typo_lists_the_known_backends() {
+        let _guard = ForcedBackendGuard::set("jlnk");
+        let err = discover("nRF54L15").unwrap_err().to_string();
+        assert!(err.contains("jlnk"), "must echo back what was actually set: {err}");
+        assert!(err.contains("jlink"), "{err}");
+    }
+
+    /// A *known* name that just is not installed must keep its existing
+    /// install-hint message — validating the name up front must not change
+    /// this path's behaviour.
+    #[test]
+    fn forced_known_but_missing_backend_keeps_its_install_hint() {
+        let _guard = ForcedBackendGuard::set("nrfjprog");
+        if locate("nrfjprog").is_some() {
+            // Guard against a developer machine that happens to have it.
+            return;
+        }
+        let err = discover("nRF54L15").unwrap_err().to_string();
+        assert!(err.contains("no such tool was found"), "{err}");
+        assert!(err.contains("nRF Command Line Tools"), "{err}");
+        assert!(!err.contains("is not a known backend"), "{err}");
+    }
+
+    /// `EMBARCH_FLASH_BACKEND=probe-rs` must still force probe-rs even for a
+    /// family this module otherwise refuses it for, and must still warn that
+    /// it did so.
+    #[test]
+    fn forced_probe_rs_still_forces_probe_rs_and_warns_on_a_refused_family() {
+        let _guard = ForcedBackendGuard::set("probe-rs");
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber { messages: messages.clone() };
+        let result = tracing::subscriber::with_default(subscriber, || discover("nRF54L15"));
+        assert_eq!(result.unwrap(), Backend::ProbeRs);
+        let logged = messages.lock().unwrap().join("\n");
+        assert!(logged.contains("forces probe-rs"), "{logged}");
+        assert!(logged.contains("RRAM"), "must say why this family is otherwise refused: {logged}");
     }
 }
