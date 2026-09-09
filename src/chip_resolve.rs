@@ -49,6 +49,44 @@ const SOC_TO_CHIP: &[(&str, &str)] = &[
     // preserves each target's own real probe-rs spelling rather than
     // normalizing a convention across vendors.
     ("esp32c5", "esp32c5"),
+    // First non-Nordic, non-Espressif entry, and the first one where the
+    // Zephyr key is a *series* name rather than a part number. `board.yml`
+    // for a G0 board names the SoC `stm32g0b1xx` — Zephyr's own
+    // `soc/st/stm32/stm32g0x/` naming, where the trailing `xx` stands in for
+    // both the package letter and the flash-size letter — but probe-rs wants
+    // one concrete variant (`chip-list stm32g0b1` offers sixteen, CB through
+    // VE). So this row is lossy in a way none of the rows above are, and the
+    // loss is not cosmetic: within G0B1 the final letter *is* the flash size
+    // (B = 128 KiB, C = 256 KiB, E = 512 KiB), which is what probe-rs's
+    // memory map and flash algorithm are built from.
+    //
+    // What the loss does and does not cost was measured against probe-rs's
+    // own registry rather than reasoned about, because the first repo to need
+    // this row (chargerito) builds for two different G0B1 packages through
+    // this one key — its custom `chargerito_core` board (STM32G0B1**VE**, per
+    // its `board.cmake` J-Link `--device`) and upstream Zephyr's
+    // `nucleo_g0b1re` bring-up board (STM32G0B1**RE**). Dumping
+    // `Target::memory_map` for both:
+    //
+    //   STM32G0B1VE == STM32G0B1RE  BANK_1 0x08000000..0x08040000 (256 KiB)
+    //                               BANK_2 0x08040000..0x08080000 (256 KiB)
+    //                               SRAM   0x20000000 + 144 KiB
+    //   STM32G0B1CB                 BANK_1 0x08000000..0x08020000 (128 KiB)
+    //                               SRAM   0x20000000 + 144 KiB   (no BANK_2)
+    //
+    // So the **flash-size letter is the axis that matters and the package
+    // letter is not** — VE and RE are byte-identical here, and it is the
+    // 128 KiB `B` part that has a genuinely different map (single bank).
+    // One row therefore covers every `stm32g0b1x**E**` board correctly, which
+    // is both boards in play.
+    //
+    // Where it would break: a `stm32g0b1xB`/`xC` board would get 512 KiB
+    // dual-bank declared for a 128/256 KiB single-bank part. That
+    // over-declares rather than corrupts — a write past the real end fails
+    // loudly — but it is still wrong, and at that point the key stops being
+    // expressible as one row: the table would need a real (soc, flash_size)
+    // key rather than a longer comment.
+    ("stm32g0b1xx", "STM32G0B1VE"),
 ];
 
 /// The SoC named didn't resolve — either it's not in `SOC_TO_CHIP` at all, or
@@ -213,6 +251,28 @@ mod tests {
         let err = resolve("esp32c3").unwrap_err();
         assert!(err.0 == "esp32c3");
         assert!(err.to_string().contains("esp32c3"));
+    }
+
+    /// The lossy series-name row: Zephyr's `stm32g0b1xx` covers sixteen
+    /// probe-rs variants, and this asserts the one the table deliberately
+    /// picks, so a future edit that "fixes" the package letter has to argue
+    /// with a test rather than pass silently.
+    #[test]
+    fn resolves_stm32g0b1_series_to_the_512k_v_package() {
+        assert_eq!(resolve("stm32g0b1xx").unwrap(), "STM32G0B1VE");
+        assert_eq!(resolve("STM32G0B1XX").unwrap(), "STM32G0B1VE");
+    }
+
+    /// probe-rs does not put an STM32G0 in the vendor-tool refusal list, so
+    /// the chip this table now hands out has to be flashable by the default
+    /// backend — otherwise the mapping resolves and then dead-ends at
+    /// `/flash`. Checked here because `flash_backend` matches on the probe-rs
+    /// name this module produces, not on the Zephyr SoC name.
+    #[test]
+    fn the_stm32g0_target_is_not_refused_by_the_flash_backend() {
+        assert!(!crate::flash_backend::requires_vendor_tool(
+            &resolve("stm32g0b1xx").unwrap()
+        ));
     }
 
     #[test]
