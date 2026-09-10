@@ -2,18 +2,15 @@ use axum::{
     extract::{FromRequest, Json, Multipart, Query, Request, State},
     http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
-    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::{chip_resolve, hardware, logs, serial, study};
@@ -84,7 +81,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
         .route("/logs/recent", get(logs_recent_handler))
-        .route("/logs/stream", get(logs_stream_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
@@ -1009,16 +1005,24 @@ async fn alerts_handler(
         .map(Json)
 }
 
-// ---- GET /logs/recent, GET /logs/stream --------------------------------
+// ---- GET /logs/recent ---------------------------------------------------
 //
-// `embarch-ui` decision 7 (the Debug tab): backlog-on-open plus
-// a live tail, both mediated through Core rather than embarch-ui ever
-// reading a logfile directly — Core can run on a different machine than
-// whatever's asking (the whole reason `embarch-topology` exists). Both
-// reuse `logs.rs`'s existing daily-rolling-logfile logic (`main.rs`'s own
-// `Logs` CLI subcommand shares it too) rather than a second, size-capped
-// mechanism this decision originally proposed before noticing one already
-// existed.
+// `embarch-ui` decision 7 (the Debug tab): backlog-on-open, mediated through
+// Core rather than embarch-ui ever reading a logfile directly — Core can
+// run on a different machine than whatever's asking (the whole reason
+// `embarch-topology` exists). Reuses `logs.rs`'s existing
+// daily-rolling-logfile logic (`main.rs`'s own `Logs` CLI subcommand shares
+// it too) rather than a second, size-capped mechanism this decision
+// originally proposed before noticing one already existed.
+//
+// `GET /logs/stream`, the live-tail counterpart decision 7 also built, was
+// retired (`tasks/core/021`): decision 13 in that same file structurally
+// excludes an SSE source by sharing one poll/diff loop across both log
+// sources, nothing replaced it, and no caller anywhere ever used it. This
+// route's own `logs::FollowState` poll-follow machinery went with it;
+// `read_recent`/`tail_lines` below are unaffected. `decisions/logging.md`
+// decision 44 (the hold-past-`\n` rule this route needed) is retired
+// alongside it.
 
 #[derive(Deserialize)]
 struct LogsRecentQuery {
@@ -1052,61 +1056,6 @@ async fn logs_recent_handler(
         .map_err(internal_err)?
         .map_err(internal_err)?;
     Ok(Json(LogsRecentResponse { lines }))
-}
-
-/// Live tail: polls the current log file every 750ms (`logs::FollowState`)
-/// and pushes any newly-appended lines as one SSE event per tick (a JSON
-/// array, batching whatever arrived since the last tick rather than one
-/// frame per line). **Every element is one whole log line, with one stated
-/// exception: the very first line a subscriber receives may be short.** A
-/// tick that lands inside the writer's own `write` holds the trailing
-/// partial back until its newline arrives, rather than splitting one line
-/// across two frames — but the offset a subscriber *starts* from is the
-/// file's length at the moment it attached, which is newline-aligned only
-/// if the writer was idle then (`logs::FollowState::poll_in`, decision 44).
-/// Mirrors `/study/{study_id}/events`'s existing SSE
-/// shape in this same file. Poll-based rather than a custom broadcasting
-/// `tracing` layer, deliberately: the latter would mean modifying
-/// `main.rs`'s `init_tracing` — foundational, already-deployed setup for a
-/// real running service — for a debug-tooling feature; a poll loop over a
-/// tiny local file costs nothing `serial::read_log`'s own poll loop
-/// doesn't already cost elsewhere in this crate. `Sse::keep_alive` already
-/// covers idle-connection pings, so a tick with nothing new just retries
-/// after a short sleep rather than emitting an event of its own.
-async fn logs_stream_handler() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures_util::stream::unfold(logs::FollowState::new(), |mut follow| async move {
-        loop {
-            let (returned, result) = match tokio::task::spawn_blocking(move || {
-                let lines = follow.poll();
-                (follow, lines)
-            })
-            .await
-            {
-                Ok(pair) => pair,
-                Err(_join_err) => return None, // spawn_blocking panicked — end the stream rather than loop forever
-            };
-            follow = returned;
-
-            match result {
-                Ok(lines) if !lines.is_empty() => {
-                    let payload = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
-                    return Some((Ok::<_, Infallible>(Event::default().event("lines").data(payload)), follow));
-                }
-                Ok(_) => {
-                    tokio::time::sleep(Duration::from_millis(750)).await;
-                }
-                Err(e) => {
-                    // A transient read error (e.g. the file mid-rotation)
-                    // shouldn't kill the whole stream — log it server-side
-                    // and retry, the same "keep going" posture `poll_loop`
-                    // in `embarch-ui`'s own background poller takes.
-                    tracing::warn!("logs/stream poll failed: {e:#}");
-                    tokio::time::sleep(Duration::from_millis(750)).await;
-                }
-            }
-        }
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
@@ -1379,7 +1328,6 @@ mod tests {
         ("POST", "/validate", "/validate"),
         ("GET", "/alerts", "/alerts"),
         ("GET", "/logs/recent", "/logs/recent"),
-        ("GET", "/logs/stream", "/logs/stream"),
         ("POST", "/study", "/study"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
@@ -1421,7 +1369,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 26;
+    const DOCUMENTED_ROUTE_COUNT: usize = 25;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {

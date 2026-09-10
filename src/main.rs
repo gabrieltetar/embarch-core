@@ -369,8 +369,8 @@ where
 /// thread is needed — `tracing`'s call sites here are never so hot that a
 /// blocking file write matters). `max_log_files(7)` deletes the oldest
 /// matching file once an 8th day's worth exist, keeping the most recent 7 —
-/// this same file is what `GET /logs/recent`/`GET /logs/stream` (`api.rs`)
-/// and `logs::read_recent`/`logs::FollowState` read, not a second,
+/// this same file is what `GET /logs/recent` (`api.rs`)
+/// and `logs::read_recent` read, not a second,
 /// size-capped mechanism (`embarch-ui` decision 7, corrected in
 /// place once this crate's own decisions noted the daily-rolling file
 /// already existed).
@@ -416,7 +416,7 @@ async fn run(bind: String, port: u16) -> anyhow::Result<()> {
     serve(bind, port, std::future::pending()).await
 }
 
-// Log-selection unit tests (`latest_log_file`/`tail_lines`/`FollowState`)
+// Log-selection unit tests (`latest_log_file`/`tail_lines`)
 // moved to `logs.rs` alongside the code they test.
 
 #[cfg(test)]
