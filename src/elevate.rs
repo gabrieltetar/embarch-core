@@ -1,5 +1,5 @@
 //! Self-elevation for `embarch-core`'s privileged subcommands (`install`,
-//! `uninstall`, `start`, `stop`, `update`) — `decision 3`,
+//! `uninstall`, `start`, `stop`, `update`) — decision 3,
 //! reversing `embarch-umbrella` decision 7's original "never
 //! self-elevate, print the command" stance.
 //!

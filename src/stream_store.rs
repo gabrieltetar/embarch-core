@@ -1,6 +1,6 @@
 //! `study_results/<study_id>/streams/` — one file per declared stream tap.
 //!
-//! `decision 30(b)` is what this implements:
+//! decision 30(b) is what this implements:
 //! `streams/` replaces `data.csv`/`waveform.csv`/`gatt.csv` as *paths* while
 //! keeping every one of their row shapes, and **a tap always writes its raw
 //! bytes before any decode is attempted** — a decode that fails must not cost

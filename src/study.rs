@@ -73,7 +73,7 @@ pub type JobRegistry = Arc<StdMutex<HashMap<String, StudyJob>>>;
 
 /// One-study-at-a-time lock (`AppState::study_lock`), explicitly separate
 /// from `hw_lock` — a different physical connection
-/// (`decision 15`). `Some(study_id)` while a study
+/// (decision 15). `Some(study_id)` while a study
 /// is in flight.
 pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
@@ -292,10 +292,10 @@ fn validate_study(study: &Study) -> Result<(), String> {
     Ok(())
 }
 
-// ---- the version gate (`decision 31`) --------------------------
+// ---- the version gate (decision 31) --------------------------
 
 /// **What Core can verify, it verifies; what it cannot, it must not pretend
-/// to** — `decision 31`, the Core half of
+/// to** — decision 31, the Core half of
 /// `embarch-study-designer` decision 40.
 ///
 /// `requires.dev_bench_version` is the half Core genuinely *checks*:
@@ -398,7 +398,7 @@ fn mismatch_message(subject: VersionSubject, required: &str, actual: &str) -> St
 }
 
 /// The two out-of-band run parameters `POST /study` accepts as query
-/// parameters (`decision 31`'s amendment,
+/// parameters (decision 31's amendment,
 /// `embarch-api` decision 40).
 ///
 /// **Query parameters rather than fields on the `Study` body**, because
@@ -442,7 +442,7 @@ impl StudyRunParams {
 }
 
 /// What this run actually executed against, and **how each version was
-/// established** (`decision 31`, `embarch-study-designer` spec.md
+/// established** (decision 31, `embarch-study-designer` spec.md
 /// §4.5).
 ///
 /// dev-bench's is [`VersionSource::ReportedByDevBench`] — Core read it off
@@ -548,7 +548,7 @@ fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study
 /// `StudyDone`. Pure and `now`-parameterized so the deadline math is
 /// unit-testable without a clock or a real study run.
 ///
-/// **`delay_before_ms` is part of the window (`decision 33`).** This
+/// **`delay_before_ms` is part of the window (decision 33).** This
 /// function used to ignore it, which was a live defect rather than a rounding
 /// error: dev-bench honours the field by `k_sleep`ing it *before* running the
 /// step (`main.c`'s dispatch loop), so a study authoring
@@ -818,7 +818,7 @@ async fn open_and_handshake(
     .map_err(|e| format!("dev-bench handshake task panicked: {e:?}"))?
 }
 
-/// The `decision 22` board-identity gate, applied to
+/// The decision 22 board-identity gate, applied to
 /// dev-bench's own connection — this path never calls `hardware::open_probe`
 /// at all (it's a plain serial port, not a probe-rs debug session), so it
 /// can't reuse `hardware.rs`'s own probe-selection logic the way
@@ -1125,7 +1125,7 @@ pub async fn post_study_handler(
 ///
 /// The `Mutex` exists for exactly one reason: a `StreamSource::Signal` tap
 /// with a `Route::Direct` route reads a **third physical serial connection**
-/// on its own thread (`decision 30(a)`), so two producers can
+/// on its own thread (decision 30(a)), so two producers can
 /// reach the same [`StreamStore`]. It takes neither `hw_lock` nor
 /// `study_lock` — it is a read-only listener on a wire, and blocking a
 /// `/flash` on it would invent contention that does not exist.
@@ -1222,7 +1222,7 @@ fn run_study_to_completion(
         return;
     }
 
-    // Retention across runs (`decision 30`): run
+    // Retention across runs (decision 30): run
     // once per submitted study, immediately after this study's own directory
     // exists, so `keep` is exact and counts the run in progress rather than
     // being one out. A sweep that fails is logged and ignored — losing disk
@@ -1651,7 +1651,7 @@ fn run_study_to_completion(
                 // `recv` buffers and nothing ever mentioned. A run that timed
                 // out this way once reported only "no message received" while
                 // holding the bench's own account of its reset in a private
-                // buffer (`decision 40`).
+                // buffer (decision 40).
                 if let Some(full) = link.unframed_tail_full() {
                     crate::dev_bench_log::note(
                         Some(&study_id),
@@ -1968,7 +1968,7 @@ fn render_outpost_traces(
 
 // ---- Core's own taps: a Route::Direct signal on a third serial port -------
 
-/// One `StreamSource::Signal` tap Core reads itself (`decision 30(a)`): a
+/// One `StreamSource::Signal` tap Core reads itself (decision 30(a)): a
 /// USB-UART bridge with a DUT pin on it and nothing else — **a
 /// port that belongs to a wire, not to a device.**
 struct SignalTapReader {
@@ -2235,7 +2235,7 @@ fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
 /// Writes one arrival-stamped record to its tap's files under `streams/`.
 ///
 /// **The raw bytes go down first, always, before any decode is attempted**
-/// (`decision 30(b)`). A decode that fails then
+/// (decision 30(b)). A decode that fails then
 /// costs a rendering, not a capture — the run is recoverable, which is the
 /// whole difference between a bad afternoon and a lost one.
 ///
@@ -3088,7 +3088,7 @@ impl StreamQuery {
 }
 
 /// One tap's capture, by the name the `Study` declared it under
-/// (`decision 30(b)`, spec.md §4).
+/// (decision 30(b), spec.md §4).
 ///
 /// Served as **bytes**, for the same reason the three fixed routes it
 /// replaces were: Core and `embarch-api` are not guaranteed to share a
@@ -3127,7 +3127,7 @@ pub async fn stream_data_handler(
 // The three fixed routes `GET /study/{id}/stream/{name}` replaces, kept as
 // aliases for one release rather than breaking `embarch-api`'s existing
 // `study_power_data`/`study_waveform_data`/`study_gatt_data` tools mid-flight
-// (`decision 30`). Each resolves through the
+// (decision 30). Each resolves through the
 // study's own index to whichever tap answers that alias — which is the whole
 // reason the index exists, since a handler reading results back off disk has
 // no `Study` in hand to ask.
@@ -3490,7 +3490,7 @@ mod tests {
         assert_eq!(raw.len(), 6);
     }
 
-    // ---- write_transcript_entry (`decision 36`) ----
+    // ---- write_transcript_entry (decision 36) ----
 
     fn transcript_entry(payload: &[u8]) -> GattTranscriptEntry {
         use embarch_study_designer::{GattDirection, GattEventKind, Uuid};
@@ -3518,7 +3518,7 @@ mod tests {
         write_transcript_entry(&capture, 0, 1, &transcript_entry(b"hi"));
 
         // The row shape is unchanged by the move to `streams/` — only the
-        // path is (`decision 30(b)`).
+        // path is (decision 30(b)).
         let csv = std::fs::read_to_string(dir.path().join("streams").join("gatt.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3, "expected a header plus two rows, got: {csv}");
@@ -3819,7 +3819,7 @@ mod tests {
         assert_eq!(deadline, now + Duration::from_millis(5_000 + WATCHDOG_GRACE_MS));
     }
 
-    /// The regression for `decision 33`. Against the old math
+    /// The regression for decision 33. Against the old math
     /// (`timeout_ms + GRACE`, delay ignored) this study's window was 3s while
     /// dev-bench would not even *start* the step for 30s — a guaranteed
     /// spurious lapse against a bench doing exactly what it was told.
@@ -4926,7 +4926,7 @@ mod tests {
         assert!(index.find("no-such-tap").is_none());
     }
 
-    /// **The test the aliases exist for** (`decision 30`,
+    /// **The test the aliases exist for** (decision 30,
     /// `embarch-api` decision 39): each of the
     /// three retired fixed routes has to keep answering with *exactly* what
     /// its replacement answers with, for one release, or an agent

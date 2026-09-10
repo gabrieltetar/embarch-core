@@ -8,7 +8,7 @@
 //! needed the same logic `main.rs`'s `Logs` subcommand already had.
 //!
 //! Reuses the existing daily-rolling logfile (`main.rs`'s `init_tracing`,
-//! `decision 16`) rather than introducing a second, size-capped log
+//! decision 16) rather than introducing a second, size-capped log
 //! mechanism — `embarch-ui` decision 7 originally described a
 //! new size-capped rotating logfile, written before this session noticed
 //! Core already had a real, tested, daily-rotating one (7-file retention).

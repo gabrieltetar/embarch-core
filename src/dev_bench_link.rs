@@ -104,7 +104,7 @@ pub struct DevBenchLink {
 ///
 /// Three outcomes rather than `Result<Option<_>>`'s two, because **an
 /// undecodable frame is not a dead link and treating it as one cost a real
-/// diagnosis** (`decision 40`). A `StepResult` carrying a
+/// diagnosis** (decision 40). A `StepResult` carrying a
 /// step's failure reason arrived short of its own declared length; Core
 /// refused it, tore the link down, and reported the study as a *transport*
 /// error that never mentioned a step had failed. The one message whose job
@@ -112,7 +112,7 @@ pub struct DevBenchLink {
 ///
 /// So the posture here is the suite's posture everywhere else — an
 /// undecodable frame costs *the frame*, not the link, which is exactly why an
-/// outpost frame carries its own CRC (`embarch-outpost` decision 5). The frames after it are still worth having: dev-bench's own
+/// outpost frame carries its own CRC (`embarch-outpost` interfaces/wire.md). The frames after it are still worth having: dev-bench's own
 /// account of what went wrong arrives as ordinary `LogLine`s, and a
 /// `StudyDone` still says whether the run ended on its own terms.
 ///
@@ -275,7 +275,7 @@ impl DevBenchLink {
     /// and bootloader banner on it as plain ASCII at a different baud —
     /// text, no nulls anywhere in it. So the run that finally proved dev-bench
     /// was rebooting mid-frame
-    /// (`decision 40`) reported "no message received from
+    /// (decision 40) reported "no message received from
     /// dev-bench before the deadline" while holding the bench's own account of
     /// the reset in a private `Vec`. The uptime comparison that cracked it
     /// took another handshake to do what these bytes could have said outright.
@@ -379,7 +379,7 @@ impl DevBenchLink {
         // it reads identically to a field-layout disagreement unless the two
         // numbers are put side by side -- which is how a flat 16-byte
         // truncation was first misread as an encoder omitting trailing
-        // fields (`decision 40`).
+        // fields (decision 40).
         let claim = match head.first() {
             // COBS: the code byte is 1 + the count of non-zero bytes that
             // follow, so the block it opens should run to that many bytes --
@@ -860,7 +860,7 @@ mod tests {
 
     /// `StepResult` arriving short of what its COBS code byte promised, which
     /// reads identically to a field-layout disagreement until the two numbers
-    /// are put side by side (`decision 40`).
+    /// are put side by side (decision 40).
     ///
     /// **The shortfall is counted against the block, not the frame.** The
     /// numbers reaching this function include the `0x00` delimiter and the

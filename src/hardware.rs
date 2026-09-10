@@ -57,7 +57,7 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 }
 
 /// Resolves which attached probe a call means, matched against
-/// `ProbeInfo.serial_number` (`decision 9`) — real, not just
+/// `ProbeInfo.serial_number` (decision 9) — real, not just
 /// documented: `open_first_probe`'s own prior doc comment said this was
 /// still single-probe-only, a real drift from what that decision already
 /// claimed, found the first time a second probe (dev-bench's own) was
