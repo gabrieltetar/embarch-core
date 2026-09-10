@@ -25,7 +25,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 /// instead of two places that could disagree.
 pub(crate) const DEFAULT_PORT: u16 = 4884;
 
-/// Loopback-only (`decision 6`'s amendment, 2026-08-15): reachable
+/// Loopback-only (decision 6's amendment, 2026-08-15): reachable
 /// only from processes on this same machine unless something explicitly
 /// widens it. Shared between `Run`'s and `Install`'s own `--bind` flags so
 /// they can't drift apart.
@@ -49,7 +49,7 @@ enum Command {
     /// launched this process as a service in the first place (a human at a
     /// console, same as everywhere else) — see `service::windows`.
     Run {
-        /// Bind address. Loopback-only by default (`decision 6`'s
+        /// Bind address. Loopback-only by default (decision 6's
         /// amendment) — reachable only from this same machine unless widened
         /// explicitly. `embarch-umbrella setup` passes an explicit `--bind`
         /// to `install` for the one topology (WSL2⟷Windows, or a genuinely
@@ -67,7 +67,7 @@ enum Command {
         /// having to re-run this), not just this one invocation. Same
         /// loopback-only default as `run`; `embarch-umbrella setup` passes
         /// `recommended_bind_address(TopologyClass)`'s answer explicitly for
-        /// wsl-host/remote (`decision 6`'s amendment).
+        /// wsl-host/remote (decision 6's amendment).
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
     },
@@ -94,7 +94,7 @@ enum Command {
     /// check the bench is visible without an HTTP client or a running service.
     DetectDevBench,
     /// List probe-rs target names, optionally narrowed by a case-insensitive
-    /// substring — `decision 34`. Pure enumeration: no probe is
+    /// substring — decision 34. Pure enumeration: no probe is
     /// opened and no board need be attached, same posture as
     /// `detect-dev-bench`. This is where the target name for a **new
     /// `SOC_TO_CHIP` entry** comes from when a SoC isn't in the built-in
@@ -109,7 +109,7 @@ enum Command {
         filter: Option<String>,
     },
     /// Report which program Core would use to flash a given chip, and where
-    /// it found it — `decision 36`. Pure lookup: no probe is
+    /// it found it — decision 36. Pure lookup: no probe is
     /// opened, nothing is flashed and no board need be attached, same posture
     /// as `detect-dev-bench` and `chip-list`.
     ///
@@ -293,7 +293,7 @@ fn main() -> anyhow::Result<()> {
 /// Sets up `tracing` to write to both stderr (unchanged from before this
 /// decision) and a daily-rolling file under
 /// `token_store::local_data_dir()?.join("logs")` — `%ProgramData%\embarch\logs`
-/// / `/var/lib/embarch/logs` (`decision 16`),
+/// / `/var/lib/embarch/logs` (decision 16),
 /// retaining the last 7 daily files. Runs once, unconditionally, at the very
 /// top of `main`, before `Cli::parse()` or dispatch on the subcommand — so
 /// both entry paths that share `build_runtime()` (a plain foreground `Run`,

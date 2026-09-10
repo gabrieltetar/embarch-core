@@ -148,7 +148,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 /// Replace the installed service's binary with `new_exe` and restart it —
-/// the motivating case for self-elevation (`decision 3`):
+/// the motivating case for self-elevation (decision 3):
 /// updating an already-installed Core previously had no supported path at
 /// all, only manual stop/copy/start surgery in a hand-opened elevated
 /// shell.
