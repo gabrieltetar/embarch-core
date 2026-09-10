@@ -64,7 +64,7 @@ impl AppState {
 /// Every route requires the bearer token — there is no unauthenticated
 /// route left (there used to be exactly one, `GET /enroll`'s static HTML/JS
 /// page; retired 2026-08-24 in favor of `embarch-ui`'s Enroll tab,
-/// embarch-ui milestone 1 — `POST /probes/enroll`
+/// `embarch-ui` decision 1 — `POST /probes/enroll`
 /// itself is unaffected and still lives below).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -1329,7 +1329,7 @@ mod tests {
     // `embarch-doc/embarch-core/spec.md` states every route requires
     // `Authorization: Bearer <token>`, "no exceptions" — there used to be
     // exactly one deliberate exemption (`GET /enroll`'s static page),
-    // retired 2026-08-24 (embarch-ui milestone 1).
+    // retired 2026-08-24 (`embarch-ui` decision 1).
     //
     // That invariant used to be checked by one hand-written test per route,
     // and the two lists drifted exactly as you would expect: on 2026-09-06,
