@@ -1,7 +1,7 @@
 //! Core's bridge between `embarch-api`'s HTTP `/study*` surface and
 //! `embarch-dev-bench` firmware's serial link (`dev_bench_link.rs`).
 //!
-//! `embarch-study-designer/design.md` §5.1 (the `POST /study` async job
+//! `embarch-study-designer` spec.md §5.1 (the `POST /study` async job
 //! model) and §5.2 (`events.json`/`data.csv`/`waveform.csv` layout) are the
 //! finalized design this module implements. Section references in doc
 //! comments below point back into that document.
@@ -38,7 +38,7 @@ use crate::stream_store::{self, StreamStore};
 use crate::token_store;
 
 /// Host-side watchdog grace margin, on top of a step's own `timeout_ms`
-/// (`embarch-study-designer/design.md` §3 decision 16's amendment, §7). §7
+/// (`embarch-study-designer` decision 16's amendment, §7). §7
 /// documented this constant as an unsized placeholder awaiting real
 /// dev-bench timing; **2026-08-27 is that timing, and 2000ms was too small.**
 ///
@@ -67,13 +67,13 @@ const WATCHDOG_GRACE_MS: u64 = 10_000;
 /// generous enough to cover a slow dev-bench boot.
 const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 
-/// In-memory job registry (`AppState::study_jobs`, design.md §5.1). No
+/// In-memory job registry (`AppState::study_jobs`, `embarch-study-designer` spec.md §5.1). No
 /// expiry/cleanup by design — entries live until Core restarts.
 pub type JobRegistry = Arc<StdMutex<HashMap<String, StudyJob>>>;
 
 /// One-study-at-a-time lock (`AppState::study_lock`), explicitly separate
 /// from `hw_lock` — a different physical connection
-/// (`embarch-core/design.md` §3 decision 15). `Some(study_id)` while a study
+/// (`decision 15`). `Some(study_id)` while a study
 /// is in flight.
 pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
@@ -83,7 +83,7 @@ pub type StudyLock = Arc<StdMutex<Option<String>>>;
 /// 64>` × `StepResult`'s own `gatt_activity` capacity), a value that's
 /// genuinely unsafe to clone by value on a normal thread stack, which is
 /// exactly what every `GET /study/{study_id}` call used to do
-/// (`embarch-study-designer/design.md` §7's stack-overflow finding). A
+/// (`embarch-study-designer` decision 63's stack-overflow finding). A
 /// completed study's actual result lives only in `events.json` on disk
 /// (written incrementally by [`EventsJsonWriter`] as each step arrives, not
 /// assembled from this struct) — [`get_study_handler`] reads it back from
@@ -138,8 +138,8 @@ pub struct StudyAcceptedResponse {
 /// One live event pushed to every subscriber of `GET /study/{study_id}/
 /// events` (SSE) the instant Core processes it off the dev-bench link —
 /// never buffered until the study finishes. Mirrors `embarch-topology`'s own
-/// durable-log-plus-live-push shape (`embarch-topology/design.md` §3
-/// decision 12: write it to disk *and* push it live if anyone's watching)
+/// durable-log-plus-live-push shape (`embarch-topology` decision 12: write
+/// it to disk *and* push it live if anyone's watching)
 /// applied here to study progress instead of a topology mismatch. Every
 /// variant carries `study_id` so a subscriber that reconnects across studies
 /// can tell them apart, even though today only one study is ever in flight
@@ -167,13 +167,11 @@ pub enum StudyEvent {
     ///
     /// Keyed by the tap that produced them (`stream_id` is its index in
     /// `Study.streams`, `stream_name` its declared name) rather than by the
-    /// retired `StreamChannel` — `embarch-study-designer/design.md` §3
-    /// decision 39.
+    /// retired `StreamChannel` — `embarch-study-designer` decision 39.
     SampleBatch { study_id: String, stream_id: u8, stream_name: String, samples: Vec<Sample> },
     /// One GATT transcript entry, pushed the instant Core decodes it off the
     /// wire — the same entry [`write_transcript_entry`] is appending to
-    /// `gatt.csv` in the same pass (`embarch-study-designer/design.md` §3
-    /// decision 36). Boxed for the same reason `StepCompleted` is: a
+    /// `gatt.csv` in the same pass (`embarch-study-designer` decision 36). Boxed for the same reason `StepCompleted` is: a
     /// `MAX_PAYLOAD_LEN` payload would otherwise set this whole enum's size.
     GattTranscript { study_id: String, step_index: u32, entry: Box<GattTranscriptEntry> },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
@@ -182,7 +180,7 @@ pub enum StudyEvent {
 
 // ---- pure validation (no HTTP, no hardware — unit-testable directly) ------
 
-/// design.md §5.1: both of a study's seals must match what their own halves
+/// `embarch-study-designer` spec.md §5.1: both of a study's seals must match what their own halves
 /// recompute to, and its declared taps must satisfy §4.8's own pre-flight
 /// rules. Factored out from the handler so it's testable with no HTTP
 /// plumbing — the same posture `embarch_topology::hardware`'s own
@@ -191,14 +189,14 @@ pub enum StudyEvent {
 /// The per-`PostHocValidation` step-index/tap-name checks this used to run
 /// are gone with post-hoc validation itself.
 fn validate_study(study: &Study) -> Result<(), String> {
-    // design.md §3 decision 39/§4.8's own pre-flight rules — id-is-index,
+    // `embarch-study-designer` decision 39/§4.8's own pre-flight rules — id-is-index,
     // no blank/duplicate/reserved name, no step range that could never open.
     // Computed by the crate, not restated here, so Core holds no second copy
     // of the rules to drift from.
     validate_taps(&study.streams, study.steps.len() as u32, study.decoders.len())
         .map_err(|e| e.to_string())?;
 
-    // `embarch-study-designer/design.md` §3 decision 40: both requirements
+    // `embarch-study-designer` decision 40: both requirements
     // are mandatory and `"any"` is an explicit legal value, so a *blank* one
     // is the nobody-thought-about-it case and is rejected here. An omitted
     // one never reaches this function at all — `Study.requires` has no serde
@@ -218,7 +216,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
         ));
     }
 
-    // The sibling seal (`embarch-study-designer/design.md` §3 decision 39's
+    // The sibling seal (`embarch-study-designer` decision 39's
     // 2026-08-25 amendment), checked independently of `steps_crc` above so a
     // failure says *which* half is corrupt — the whole reason there are two
     // seals rather than one widened one.
@@ -233,7 +231,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
         ));
     }
 
-    // The **third** seal (`embarch-study-designer/design.md` §3 decision 58),
+    // The **third** seal (`embarch-study-designer` decision 58),
     // checked independently of the other two for the same reason they are
     // checked independently of each other: a mismatch says which of the three
     // halves of a `Study` is corrupt.
@@ -294,11 +292,11 @@ fn validate_study(study: &Study) -> Result<(), String> {
     Ok(())
 }
 
-// ---- the version gate (design.md §3 decision 31) --------------------------
+// ---- the version gate (`decision 31`) --------------------------
 
 /// **What Core can verify, it verifies; what it cannot, it must not pretend
-/// to** — `embarch-core/design.md` §3 decision 31, the Core half of
-/// `embarch-study-designer/design.md` §3 decision 40.
+/// to** — `decision 31`, the Core half of
+/// `embarch-study-designer` decision 40.
 ///
 /// `requires.dev_bench_version` is the half Core genuinely *checks*:
 /// dev-bench self-reports its build over `HelloAck`, so this compares a
@@ -316,7 +314,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
 ///
 /// `requires.firmware_version` is checkable **only when this run's caller
 /// says it flashed the DUT** (`run.flashed_firmware_version`,
-/// `embarch-api/design.md` §3 decision 40). There is no readback path from a
+/// `embarch-api` decision 40). There is no readback path from a
 /// DUT — Core flashes through a debug probe and gets nothing back — so
 /// absent that, the requirement is recorded as `Declared` and not compared
 /// against anything. With it, the DUT half of the gate fires for the first
@@ -324,7 +322,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
 /// the submit, so it is the only one that can supply the string.
 ///
 /// **An override is recorded, never silently honoured** (decision 31,
-/// `embarch-study-designer/design.md` §3 decision 40). On success this
+/// `embarch-study-designer` decision 40). On success this
 /// returns every requirement it waved through, which
 /// [`provenance_for`] writes into the result — a run allowed past a
 /// requirement must not be indistinguishable from one that satisfied it.
@@ -378,7 +376,7 @@ fn gate_then_start(
 
 /// The `409` body for a version mismatch, naming **both** strings and saying
 /// no step ran — the same shape `doctor` check 13 fails in
-/// (`embarch-study-designer/design.md` §3 decision 40).
+/// (`embarch-study-designer` decision 40).
 fn mismatch_message(subject: VersionSubject, required: &str, actual: &str) -> String {
     let (what, remedy) = match subject {
         VersionSubject::DevBench => (
@@ -400,11 +398,11 @@ fn mismatch_message(subject: VersionSubject, required: &str, actual: &str) -> St
 }
 
 /// The two out-of-band run parameters `POST /study` accepts as query
-/// parameters (design.md §3 decision 31's amendment,
-/// `embarch-api/design.md` §3 decision 40).
+/// parameters (`decision 31`'s amendment,
+/// `embarch-api` decision 40).
 ///
 /// **Query parameters rather than fields on the `Study` body**, because
-/// `embarch-study-designer/design.md` §3 decision 40 settles that reflash is
+/// `embarch-study-designer` decision 40 settles that reflash is
 /// "a run parameter, not a study field": a saved study that reflashed a
 /// board every time you re-read its results is the thing that decision
 /// exists to prevent. A parameter of the *request* is literally that. It
@@ -444,7 +442,7 @@ impl StudyRunParams {
 }
 
 /// What this run actually executed against, and **how each version was
-/// established** (design.md §3 decision 31, `embarch-study-designer/design.md`
+/// established** (`decision 31`, `embarch-study-designer` spec.md
 /// §4.5).
 ///
 /// dev-bench's is [`VersionSource::ReportedByDevBench`] — Core read it off
@@ -458,7 +456,7 @@ impl StudyRunParams {
 /// only because `embarch-api` sequences check → build → flash → `POST
 /// /study` and tells Core so out of band; Core keeps no persisted "last
 /// thing I flashed" record of its own, which is the staleness pattern
-/// `embarch-topology/design.md` §3 decision 3 forbids and which decision
+/// `embarch-topology` decision 3 forbids and which decision
 /// 30(c) already declined once. `ReportedByOutpost` still needs an outpost
 /// header record no firmware emits yet.
 ///
@@ -534,7 +532,7 @@ fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study
     // No subscribers is the common case (nobody's watching `/events` right
     // now) — `send` erroring just means that, not a real failure, so the
     // result is intentionally discarded, same posture `embarch-topology`'s
-    // own live-push takes (design.md §3 decision 12).
+    // own live-push takes (`embarch-topology` decision 12).
     let _ = events_tx.send(StudyEvent::StatusChanged {
         study_id: study_id.to_string(),
         status: "failed".to_string(),
@@ -544,20 +542,20 @@ fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study
 
 /// The deadline for the next `DevBenchMessage` to arrive, given the index of
 /// the next `StepResult` still outstanding — `study.rs`'s host-side watchdog
-/// (design.md §3 decision 16's amendment). `next_expected` in range uses that
+/// (`embarch-study-designer` decision 16's amendment). `next_expected` in range uses that
 /// step's own `delay_before_ms + timeout_ms`; once every step has reported in,
 /// the last step's `timeout_ms` alone is reused as the wait for the terminal
 /// `StudyDone`. Pure and `now`-parameterized so the deadline math is
 /// unit-testable without a clock or a real study run.
 ///
-/// **`delay_before_ms` is part of the window (design.md §3 decision 33).** This
+/// **`delay_before_ms` is part of the window (`decision 33`).** This
 /// function used to ignore it, which was a live defect rather than a rounding
 /// error: dev-bench honours the field by `k_sleep`ing it *before* running the
 /// step (`main.c`'s dispatch loop), so a study authoring
 /// `delay_before_ms >= timeout_ms + WATCHDOG_GRACE_MS` failed against a bench
 /// that was working perfectly. That is squarely the intended path —
 /// `delay_before_ms` exists so a stimulus's timing is authorable
-/// (`embarch-study-designer/design.md` §3 decision 42) and multi-second delays
+/// (`embarch-study-designer` decision 42) and multi-second delays
 /// are the point of it. `timeout_ms` means "how long this step may take", never
 /// "how long until I hear back"; the delay is the other term.
 ///
@@ -583,8 +581,7 @@ fn next_deadline(study: &Study, next_expected: usize, now: Instant) -> Instant {
 /// callers outside this module (namely [`hello_handler`]) don't need to know
 /// about `embarch_study_designer`'s capacity-bounded string type — this is
 /// also what `GET /dev-bench/hello` serializes verbatim for
-/// `embarch-umbrella`'s doctor check 13 (`embarch-dev-bench/design.md` §3
-/// decision 25).
+/// `embarch-umbrella`'s doctor check 13 (`embarch-dev-bench` decision 25).
 #[derive(Debug, Clone, Serialize)]
 pub struct HelloAckInfo {
     pub schema_version: u32,
@@ -821,14 +818,14 @@ async fn open_and_handshake(
     .map_err(|e| format!("dev-bench handshake task panicked: {e:?}"))?
 }
 
-/// The `design.md` §3 decision 22 board-identity gate, applied to
+/// The `decision 22` board-identity gate, applied to
 /// dev-bench's own connection — this path never calls `hardware::open_probe`
 /// at all (it's a plain serial port, not a probe-rs debug session), so it
 /// can't reuse `hardware.rs`'s own probe-selection logic the way
 /// `hardware::flash`/`reset` do.
 ///
 /// **Keyed by role, not by the link's own USB serial number, since
-/// 2026-08-21** (`embarch-dev-bench/design.md` decision 26's update):
+/// 2026-08-21** (`embarch-dev-bench` decision 26's update):
 /// originally keyed on the USB serial the link port itself reported, back
 /// when that port was the ESP32-C5's native USB-Serial/JTAG peripheral —
 /// which enumerates as both a serial port *and* a probe-rs debug probe over
@@ -877,7 +874,7 @@ fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity)
 /// Opens the dev-bench link just long enough to run the `Hello`/`HelloAck`
 /// handshake and report `firmware_version`, then closes it — no `Study` is
 /// sent. This is the "existing `GET /dev-bench/port`-adjacent connection"
-/// `embarch-umbrella/design.md` §3 decision 19 names as check 13's data
+/// `embarch-umbrella` decision 19 names as check 13's data
 /// source: `doctor` compares the `firmware_version` this returns against the
 /// local `embarch-dev-bench` checkout's own `git describe`.
 ///
@@ -921,7 +918,7 @@ pub async fn hello_handler(
 
 // ---- POST /study -----------------------------------------------------------
 
-/// design.md §5.1: validate, take the study lock, open dev-bench and hand it
+/// `embarch-study-designer` spec.md §5.1: validate, take the study lock, open dev-bench and hand it
 /// the study, then return immediately and let a background task own the rest
 /// of the study's lifetime.
 pub async fn post_study_handler(
@@ -933,7 +930,7 @@ pub async fn post_study_handler(
 
     // A `StreamSource::Signal` tap names a signal `embarch-topology` has to
     // have a declared route for before Core can open anything
-    // (`embarch-topology/design.md` §3 decision 18) — a wire between two
+    // (`embarch-topology` decision 18) — a wire between two
     // headers is invisible to software and can only ever be stated. Checked
     // here rather than at the moment the tap opens, because the failure
     // otherwise lands mid-study as a silently-empty capture, which is the
@@ -1012,8 +1009,8 @@ pub async fn post_study_handler(
         let mut link = link;
         let outcome = gate_then_start(&requires, &reported, &run_for_gate, || {
             // `streams` rides along; `validations` and `requires`
-            // deliberately do not (`embarch-study-designer/design.md` §3
-            // decisions 17, 39, 40) — dev-bench has to know which taps to
+            // deliberately do not (`embarch-study-designer` decisions
+            // 17, 39, 40) — dev-bench has to know which taps to
             // open and which `id` each answers to, and has nothing to do
             // with either of the other two.
             link.send(&DevBenchMessage::StudyStart {
@@ -1024,8 +1021,8 @@ pub async fn post_study_handler(
                 dev_bench_log_level,
                 // The manifest itself, not a reference to one: Core cannot
                 // read the firmware repo, and dev-bench is the node that
-                // *executes* this (`embarch-study-designer/design.md` §3
-                // decisions 58/60). `decoders` still does not ride along and
+                // *executes* this (`embarch-study-designer` decisions
+                // 58/60). `decoders` still does not ride along and
                 // never will — a layout decides how the host renders a byte
                 // that was already captured, and dev-bench renders nothing.
                 protocols,
@@ -1128,7 +1125,7 @@ pub async fn post_study_handler(
 ///
 /// The `Mutex` exists for exactly one reason: a `StreamSource::Signal` tap
 /// with a `Route::Direct` route reads a **third physical serial connection**
-/// on its own thread (design.md §3 decision 30(a)), so two producers can
+/// on its own thread (`decision 30(a)`), so two producers can
 /// reach the same [`StreamStore`]. It takes neither `hw_lock` nor
 /// `study_lock` — it is a read-only listener on a wire, and blocking a
 /// `/flash` on it would invent contention that does not exist.
@@ -1194,8 +1191,8 @@ fn advance_step_counters(capture: &Capture, jobs: &JobRegistry, study_id: &str, 
 /// Owns the dev-bench link for the rest of the study's lifetime: receives
 /// `DevBenchMessage`s until `StudyDone` arrives or the watchdog fires,
 /// updating the job registry, `streams/` and `events.json` as it goes
-/// (design.md §5.1 steps 8+, §5.2, and `embarch-core/design.md` §3 decisions
-/// 30/31). Entirely blocking — called from `spawn_blocking` by
+/// (`embarch-study-designer` spec.md §5.1 steps 8+, §5.2, and
+/// `decisions 30/31`). Entirely blocking — called from `spawn_blocking` by
 /// [`post_study_handler`].
 #[allow(clippy::too_many_arguments)]
 fn run_study_to_completion(
@@ -1225,7 +1222,7 @@ fn run_study_to_completion(
         return;
     }
 
-    // Retention across runs (`embarch-core/design.md` §3 decision 30): run
+    // Retention across runs (`decision 30`): run
     // once per submitted study, immediately after this study's own directory
     // exists, so `keep` is exact and counts the run in progress rather than
     // being one out. A sweep that fails is logged and ignored — losing disk
@@ -1293,7 +1290,7 @@ fn run_study_to_completion(
     // than accumulating them and assembling a `StudyResult` only at the
     // end — see `EventsJsonWriter`'s own doc comment for why that
     // accumulate-then-build step is exactly what used to overflow the
-    // stack (`embarch-study-designer/design.md` §7).
+    // stack (`embarch-study-designer` decision 63).
     let mut writer = match EventsJsonWriter::start(&results_dir, study.name.as_str(), &provenance) {
         Ok(w) => w,
         Err(e) => {
@@ -1318,7 +1315,7 @@ fn run_study_to_completion(
     let mut open_taps: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
     // What this study asked the bench for, stated in the bench's own file
-    // (`embarch-dev-bench/design.md` §3 decision 39).
+    // (`embarch-dev-bench` decision 39).
     //
     // **A quiet debug file is ambiguous without this line, and that is the
     // whole reason it exists.** Since verbosity became per-study, a run with
@@ -1444,7 +1441,7 @@ fn run_study_to_completion(
                 let name = tap_for(&capture.taps, id).map(|t| t.name.as_str()).unwrap_or("<undeclared>");
                 if dropped > 0 {
                     // A capture that lost data must say so rather than be
-                    // read as complete — `embarch-study-designer/design.md`
+                    // read as complete — `embarch-study-designer`
                     // §4.8's whole reason for carrying `dropped` on close.
                     // Recorded on the `StreamRef`, not just logged: a log
                     // line is not something a result carries with it.
@@ -1529,7 +1526,7 @@ fn run_study_to_completion(
                 }
 
                 // ...and into the study's own results, on the reserved
-                // `dev-bench` tap (`embarch-study-designer/design.md` §4.8).
+                // `dev-bench` tap (`embarch-study-designer` spec.md §4.8).
                 // This is the asymmetry that tap exists to close: until now
                 // a LogLine reached Core's rolling log and *nothing else*,
                 // so the firmware's own account of a run was the one part of
@@ -1654,7 +1651,7 @@ fn run_study_to_completion(
                 // `recv` buffers and nothing ever mentioned. A run that timed
                 // out this way once reported only "no message received" while
                 // holding the bench's own account of its reset in a private
-                // buffer (`embarch-dev-bench/design.md` §4).
+                // buffer (`decision 40`).
                 if let Some(full) = link.unframed_tail_full() {
                     crate::dev_bench_log::note(
                         Some(&study_id),
@@ -1806,7 +1803,7 @@ fn verify_declared_records(
 }
 
 /// Decodes every `OutpostTrace` tap's captured bytes into a `*.trace.csv`,
-/// once the capture is closed (`embarch-outpost/design.md` §3 decision 10 —
+/// once the capture is closed (`embarch-outpost` decision 10 —
 /// post-hoc, no live feed).
 ///
 /// **A missing or mismatched manifest costs the names, never the capture.**
@@ -1854,7 +1851,7 @@ fn render_outpost_traces(
         let out_path = streams_dir.join(&rendered_name);
         // Core's own receipt time per frame, written during the capture — the
         // trace's only clock, since a record carries none of its own
-        // (`embarch-outpost/design.md` §3 decisions 4, 17, 18).
+        // (`embarch-outpost` decisions 4, 17, 18).
         let arrival_path = entry.arrival_file.as_ref().map(|f| streams_dir.join(f));
 
         match outpost_manifest::render(
@@ -1971,8 +1968,8 @@ fn render_outpost_traces(
 
 // ---- Core's own taps: a Route::Direct signal on a third serial port -------
 
-/// One `StreamSource::Signal` tap Core reads itself (design.md §3 decision
-/// 30(a)): a USB-UART bridge with a DUT pin on it and nothing else — **a
+/// One `StreamSource::Signal` tap Core reads itself (`decision 30(a)`): a
+/// USB-UART bridge with a DUT pin on it and nothing else — **a
 /// port that belongs to a wire, not to a device.**
 struct SignalTapReader {
     stop: Arc<AtomicBool>,
@@ -1993,7 +1990,7 @@ impl SignalTapReader {
 /// has to have a declared route before Core can open anything.
 ///
 /// This is the **first caller `resolve_signal_port`/`find_signal` have ever
-/// had** — `embarch-topology/design.md` §5 recorded that surface as unwired
+/// had** — `embarch-topology` spec.md recorded that surface as unwired
 /// infrastructure, and this is what wires it.
 async fn check_signal_taps_are_declared(study: &Study) -> Result<(), String> {
     let names: Vec<String> = study
@@ -2017,7 +2014,7 @@ async fn check_signal_taps_are_declared(study: &Study) -> Result<(), String> {
                         "this study taps signal '{name}', which has no declared route — \
                          declare it first with POST /signals. A wire between two headers is \
                          invisible to software and can only ever be stated \
-                         (embarch-topology/design.md §3 decision 18)."
+                         (embarch-topology decision 18).",
                     ))
                 }
                 Err(e) => {
@@ -2205,7 +2202,7 @@ fn read_signal_tap(
             Ok(n) => {
                 let record = StreamRecord {
                     // Core is the node that received these bytes, so Core
-                    // stamps them (`embarch-study-designer/design.md` §4.8).
+                    // stamps them (`embarch-study-designer` spec.md §4.8).
                     rx_utc_ms: current_utc_ms(),
                     bytes: heapless::Vec::from_slice(&buf[..n]).unwrap_or_default(),
                 };
@@ -2228,7 +2225,7 @@ fn read_signal_tap(
 
 /// The declared tap `id` refers to, or `None` if the study never declared it.
 /// `id` is the tap's own index in `Study.streams`
-/// (`embarch-study-designer/design.md` §4.8), enforced by that crate's
+/// (`embarch-study-designer` spec.md §4.8), enforced by that crate's
 /// `validate_taps` at submission, so this is a bounds-checked index rather
 /// than a search.
 fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
@@ -2238,12 +2235,12 @@ fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
 /// Writes one arrival-stamped record to its tap's files under `streams/`.
 ///
 /// **The raw bytes go down first, always, before any decode is attempted**
-/// (`embarch-core/design.md` §3 decision 30(b)). A decode that fails then
+/// (`decision 30(b)`). A decode that fails then
 /// costs a rendering, not a capture — the run is recoverable, which is the
 /// whole difference between a bad afternoon and a lost one.
 ///
 /// What a payload *means* comes only from the tap's declared
-/// [`StreamEncoding`] (`embarch-study-designer/design.md` §3 decision 39,
+/// [`StreamEncoding`] (`embarch-study-designer` decision 39,
 /// §4.8) — never from the bytes. There is no sniff and no fallback here:
 /// `Raw` renders nothing because nobody declared anything to render it as.
 fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord) {
@@ -2251,8 +2248,8 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         // Raw first. Unconditionally, for every encoding. The arrival stamp
         // goes down in the same lock, immediately after, because for an
         // `OutpostTrace` tap it is the *only* clock the trace will ever have —
-        // a record carries none of its own (`embarch-outpost/design.md` §3
-        // decisions 4 and 17) and the rendering happens post-hoc, long after
+        // a record carries none of its own (`embarch-outpost` decisions
+        // 4 and 17) and the rendering happens post-hoc, long after
         // this read. A no-op for every other encoding, whose rendered rows
         // carry `core_rx_utc_ms` themselves.
         let mut store = capture.store.lock().unwrap();
@@ -2312,7 +2309,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         }
         StreamEncoding::OutpostTrace => {
             // Rendered **post-hoc, from the complete raw file**, not here.
-            // `embarch-outpost/design.md` §3 decision 10 settled that a trace
+            // `embarch-outpost` decision 10 settled that a trace
             // is recorded for a study's duration and drawn afterwards, and
             // decoding at the end is also what lets a header frame that
             // arrived late name every record before it. See
@@ -2320,7 +2317,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         }
         StreamEncoding::Struct { decoder } => {
             // The record's bytes are one instance of the layout the engineer
-            // declared (`embarch-study-designer/design.md` §3 decision 52) —
+            // declared (`embarch-study-designer` decision 52) —
             // for a `GattNotify` tap, exactly one notification's raw ATT
             // value, with nothing wrapped around it.
             write_struct_rows(capture, tap.id, open_step_index, decoder, record);
@@ -2333,8 +2330,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
 }
 
 /// Renders one record through its tap's declared [`StructLayout`], appending
-/// one CSV row per repetition (`embarch-study-designer/design.md` §3
-/// decision 52).
+/// one CSV row per repetition (`embarch-study-designer` decision 52).
 ///
 /// **A payload that doesn't fit the layout still gets a row.** Its decoded
 /// columns are empty and `payload_hex`/`decode_note` carry the bytes and the
@@ -2440,13 +2436,13 @@ fn write_sample(capture: &Capture, tap_id: u8, step_index: u32, sample: Sample) 
 }
 
 /// Appends one GATT transcript entry to its tap's rendered CSV
-/// (`embarch-study-designer/design.md` §3 decision 36, §4.3b), the same way
+/// (`embarch-study-designer` decision 36, §4.3b), the same way
 /// [`write_sample`] appends samples: incrementally, as each entry arrives,
 /// so a capture survives a Core crash that writes the study itself off as
 /// `"failed"`.
 ///
 /// `step_index` is whichever step was open when the record carrying this
-/// entry arrived (`embarch-study-designer/design.md` §3 decision 36's own
+/// entry arrived (`embarch-study-designer` decision 36's own
 /// definition of that column) — the generic stream record replacing the
 /// retired `GattTranscriptRecord` carries no step of its own. An
 /// out-of-range `step_index` still gets written, with an empty `step_name`,
@@ -2472,7 +2468,7 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
     // Core's receipt time, not part of the wire type (decision 30), same
     // split `write_sample` uses. It is also the only wall-clock timestamp on
     // the row today: `rx_utc_ms` is dev-bench uptime until the clock-resync
-    // gap (design.md §7) closes.
+    // gap (`embarch-study-designer` decision 30) closes.
     capture
         .store
         .lock()
@@ -2482,7 +2478,7 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
 
 /// Streams `events.json` to disk one `StepResult` at a time, as each
 /// arrives — the file is never assembled from a fully-materialized
-/// `StudyResult` held in memory. `embarch-study-designer/design.md` §7
+/// `StudyResult` held in memory. `embarch-study-designer` decision 63
 /// measured that type at **~1.3 MB**, purely from its `no_std` worst-case-
 /// capacity fields (`heapless::Vec<StepResult, 64>`, each `StepResult`
 /// itself carrying up to 32 `GattActivityRecord`s at up to 512 bytes each) —
@@ -2678,7 +2674,7 @@ impl EventsJsonWriter {
     }
 }
 
-/// `StudyDone`'s happy path (design.md §5.1 step 8): finalize `events.json`
+/// `StudyDone`'s happy path (`embarch-study-designer` spec.md §5.1 step 8): finalize `events.json`
 /// (every step in it was already streamed to disk as it arrived — this only
 /// closes the file out) and mark the job `"completed"`. `completed: false`
 /// (a study that stopped early on a failing step with `continue_on_fail:
@@ -2761,7 +2757,7 @@ async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
 /// broadcasts it — a step completing, a sample batch arriving, or the
 /// study's own status changing — rather than requiring the client to poll
 /// and hope it didn't miss something in between. Mirrors `embarch-
-/// topology`'s own live-push shape (design.md §3 decision 12) applied here
+/// topology`'s own live-push shape (`embarch-topology` decision 12) applied here
 /// to study progress. Only one study is ever in flight at a time
 /// (`StudyLock`), so a single process-wide broadcast channel (`AppState::
 /// study_events`) is enough — no per-study subscription bookkeeping.
@@ -2841,8 +2837,7 @@ pub struct StreamIndexEntryResponse {
     /// facts to branch on are below.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Whether a manifest named this trace (`embarch-outpost/design.md` §3
-    /// decision 9), and whether its frames carry Core's receipt time
+    /// Whether a manifest named this trace (`embarch-outpost` decision 9), and whether its frames carry Core's receipt time
     /// (decisions 17, 18). Two independent facts, reported as two, because a
     /// trace can be either without the other and a caller that read them off
     /// `note`'s text would be re-deriving a judgement Core already made.
@@ -2852,8 +2847,8 @@ pub struct StreamIndexEntryResponse {
     pub timed: Option<bool>,
     /// A third independent fact, and the only one the **firmware** decides:
     /// whether the outpost kept its own drain thread and its own UART's
-    /// interrupt out of this trace (`embarch-outpost/design.md` §3 decision
-    /// 19, read off the header frame's flags). `true` means intervals covered
+    /// interrupt out of this trace (`embarch-outpost` decision 19, read off
+    /// the header frame's flags). `true` means intervals covered
     /// by no lane are the instrument's own rather than unexplained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_excluded: Option<bool>,
@@ -2867,8 +2862,8 @@ pub struct StreamIndexResponse {
 /// What a study's taps captured, and — the reason this route exists — **why a
 /// trace has no names when it has none**.
 ///
-/// Added 2026-08-26 for `embarch-ui`'s Trace view (`embarch-ui/design.md` §3
-/// decision 10). Until it existed, `streams/index.json`'s `note` had no HTTP
+/// Added 2026-08-26 for `embarch-ui`'s Trace view (`embarch-ui` decision 10,
+/// trace half). Until it existed, `streams/index.json`'s `note` had no HTTP
 /// caller at all: `GET /study/{id}` returns `StreamRef { name, bytes_written,
 /// truncated }`, which has no room for it, and
 /// `GET /study/{id}/stream/{name}` serves the rendered CSV either way — so
@@ -3093,7 +3088,7 @@ impl StreamQuery {
 }
 
 /// One tap's capture, by the name the `Study` declared it under
-/// (`embarch-core/design.md` §3 decision 30(b), §4).
+/// (`decision 30(b)`, spec.md §4).
 ///
 /// Served as **bytes**, for the same reason the three fixed routes it
 /// replaces were: Core and `embarch-api` are not guaranteed to share a
@@ -3132,7 +3127,7 @@ pub async fn stream_data_handler(
 // The three fixed routes `GET /study/{id}/stream/{name}` replaces, kept as
 // aliases for one release rather than breaking `embarch-api`'s existing
 // `study_power_data`/`study_waveform_data`/`study_gatt_data` tools mid-flight
-// (`embarch-core/design.md` §3 decision 30). Each resolves through the
+// (`decision 30`). Each resolves through the
 // study's own index to whichever tap answers that alias — which is the whole
 // reason the index exists, since a handler reading results back off disk has
 // no `Study` in hand to ask.
@@ -3145,7 +3140,7 @@ pub async fn waveform_data_handler(Path(study_id): Path<String>) -> Result<Respo
     serve_alias(&study_id, "waveform", "waveform.csv", "waveform data").await
 }
 
-/// `embarch-study-designer/design.md` §3 decision 36: the study's whole GATT
+/// `embarch-study-designer` decision 36: the study's whole GATT
 /// transcript, every entry across every step, uncapped — as opposed to
 /// `GET /study/{id}`'s per-step `gatt_activity`, which is a bounded inline
 /// summary.
@@ -3345,7 +3340,7 @@ mod tests {
             streams,
             steps_crc: steps_crc_value,
             streams_crc: streams_crc_value,
-            // embarch-study-designer/design.md §3 decision 58: this fixture
+            // `embarch-study-designer` decision 58: this fixture
             // runs no protocol, and an empty list's CRC is the genuine
             // CRC-32 of zero bytes rather than a sentinel.
             protocols: Default::default(),
@@ -3355,7 +3350,7 @@ mod tests {
         }
     }
 
-    // ---- write_struct_rows (embarch-study-designer/design.md §3 decision 52) ----
+    // ---- write_struct_rows (`embarch-study-designer` decision 52) ----
 
     /// `ppg_packet`: a two-field header then a repeating pair — the shape a
     /// real sensor notification actually has, and the whole reason
@@ -3495,7 +3490,7 @@ mod tests {
         assert_eq!(raw.len(), 6);
     }
 
-    // ---- write_transcript_entry (design.md §3 decision 36) ----
+    // ---- write_transcript_entry (`decision 36`) ----
 
     fn transcript_entry(payload: &[u8]) -> GattTranscriptEntry {
         use embarch_study_designer::{GattDirection, GattEventKind, Uuid};
@@ -3523,7 +3518,7 @@ mod tests {
         write_transcript_entry(&capture, 0, 1, &transcript_entry(b"hi"));
 
         // The row shape is unchanged by the move to `streams/` — only the
-        // path is (`embarch-core/design.md` §3 decision 30(b)).
+        // path is (`decision 30(b)`).
         let csv = std::fs::read_to_string(dir.path().join("streams").join("gatt.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3, "expected a header plus two rows, got: {csv}");
@@ -3593,7 +3588,7 @@ mod tests {
 
 
 
-    // ---- `.eap` protocols (embarch-study-designer/design.md §3 decisions
+    // ---- `.eap` protocols (`embarch-study-designer` decisions
     //      58-62) ----
 
     /// The smallest executable manifest: one source, one frame, an active
@@ -3824,7 +3819,7 @@ mod tests {
         assert_eq!(deadline, now + Duration::from_millis(5_000 + WATCHDOG_GRACE_MS));
     }
 
-    /// The regression for design.md §3 decision 33. Against the old math
+    /// The regression for `decision 33`. Against the old math
     /// (`timeout_ms + GRACE`, delay ignored) this study's window was 3s while
     /// dev-bench would not even *start* the step for 30s — a guaranteed
     /// spurious lapse against a bench doing exactly what it was told.
@@ -4163,7 +4158,7 @@ mod tests {
             step_name: heapless::String::try_from(name).unwrap(),
             outcome: embarch_study_designer::Outcome::Pass,
             captured_data: None,
-            // embarch-study-designer/design.md §3 decisions 31/32 — new
+            // `embarch-study-designer` decisions 31/32 — new
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
             // Decision 44's `security_level`, likewise: this fixture has no
@@ -4207,7 +4202,7 @@ mod tests {
     }
 
     /// Regression test for the real stack overflow this streaming rework
-    /// fixes (`embarch-study-designer/design.md` §7): the old version of
+    /// fixes (`embarch-study-designer` decision 63): the old version of
     /// this test built a full `StudyResult` (~1.3 MB, all no_std worst-case
     /// capacity) and cloned a `StudyJob` holding one — both routinely
     /// overflowed a normal thread stack. `EventsJsonWriter` never
@@ -4273,8 +4268,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `StepResult.protocol` reaches `events.json` (embarch-study-designer/
-    /// design.md §3 decision 62), and it does so through serde rather than
+    /// `StepResult.protocol` reaches `events.json` (`embarch-study-designer`
+    /// decision 62), and it does so through serde rather than
     /// through anything this file writes by hand.
     ///
     /// Asserted rather than assumed. `EventsJsonWriter` hand-writes the
@@ -4548,7 +4543,7 @@ mod tests {
     fn a_raw_tap_writes_its_bytes_and_renders_nothing() {
         // No sniff, no heuristic, no "looks like text" fallback: `Raw` is
         // the honest default for a payload nobody declared a meaning for
-        // (`embarch-study-designer/design.md` §3 decision 35).
+        // (`embarch-study-designer` decision 35).
         let dir = tempfile::tempdir().unwrap();
         let study = study_with_taps(
             &[1_000],
@@ -4573,7 +4568,7 @@ mod tests {
 
     #[test]
     fn a_record_arriving_during_step_1_is_labelled_step_1_not_step_0() {
-        // `embarch-study-designer/design.md` §4.8 defines this column as
+        // `embarch-study-designer` spec.md §4.8 defines this column as
         // "whichever step the host has open when the record arrives" —
         // which is the step now *running*, not the one that just finished.
         // Phase A's adaptation used the latter, and the two agree only
@@ -4738,7 +4733,7 @@ mod tests {
 
     #[test]
     fn an_override_proceeds_and_the_result_records_what_was_waved_through() {
-        // `embarch-study-designer/design.md` §3 decision 40: the override is
+        // `embarch-study-designer` decision 40: the override is
         // "recorded in the result rather than silently honoured". The
         // assertion that matters is the third one — a run that proceeded past
         // a requirement must not be indistinguishable from one that met it.
@@ -4931,8 +4926,8 @@ mod tests {
         assert!(index.find("no-such-tap").is_none());
     }
 
-    /// **The test the aliases exist for** (`embarch-core/design.md` §3
-    /// decision 30, `embarch-api/design.md` §3 decision 39): each of the
+    /// **The test the aliases exist for** (`decision 30`,
+    /// `embarch-api` decision 39): each of the
     /// three retired fixed routes has to keep answering with *exactly* what
     /// its replacement answers with, for one release, or an agent
     /// mid-conversation gets silently different data from the same call it

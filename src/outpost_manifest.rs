@@ -1,6 +1,6 @@
 //! Storing the DUT's `outpost-manifest.json`, and rendering a trace against it.
 //!
-//! `embarch-outpost/design.md` §3 decision 9, and this crate's own §3 decision
+//! `embarch-outpost` decision 9, and this crate's own decision
 //! 30(c). Built 2026-08-25, when Milestone 7 Phase C produced the first real
 //! manifest — the named trigger both halves were deliberately parked on.
 //!
@@ -11,7 +11,7 @@
 //! operation** (`POST /flash` carries both), so there is no interval in which
 //! Core holds one without the other, and no "current manifest" registry to go
 //! stale. This is not the write-ahead-staleness pattern
-//! `embarch-topology/design.md` §3 decision 3 exists to eliminate — what that
+//! `embarch-topology` decision 3 exists to eliminate — what that
 //! forbids is a *persisted* record of resolved state consulted at a later,
 //! unrelated moment, and this binding's lifetime ends at the next flash of the
 //! same chip.
@@ -104,8 +104,7 @@ impl ManifestSlot {
 
     /// Whichever manifest is currently bound, if exactly one chip has one.
     ///
-    /// A `Study` names a *signal*, not a chip (`embarch-outpost/design.md` §3
-    /// decision 12), so there is nothing in a study to resolve a chip from.
+    /// A `Study` names a *signal*, not a chip (`embarch-outpost` decision 12), so there is nothing in a study to resolve a chip from.
     /// With one bound manifest that is unambiguous. With more than one it is
     /// not, and this returns `None` rather than picking — an ambiguous choice
     /// rendered confidently is the same failure as a stale one.
@@ -196,7 +195,7 @@ pub struct RenderOutcome {
     /// already reported on the entry beside it.
     pub header_flags: Option<u8>,
     /// Frames that got a receipt time out of the arrival log — the trace's only
-    /// clock (`embarch-outpost/design.md` §3 decisions 17, 18). Zero means
+    /// clock (`embarch-outpost` decisions 17, 18). Zero means
     /// every row rendered with an empty `rx_utc_ms`: an ordered, untimed
     /// trace, which is a real answer and is never dressed up as a timed one.
     pub stamped_frames: usize,
@@ -280,7 +279,7 @@ impl ArrivalIndex {
 /// Decodes a captured outpost stream into a `*.trace.csv` beside it.
 ///
 /// Post-hoc, from the complete raw file, because that is what the capture
-/// model is: `embarch-outpost/design.md` §3 decision 10 settled that a trace
+/// model is: `embarch-outpost` decision 10 settled that a trace
 /// is recorded for the duration of a study and drawn afterwards, with no live
 /// feed. Decoding at the end also means a header frame that arrived late still
 /// names every record before it.

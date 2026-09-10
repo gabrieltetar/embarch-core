@@ -57,7 +57,7 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 }
 
 /// Resolves which attached probe a call means, matched against
-/// `ProbeInfo.serial_number` (`design.md` §3 decision 9) — real, not just
+/// `ProbeInfo.serial_number` (`decision 9`) — real, not just
 /// documented: `open_first_probe`'s own prior doc comment said this was
 /// still single-probe-only, a real drift from what that decision already
 /// claimed, found the first time a second probe (dev-bench's own) was
@@ -75,7 +75,7 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 /// call mean" (`enforce`/`enroll`) — the exact selection rule, shared
 /// rather than copied a second time, closing the same class of gap that let
 /// this decision's own serial-number selector go silently unimplemented for
-/// as long as it did (see this decision's own text in `design.md`).
+/// as long as it did (see decision 9's own text).
 pub(crate) fn resolve_probe(probe_serial: Option<&str>) -> Result<probe_rs::probe::DebugProbeInfo> {
     let lister = Lister::new();
     let probes = lister.list_all();
@@ -115,7 +115,7 @@ pub(crate) fn resolve_probe(probe_serial: Option<&str>) -> Result<probe_rs::prob
 /// `embarch_topology::hardware::validate_serial` (the board-identity gate,
 /// formerly this crate's own `board_gate.rs`) opens the exact same probe
 /// again for its own gate-check attach, a separate connection from
-/// `flash`/`reset`'s own subsequent attach (`design.md` §5: probe attach is
+/// `flash`/`reset`'s own subsequent attach (`embarch-core` spec.md §2: probe attach is
 /// per-call, never held open across calls).
 pub(crate) fn open_probe(probe_serial: Option<&str>) -> Result<probe_rs::probe::Probe> {
     resolve_probe(probe_serial)?.open().context("failed to open debug probe")
@@ -147,8 +147,7 @@ fn resolved_serial(probe_serial: Option<&str>) -> Result<String> {
 /// `base_address` is only meaningful for `format = "bin"` — a raw binary has
 /// no self-describing load address (unlike ELF/hex/uf2, and unlike `idf`,
 /// which builds its own bootloader+partition-table+app image from an ELF's
-/// ESP-IDF app-descriptor section, `embarch-dev-bench/design.md`'s ESP JTAG
-/// decision). Zephyr's own ESP32 `west flash` merges bootloader+partition-
+/// ESP-IDF app-descriptor section, `embarch-dev-bench` decision 26). Zephyr's own ESP32 `west flash` merges bootloader+partition-
 /// table+app into one flat image (its build already logs the merge address,
 /// e.g. `0x2000`) and writes it as one `esptool write-flash <addr> zephyr.bin`
 /// call — `Format::Idf` doesn't apply to that image at all (Zephyr doesn't

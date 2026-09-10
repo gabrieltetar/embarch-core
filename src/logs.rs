@@ -1,19 +1,19 @@
 //! Shared log-reading logic behind `embarch-core logs` (CLI, `main.rs`) and
 //! `GET /logs/recent`/`GET /logs/stream` (HTTP, `api.rs`) — one
 //! implementation, multiple call sites, matching this suite's own
-//! established shape (`embarch-topology/design.md` decisions 2/8/14) rather
+//! established shape (`embarch-topology` decisions 2/8/14) rather
 //! than the CLI and HTTP paths growing separate copies of "find the current
-//! log file." Moved out of `main.rs` unchanged (`embarch-ui/design.md` §3
-//! decision 7) when the HTTP surface
+//! log file." Moved out of `main.rs` unchanged (`embarch-ui` decision 7)
+//! when the HTTP surface
 //! needed the same logic `main.rs`'s `Logs` subcommand already had.
 //!
 //! Reuses the existing daily-rolling logfile (`main.rs`'s `init_tracing`,
-//! §3 decision 16) rather than introducing a second, size-capped log
-//! mechanism — `embarch-ui/design.md` §3 decision 7 originally described a
+//! `decision 16`) rather than introducing a second, size-capped log
+//! mechanism — `embarch-ui` decision 7 originally described a
 //! new size-capped rotating logfile, written before this session noticed
 //! Core already had a real, tested, daily-rotating one (7-file retention).
 //! That decision is corrected in place rather than building a redundant
-//! second mechanism (see this crate's own design.md for the full account).
+//! second mechanism (see this crate's own decisions for the full account).
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -78,8 +78,8 @@ pub(crate) fn read_recent_with_prefix(prefix: &str, tail: usize) -> Result<Vec<S
     Ok(tail_lines(&contents, tail).into_iter().map(String::from).collect())
 }
 
-/// Poll-based tail-follow behind `GET /logs/stream` — `embarch-ui/design.md`
-/// §3 decision 7's "live tail," implemented the same way `embarch-core`'s
+/// Poll-based tail-follow behind `GET /logs/stream` — `embarch-ui`
+/// decision 7's "live tail," implemented the same way `embarch-core`'s
 /// own `serial::read_log` already reads a live source (a poll loop, not an
 /// OS-level file-change notification), and the same way `embarch-ui`'s own
 /// Dashboard/Study-Designer tabs already relay a server-side poll over SSE

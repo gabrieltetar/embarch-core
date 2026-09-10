@@ -11,14 +11,14 @@ anyhow = "1.0.103"
 axum = { version = "0.8.9", features = ["multipart"] }
 clap = { version = "4.6.2", features = ["derive"] }
 # `core-validation` is the feature this crate's own Cargo.toml comments name
-# as the one component meant to enable it (SignalCheck evaluation, that
-# crate's design.md §4.6/decision 19) — study.rs doesn't call that evaluation
+# as the one component meant to enable it (SignalCheck evaluation,
+# `embarch-study-designer` decision 19) — study.rs doesn't call that evaluation
 # code yet (the self-test study it validates against has no `validations`),
 # but the feature costs nothing to turn on now and this is the intended place.
 # `std` (which implies `alloc`) is what Core needs from this crate: the
 # `gatt.csv`/`data.csv` rendering helpers (`GattTranscriptEntry::csv_header`,
 # `Sample::to_csv_row`) are std-gated, and `alloc` backs `Study.steps` with a
-# heap Vec (that crate's §3 decision 46). Core used to reach `std` indirectly
+# heap Vec (that crate's decision 46). Core used to reach `std` indirectly
 # via `core-validation = ["std"]`; that feature is gone with post-hoc
 # validation, so the dependency now says what it actually wants.
 embarch-study-designer = { path = "../embarch-study-designer", features = ["std"] }
@@ -26,7 +26,7 @@ embarch-study-designer = { path = "../embarch-study-designer", features = ["std"
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
 # features with embarch-study-designer's own "serde"-enabled dependency.
 heapless = "0.8"
-# embarch-topology/design.md decisions 2, 4, 8: dev-bench port detection,
+# embarch-topology decisions 2, 4, 8: dev-bench port detection,
 # hardware-ID readback, enrollment storage, and live board-identity
 # validate() all moved out of this crate's own board_gate.rs/
 # known_boards.rs/hardware_id.rs/dev_bench.rs into this shared crate.
@@ -51,7 +51,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # `usbportinfo-interface` surfaces UsbPortInfo::interface, which dev_bench.rs
 # needs to tell two VCOM interfaces of one on-board J-Link apart
-# (embarch-dev-bench/design.md §3 decision 12, §4).
+# (`embarch-dev-bench` decision 12, spec.md §4).
 serialport = { version = "4.9.0", features = ["usbportinfo-interface"] }
 service-manager = "0.11.0"
 tempfile = "3.24"
@@ -67,7 +67,7 @@ tokio = { version = "1.53.0", features = ["full"] }
 # pulling in all of `futures`.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# known_boards.toml (design.md §3 decision 22) — same version embarch-api
+# known_boards.toml (`decision 22`) — same version embarch-api
 # already pins, no reason for the two to drift.
 toml = "1.1"
 tracing = "0.1.44"

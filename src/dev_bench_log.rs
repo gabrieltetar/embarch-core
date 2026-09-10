@@ -16,7 +16,7 @@
 //!   the study started, and it does not exist at all for the
 //!   `GET /dev-bench/hello` probe.
 //!
-//! `embarch-dev-bench/design.md` §3 decision 38 turned `CONFIG_LOG` on in the
+//! `embarch-dev-bench` decision 38 turned `CONFIG_LOG` on in the
 //! firmware, which changes the volume and the value of this channel: it now
 //! carries Zephyr's own subsystem output and, on a crash, the fatal-error
 //! dump. That wants one continuous file, spanning studies, that exists whether
@@ -43,8 +43,8 @@ pub(crate) const DEV_BENCH_LOG_FILE_PREFIX: &str = "dev-bench.log";
 /// Core can mirror a firmware line into `core.log` at a level that matches
 /// what the firmware said, instead of picking one level for all of them.
 ///
-/// `Unmarked` is the hand-written `send_log_line()` diagnostics (design.md
-/// §3 decision 7's original use of this channel) — a truncated transcript, a
+/// `Unmarked` is the hand-written `send_log_line()` diagnostics
+/// (`embarch-dev-bench` decision 7's original use of this channel) — a truncated transcript, a
 /// link RX overrun, the uptime line at handshake. Those are deliberate
 /// statements to the host, not log records, and they keep the `info` treatment
 /// decision 37 found them already deserving.
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn classify_leaves_a_hand_written_diagnostic_unmarked() {
-        // design.md §3 decision 7's original users of this channel: no level
+        // `embarch-dev-bench` decision 7's original users of this channel: no level
         // marker, and they must not be demoted to `debug` by accident.
         assert_eq!(
             classify("uptime 412 ms at handshake, reset cause 0x00000001"),

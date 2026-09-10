@@ -24,7 +24,7 @@ use crate::{chip_resolve, hardware, logs, serial, study};
 ///
 /// `study_lock`/`study_jobs` are `/study*`'s own state (`study.rs`).
 /// `study_lock` is explicitly separate from `hw_lock` — a different physical
-/// connection (`embarch-core/design.md` §3 decision 15) — so an in-flight
+/// connection (`decision 15`) — so an in-flight
 /// study and a `/flash`/`/reset` call never contend on the same guard.
 #[derive(Clone)]
 pub struct AppState {
@@ -40,8 +40,8 @@ pub struct AppState {
     /// (`study::study_events_handler`) rather than silently missing events.
     pub study_events: tokio::sync::broadcast::Sender<study::StudyEvent>,
     /// The DUT's `outpost-manifest.json`, as the flash that put that image on
-    /// the board delivered it (`embarch-outpost/design.md` §3 decision 9,
-    /// design.md §3 decision 30(c)). Empty until a `POST /flash` carries one.
+    /// the board delivered it (`embarch-outpost` decision 9,
+    /// `decision 30(c)`). Empty until a `POST /flash` carries one.
     pub outpost_manifest: crate::outpost_manifest::ManifestSlot,
 }
 
@@ -135,7 +135,7 @@ struct StatusResponse {
     status: &'static str,
     probes: Vec<hardware::ProbeInfo>,
     /// The `embarch-study-designer` **host type** schema version this Core
-    /// was built against (`embarch-study-designer/design.md` §3 decision 12
+    /// was built against (`embarch-study-designer` decision 12
     /// and its 2026-08-25 amendment). `embarch-api` compares it against its
     /// own compiled-in copy before submitting a `Study`, since `GET /status`
     /// is already that hop's connection-establishment check and there is no
@@ -195,7 +195,7 @@ struct FlashRequest {
     #[serde(default)]
     base_address: Option<String>,
     /// Disambiguates which attached debug probe to use when more than one
-    /// is (`design.md` §3 decision 9, `hardware::open_probe`) — matched
+    /// is (`decision 9`, `hardware::open_probe`) — matched
     /// against `ProbeInfo.serial_number`. Omitted behaves as before when
     /// exactly one probe is attached; more than one with this omitted is
     /// now a named `500` rather than a silent, possibly-wrong pick.
@@ -213,7 +213,7 @@ struct FlashRequest {
     /// part, exactly as `firmware_path` is `firmware`'s.
     ///
     /// On the same call as the artifact rather than on a `POST /manifests` of
-    /// its own (design.md §3 decision 30(c), Settlement 1): the manifest and
+    /// its own (`decision 30(c)`, Settlement 1): the manifest and
     /// the image it describes then arrive in **one operation**, which is what
     /// makes "the study's own flash binds it" hold with no "which manifest is
     /// current" record to go stale.
@@ -267,8 +267,8 @@ struct FlashArgs {
 
 /// `/flash` accepts a JSON body (`firmware_path` — a path *this process*
 /// can open directly, the same-machine assumption) or a
-/// `multipart/form-data` body carrying the artifact's bytes (`design.md`
-/// §9 decision 10; `embarch-api/design.md` §9's 2026-08-18 finding is what
+/// `multipart/form-data` body carrying the artifact's bytes (`decision 10`;
+/// `embarch-api` decision 15's 2026-08-18 finding is what
 /// actually gave this a caller — a `WslHost` Core running as an installed
 /// Windows service has no access to the WSL2-side `\\wsl.localhost` share
 /// at all, so `embarch-api` now uploads bytes for that case instead of
@@ -380,7 +380,7 @@ fn bad_multipart_field<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 /// same as the JSON body), and a `firmware` file part (required) — the
 /// artifact's raw bytes, written to a temp file since `hardware::flash`
 /// reads from a path. An optional `manifest` text part carries the build's
-/// `outpost-manifest.json` (design.md §3 decision 30(c)) — the multipart
+/// `outpost-manifest.json` (`decision 30(c)`) — the multipart
 /// sibling of the JSON body's `manifest_path`.
 async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs, (StatusCode, String)> {
     let mut chip: Option<String> = None;
@@ -399,7 +399,7 @@ async fn flash_args_from_multipart(mut multipart: Multipart) -> Result<FlashArgs
             Some("probe_serial") => probe_serial = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("erase") => erase_raw = Some(field.text().await.map_err(bad_multipart_field)?),
             // The manifest rides the same request as the artifact it
-            // describes (design.md §3 decision 30(c)), so there is no interval
+            // describes (`decision 30(c)`), so there is no interval
             // in which Core holds one without the other.
             Some("manifest") => manifest_json = Some(field.text().await.map_err(bad_multipart_field)?),
             Some("firmware") => {
@@ -548,7 +548,7 @@ async fn serial_log_handler(
 // ---- POST /resolve-chip ----------------------------------------------------
 
 /// Zephyr SoC name → probe-rs chip target string (`chip_resolve.rs`,
-/// `design.md` §3 decision 8). Pure lookup against probe-rs's own target
+/// `decision 8`). Pure lookup against probe-rs's own target
 /// registry — no hardware touched, so this takes no `hw_lock`, same posture
 /// as `/status`'s probe listing and `/dev-bench/port`.
 #[derive(Deserialize)]
@@ -582,7 +582,7 @@ async fn resolve_chip_handler(
 // ---- POST /probes/enroll ---------------------------------------------------
 
 /// The only sanctioned way to populate/update `embarch-topology`'s
-/// enrollment storage (`design.md` §3 decision 22;
+/// enrollment storage (`decision 22`;
 /// `embarch_topology::hardware::enroll`, formerly this crate's own
 /// `board_gate::enroll`). Takes `hw_lock` like `/flash`/`/reset` — it
 /// attaches to a real chip over the same physical connection those do, and
@@ -656,7 +656,7 @@ async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::har
 /// (`embarch_topology::hardware::set_dev_bench_link_port_serial`) — a second
 /// fact from its JTAG probe's own serial, needed once dev-bench's link and
 /// its JTAG probe are different physical USB devices (a Silabs UART bridge
-/// vs. a SEGGER probe, `embarch-topology/design.md` §3's `port.rs` doc
+/// vs. a SEGGER probe, `embarch-topology`'s `port.rs` doc
 /// comment). No probe-rs attach happens here — it's a plain enrollment-file
 /// write, same class of operation as `/probes/enroll`, so it takes the same
 /// `hw_lock` to avoid racing it rather than because it touches hardware
@@ -712,7 +712,7 @@ async fn set_dev_bench_link_handler(
 
 /// Declares (or re-declares) where a named DUT signal currently goes —
 /// `embarch_topology::hardware::declare_signal`, that crate's
-/// `design.md` §3 decision 18 and its 2026-08-25 amendment.
+/// decision 18 and its 2026-08-25 amendment.
 ///
 /// Same shape and same posture as `POST /dev-bench/link` above, for the same
 /// reasons: it is a plain enrollment-file write rather than a hardware
@@ -754,7 +754,7 @@ async fn declare_signal_handler(
 ///
 /// Added alongside the write because `list_signals` has never had an HTTP
 /// caller at all and `embarch-ui`'s Topology tab needs to list rows
-/// (`embarch-ui/design.md` §3 decision 10).
+/// (`embarch-ui` decision 10, routing half).
 async fn list_signals_handler(
 ) -> Result<Json<Vec<embarch_topology::hardware::SignalLink>>, (StatusCode, String)> {
     tokio::task::spawn_blocking(embarch_topology::hardware::list_signals)
@@ -767,7 +767,7 @@ async fn list_signals_handler(
 /// Un-declares a signal — `embarch_topology::hardware::remove_signal`.
 ///
 /// Added 2026-08-26 with `embarch-ui`'s signal-route rows
-/// (`embarch-ui/design.md` §3 decision 10). Not in that decision's original
+/// (`embarch-ui` decision 10, routing half). Not in that decision's original
 /// endpoint pair, and the reason it has to be here is the decision's own
 /// consequence: **this tab is the only human surface there is**, and
 /// `declare_signal` is idempotent by name, so without a removal the one
@@ -805,7 +805,7 @@ async fn remove_signal_handler(
 /// `embarch_topology::hardware::list_serial_ports`.
 ///
 /// Exists for one caller: declaring a `Route::Direct` signal needs a
-/// `port_serial`, and `embarch-ui/design.md` §3 decision 10 says that pick
+/// `port_serial`, and `embarch-ui` decision 10 (routing half) says that pick
 /// comes from **Core's own enumeration** rather than being typed from memory.
 /// It has to be Core's, not the asking process's: a serial port on the
 /// machine running the UI is not a serial port on the machine running Core,
@@ -863,8 +863,7 @@ async fn dev_bench_port_handler(
 // ---- POST /validate ---------------------------------------------------
 
 /// Explicit, non-destructive live re-check of an already-enrolled board's
-/// identity (`embarch_topology::hardware::validate_role_timed`, design.md §3
-/// decision 28) — the exact same check `flash`/`reset`/the dev-bench
+/// identity (`embarch_topology::hardware::validate_role_timed`, `decision 28`) — the exact same check `flash`/`reset`/the dev-bench
 /// handshake already run mid-attach (decisions 8, 22), callable on its own,
 /// any time, without an actual `flash`/`reset`/`run_study` call to trigger
 /// it. Takes `hw_lock` like `/flash`/`/reset` — it opens the same physical
@@ -968,7 +967,7 @@ async fn validate_handler(
                     .into_response());
             }
             // No board enrolled under this role yet — an ordinary "not
-            // configured" state (design.md §3 decision 7), not a Core
+            // configured" state (`decision 7`), not a Core
             // failure — `404`, matching `/dev-bench/port`'s own "unplugged
             // bench" posture.
             if e.downcast_ref::<embarch_topology::hardware::NotEnrolled>().is_some() {
@@ -984,7 +983,7 @@ async fn validate_handler(
 // ---- GET /alerts --------------------------------------------------------
 
 /// Recent topology-mismatch alerts from `embarch-topology`'s durable log
-/// (`embarch_topology::hardware::recent_alerts`, design.md §3 decision 28) —
+/// (`embarch_topology::hardware::recent_alerts`, `decision 28`) —
 /// what a human (or an agent, after a `409` from `/validate` above) checks
 /// to see the full mismatch history, not just the one that just happened.
 /// Pure read of a local file, no hardware touched — no `hw_lock`, same
@@ -1012,7 +1011,7 @@ async fn alerts_handler(
 
 // ---- GET /logs/recent, GET /logs/stream --------------------------------
 //
-// embarch-ui/design.md §3 decision 7 (the Debug tab): backlog-on-open plus
+// `embarch-ui` decision 7 (the Debug tab): backlog-on-open plus
 // a live tail, both mediated through Core rather than embarch-ui ever
 // reading a logfile directly — Core can run on a different machine than
 // whatever's asking (the whole reason `embarch-topology` exists). Both
@@ -1038,7 +1037,7 @@ struct LogsRecentResponse {
 
 /// Backlog on first open — the tail of Core's current daily log file, pure
 /// local read, no hardware touched. `?tail=<n>` (default 200) is the one
-/// knob; no level/component filtering server-side (design.md §5's open
+/// knob; no level/component filtering server-side (`embarch-core` open.md's open
 /// question, resolved this way: the client can filter/color client-side
 /// from the same plain lines `tracing_subscriber`'s own formatter already
 /// produces — reformatting Core's actual log output into structured JSON
@@ -1151,7 +1150,7 @@ mod tests {
     }
 
     /// Hand-built `multipart/form-data` body — no HTTP client needed, this
-    /// exercises exactly what `/flash` actually parses (`design.md` §9's
+    /// exercises exactly what `/flash` actually parses (`embarch-api` decision 15's
     /// 2026-08-18 finding: `embarch-api` uploads bytes for a `WslHost`/
     /// `Remote` Core rather than sending a path it can't open).
     fn multipart_request(chip: &str, format: Option<&str>, firmware: &[u8]) -> Request {
@@ -1271,8 +1270,8 @@ mod tests {
         assert!(err.1.contains("firmware"));
     }
 
-    // base_address (embarch-dev-bench/design.md's ESP JTAG decision, reversing
-    // that doc's decision 13): only meaningful for format = "bin", but parsed
+    // base_address (`embarch-dev-bench` decision 26, reversing
+    // that repo's decision 13): only meaningful for format = "bin", but parsed
     // the same way regardless of which format accompanies it — parsing is a
     // pure string→u64 concern, independent of hardware.rs's own decision to
     // ignore it for every format but Bin.
@@ -1556,7 +1555,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// The parameterised route (`design.md` §3 decision 30) is actually
+    /// The parameterised route (`decision 30`) is actually
     /// wired to `study::stream_data_handler`, not falling through to axum's
     /// own not-found — which is the difference this asserts, since an
     /// unrouted path with a valid token 404s too, just with an empty body.
