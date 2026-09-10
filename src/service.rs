@@ -251,7 +251,7 @@ fn backup_path(exe: &Path) -> PathBuf {
 /// that — it just started the HTTP server like a plain console program,
 /// which worked fine when a human ran it directly and failed every time SCM
 /// launched it. Caught for real installing Core as an actual boot service on
-/// this machine for the first time (embarch-umbrella/milestone-6.md §3.8).
+/// this machine for the first time (decision 3).
 #[cfg(windows)]
 pub mod windows {
     use std::ffi::OsString;

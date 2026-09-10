@@ -181,7 +181,7 @@ pub fn flash(
         .context("board-identity gate refused this flash")?;
 
     // **Which program writes the image is decided before anything is opened**
-    // (`flash_backend`, design.md §3 decision 48). For a family whose vendor
+    // (`flash_backend`, decision 36). For a family whose vendor
     // semantics probe-rs does not implement, Core does not flash with probe-rs
     // at all — it runs the vendor's own tool, the one the board's `board.cmake`
     // already names, or refuses and says what to install. The identity gate
