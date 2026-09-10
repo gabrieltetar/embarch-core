@@ -1,6 +1,6 @@
 //! Self-elevation for `embarch-core`'s privileged subcommands (`install`,
-//! `uninstall`, `start`, `stop`, `update`) — `design.md` §3 decision 3,
-//! reversing `embarch-umbrella/design.md` §3 decision 7's original "never
+//! `uninstall`, `start`, `stop`, `update`) — `decision 3`,
+//! reversing `embarch-umbrella` decision 7's original "never
 //! self-elevate, print the command" stance.
 //!
 //! Every OS's service-control call needs elevation (root/polkit on Linux,
@@ -53,8 +53,8 @@ fn gui_available() -> bool {
 
 #[cfg(target_os = "macos")]
 fn gui_available() -> bool {
-    // Reasoned, not validated against a real machine — embarch-umbrella's
-    // design.md §10 already flags macOS as reasoned-only for this whole
+    // Reasoned, not validated against a real machine — embarch-umbrella
+    // spec.md already flags macOS as reasoned-only for this whole
     // suite (no Mac to test on). A genuinely headless Mac (rare) would want
     // this to detect no WindowServer session and fall through to `sudo`;
     // not implemented since there's nothing to verify it against yet.

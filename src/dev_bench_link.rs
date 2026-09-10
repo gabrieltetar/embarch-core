@@ -1,7 +1,7 @@
 //! The serial transport `study.rs` runs the `DevBenchMessage` protocol over.
 //!
 //! One `DevBenchLink` is opened per `POST /study` (open-per-study, not a
-//! persistent background connection — `embarch-study-designer/design.md`'s
+//! persistent background connection — `embarch-study-designer` spec.md's
 //! own language, "`Hello`... sent by Core when it opens the serial port,
 //! before any `Study` traffic", and this suite's "don't build machinery
 //! nothing needs yet" posture both point at this being simpler and safer
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The Core↔dev-bench UART link runs at 1 Mbaud
-/// (`embarch-study-designer/design.md` §3 decision 25) — a fact that
+/// (`embarch-study-designer` decision 25) — a fact that
 /// document states about dev-bench firmware's own UART configuration, not a
 /// choice made here.
 pub const DEV_BENCH_BAUD: u32 = 1_000_000;
@@ -104,7 +104,7 @@ pub struct DevBenchLink {
 ///
 /// Three outcomes rather than `Result<Option<_>>`'s two, because **an
 /// undecodable frame is not a dead link and treating it as one cost a real
-/// diagnosis** (`embarch-dev-bench/design.md` §4). A `StepResult` carrying a
+/// diagnosis** (`decision 40`). A `StepResult` carrying a
 /// step's failure reason arrived short of its own declared length; Core
 /// refused it, tore the link down, and reported the study as a *transport*
 /// error that never mentioned a step had failed. The one message whose job
@@ -112,8 +112,7 @@ pub struct DevBenchLink {
 ///
 /// So the posture here is the suite's posture everywhere else — an
 /// undecodable frame costs *the frame*, not the link, which is exactly why an
-/// outpost frame carries its own CRC ([`embarch-outpost/design.md`] §3
-/// decision 5). The frames after it are still worth having: dev-bench's own
+/// outpost frame carries its own CRC (`embarch-outpost` decision 5). The frames after it are still worth having: dev-bench's own
 /// account of what went wrong arrives as ordinary `LogLine`s, and a
 /// `StudyDone` still says whether the run ended on its own terms.
 ///
@@ -276,7 +275,7 @@ impl DevBenchLink {
     /// and bootloader banner on it as plain ASCII at a different baud —
     /// text, no nulls anywhere in it. So the run that finally proved dev-bench
     /// was rebooting mid-frame
-    /// (`embarch-dev-bench/design.md` §4) reported "no message received from
+    /// (`decision 40`) reported "no message received from
     /// dev-bench before the deadline" while holding the bench's own account of
     /// the reset in a private `Vec`. The uptime comparison that cracked it
     /// took another handshake to do what these bytes could have said outright.
@@ -380,7 +379,7 @@ impl DevBenchLink {
         // it reads identically to a field-layout disagreement unless the two
         // numbers are put side by side -- which is how a flat 16-byte
         // truncation was first misread as an encoder omitting trailing
-        // fields (`embarch-dev-bench/design.md` §4).
+        // fields (`decision 40`).
         let claim = match head.first() {
             // COBS: the code byte is 1 + the count of non-zero bytes that
             // follow, so the block it opens should run to that many bytes --
@@ -861,7 +860,7 @@ mod tests {
 
     /// `StepResult` arriving short of what its COBS code byte promised, which
     /// reads identically to a field-layout disagreement until the two numbers
-    /// are put side by side (`embarch-dev-bench/design.md` §4).
+    /// are put side by side (`decision 40`).
     ///
     /// **The shortfall is counted against the block, not the frame.** The
     /// numbers reaching this function include the `0x00` delimiter and the
@@ -1014,8 +1013,7 @@ mod tests {
         });
         // A bench whose build has no `hwinfo` driver — the empty ID has to
         // survive Core's own COBS+postcard round trip too, not just the
-        // crate's (schema v10, `embarch-study-designer/design.md` §3
-        // decision 47).
+        // crate's (schema v10, `embarch-study-designer` decision 47).
         round_trip(&DevBenchMessage::HelloAck {
             schema_version: DEV_BENCH_WIRE_SCHEMA_VERSION,
             compatible: true,
@@ -1027,8 +1025,7 @@ mod tests {
     #[test]
     fn stream_open_chunk_and_close_round_trip() {
         // The generic tap trio that replaced StreamStart/StreamChunk/
-        // StreamEnd at schema v8 (`embarch-study-designer/design.md` §3
-        // decision 39). Records carry arrival-stamped bytes, never decoded
+        // StreamEnd at schema v8 (`embarch-study-designer` decision 39). Records carry arrival-stamped bytes, never decoded
         // values.
         round_trip(&DevBenchMessage::StreamOpen { id: 3 });
 

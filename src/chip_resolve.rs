@@ -1,6 +1,6 @@
-//! Zephyr SoC name → probe-rs chip target string (`design.md` §3 decision 8).
+//! Zephyr SoC name → probe-rs chip target string (`decision 8`).
 //!
-//! `embarch-api`'s Zephyr/west live target discovery (its own `design.md` §3
+//! `embarch-api`'s Zephyr/west live target discovery (its own `embarch-api`
 //! decision 12) knows a project's SoC name (e.g. `nrf54l15`, read straight out
 //! of a board's directory layout) but has no reason to carry its own copy of
 //! the SoC→probe-rs-chip table — Core already links `probe-rs` as a library
@@ -43,8 +43,8 @@ const SOC_TO_CHIP: &[(&str, &str)] = &[
     ("nrf54l15", "nRF54L15"),
     ("nrf54lm20a", "nRF54LM20A"),
     // ESP32-C5: interim substitute dev-bench board while the real nRF54L15DK
-    // is RMA'd (`embarch-dev-bench/design.md`'s ESP JTAG decision, reversing
-    // that doc's decision 13). probe-rs's own target name is lowercase
+    // is RMA'd (`embarch-dev-bench` decision 26, reversing that repo's
+    // decision 13). probe-rs's own target name is lowercase
     // `esp32c5`, unlike the Nordic entries' `nRF*` casing above — this table
     // preserves each target's own real probe-rs spelling rather than
     // normalizing a convention across vendors.
@@ -135,7 +135,7 @@ pub fn resolve(soc: &str) -> Result<String, UnmappedSoc> {
 }
 
 /// Every probe-rs target name, optionally narrowed by a **case-insensitive
-/// substring** filter — design.md §3 decision 34's `chip-list [filter]`.
+/// substring** filter — `decision 34`'s `chip-list [filter]`.
 ///
 /// Pure enumeration: no probe is opened, no hardware is touched, nothing is
 /// attached to. Same posture as `detect-dev-bench`, so an unprivileged human

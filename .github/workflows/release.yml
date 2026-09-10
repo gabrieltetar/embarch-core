@@ -1,6 +1,6 @@
 # Release CI for embarch-core (embarch-umbrella/milestone-6.md §3.7).
 #
-# Builds the four targets embarch-umbrella/design.md §3 decision 14 names —
+# Builds the four targets embarch-umbrella decision 14 names —
 # native on their own runner where GitHub provides one, `cross` only for
 # aarch64-unknown-linux-gnu, where none does — and attaches each as a release
 # asset. This is embarch-core's *own* release, one component's binary; the
@@ -85,7 +85,7 @@ jobs:
     # Cargo.toml depends on both embarch-study-designer and embarch-topology
     # as sibling path dependencies (embarch-doc/DOC-PROTOCOL.md §2's layout:
     # every sub-project sits as a sibling of embarch-doc, not a Cargo
-    # workspace — embarch-topology/design.md §5's cross-repo-dependency
+    # workspace — embarch-topology decision 13's cross-repo-dependency
     # question, resolved this way rather than inventing a registry/vendoring
     # step). `../embarch-study-designer`/`../embarch-topology` only resolve
     # if this repo's own checkout *also* sits in a same-named sibling
@@ -159,7 +159,7 @@ jobs:
 
       # windows-latest already ships the VS Build Tools "Desktop development
       # with C++" workload this crate's MSVC link needs
-      # (embarch-core/design.md §7) — nothing extra to install there.
+      # (embarch-core spec.md §3) — nothing extra to install there.
 
       - name: Package
         id: package

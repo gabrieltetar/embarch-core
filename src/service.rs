@@ -103,7 +103,7 @@ fn set_windows_service_environment(service_name: &str, token: &str) -> Result<()
 /// Exists so `embarch-umbrella`'s `up` doesn't have to re-derive per-OS
 /// service control (`sc` vs `systemctl` vs `launchctl`) in a second codebase
 /// — the `service-manager` crate already encapsulates exactly that, and this
-/// is the binary that already depends on it (embarch-umbrella/design.md §3
+/// is the binary that already depends on it (`embarch-umbrella`
 /// decisions 4/7).
 ///
 /// Not idempotent in any guaranteed way: starting an already-running service
@@ -148,7 +148,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 /// Replace the installed service's binary with `new_exe` and restart it —
-/// the motivating case for self-elevation (`design.md` §3 decision 3):
+/// the motivating case for self-elevation (`decision 3`):
 /// updating an already-installed Core previously had no supported path at
 /// all, only manual stop/copy/start surgery in a hand-opened elevated
 /// shell.

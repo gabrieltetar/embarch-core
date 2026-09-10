@@ -25,7 +25,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 /// instead of two places that could disagree.
 pub(crate) const DEFAULT_PORT: u16 = 4884;
 
-/// Loopback-only (design.md §3 decision 6's amendment, 2026-08-15): reachable
+/// Loopback-only (`decision 6`'s amendment, 2026-08-15): reachable
 /// only from processes on this same machine unless something explicitly
 /// widens it. Shared between `Run`'s and `Install`'s own `--bind` flags so
 /// they can't drift apart.
@@ -49,7 +49,7 @@ enum Command {
     /// launched this process as a service in the first place (a human at a
     /// console, same as everywhere else) — see `service::windows`.
     Run {
-        /// Bind address. Loopback-only by default (design.md §3 decision 6's
+        /// Bind address. Loopback-only by default (`decision 6`'s
         /// amendment) — reachable only from this same machine unless widened
         /// explicitly. `embarch-umbrella setup` passes an explicit `--bind`
         /// to `install` for the one topology (WSL2⟷Windows, or a genuinely
@@ -67,7 +67,7 @@ enum Command {
         /// having to re-run this), not just this one invocation. Same
         /// loopback-only default as `run`; `embarch-umbrella setup` passes
         /// `recommended_bind_address(TopologyClass)`'s answer explicitly for
-        /// wsl-host/remote (design.md §3 decision 6's amendment).
+        /// wsl-host/remote (`decision 6`'s amendment).
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
     },
@@ -94,7 +94,7 @@ enum Command {
     /// check the bench is visible without an HTTP client or a running service.
     DetectDevBench,
     /// List probe-rs target names, optionally narrowed by a case-insensitive
-    /// substring — design.md §3 decision 34. Pure enumeration: no probe is
+    /// substring — `decision 34`. Pure enumeration: no probe is
     /// opened and no board need be attached, same posture as
     /// `detect-dev-bench`. This is where the target name for a **new
     /// `SOC_TO_CHIP` entry** comes from when a SoC isn't in the built-in
@@ -109,7 +109,7 @@ enum Command {
         filter: Option<String>,
     },
     /// Report which program Core would use to flash a given chip, and where
-    /// it found it — design.md §3 decision 36. Pure lookup: no probe is
+    /// it found it — `decision 36`. Pure lookup: no probe is
     /// opened, nothing is flashed and no board need be attached, same posture
     /// as `detect-dev-bench` and `chip-list`.
     ///
@@ -155,8 +155,8 @@ enum Command {
 ///
 /// The explicit 64 MiB `thread_stack_size` (applied to worker *and*
 /// `spawn_blocking` threads alike — Tokio's `Builder` doesn't distinguish)
-/// is a real fix, not a defensive default: `embarch-study-designer/design.md`
-/// §7 tracked a `Study`/`StepResult` stack-overflow risk from large
+/// is a real fix, not a defensive default: `embarch-study-designer`
+/// decision 63 tracked a `Study`/`StepResult` stack-overflow risk from large
 /// fixed-capacity `heapless` types, previously reproduced only in debug
 /// builds and "confirmed release-build-safe" as of that doc's 2026-08-19/20
 /// finding. That confirmation didn't hold: the first real `run_study` POST
@@ -166,7 +166,7 @@ enum Command {
 /// `STATUS_STACK_OVERFLOW` (0xc00000fd) — a first real release-build
 /// occurrence, on `run_study`'s `spawn_blocking(run_study_to_completion)`
 /// specifically (`study.rs`), not on a debug build's default `tokio-rt-worker`
-/// stack as `design.md` §7 had only ever seen before. Matches the size
+/// stack as `embarch-study-designer` decision 63 had only ever seen before. Matches the size
 /// already known to clear it in tests (`RUST_MIN_STACK=67108864`) rather than
 /// picking a new number — made an explicit runtime setting here instead of
 /// an ambient env var, since a Windows service's environment isn't something
@@ -293,7 +293,7 @@ fn main() -> anyhow::Result<()> {
 /// Sets up `tracing` to write to both stderr (unchanged from before this
 /// decision) and a daily-rolling file under
 /// `token_store::local_data_dir()?.join("logs")` — `%ProgramData%\embarch\logs`
-/// / `/var/lib/embarch/logs` (§3 decision 16, `embarch-core/design.md`),
+/// / `/var/lib/embarch/logs` (`decision 16`),
 /// retaining the last 7 daily files. Runs once, unconditionally, at the very
 /// top of `main`, before `Cli::parse()` or dispatch on the subcommand — so
 /// both entry paths that share `build_runtime()` (a plain foreground `Run`,
@@ -371,8 +371,8 @@ where
 /// matching file once an 8th day's worth exist, keeping the most recent 7 —
 /// this same file is what `GET /logs/recent`/`GET /logs/stream` (`api.rs`)
 /// and `logs::read_recent`/`logs::FollowState` read, not a second,
-/// size-capped mechanism (`embarch-ui/design.md` §3 decision 7, corrected in
-/// place once this crate's own design.md noted the daily-rolling file
+/// size-capped mechanism (`embarch-ui` decision 7, corrected in
+/// place once this crate's own decisions noted the daily-rolling file
 /// already existed).
 fn build_log_file_writer() -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
     let log_dir = token_store::local_data_dir()?.join("logs");

@@ -1,6 +1,6 @@
 //! `study_results/<study_id>/streams/` — one file per declared stream tap.
 //!
-//! `embarch-core/design.md` §3 decision 30(b) is what this implements:
+//! `decision 30(b)` is what this implements:
 //! `streams/` replaces `data.csv`/`waveform.csv`/`gatt.csv` as *paths* while
 //! keeping every one of their row shapes, and **a tap always writes its raw
 //! bytes before any decode is attempted** — a decode that fails must not cost
@@ -9,7 +9,7 @@
 //!
 //! Nothing here decides what a payload *means*. The tap's declared
 //! [`StreamEncoding`] does, always, and it is the only thing that does
-//! (`embarch-study-designer/design.md` §3 decision 35) — there is deliberately
+//! (`embarch-study-designer` decision 35) — there is deliberately
 //! no sniff, no heuristic, and no "looks like text" fallback anywhere in this
 //! module. [`StreamEncoding::Raw`] is the honest default for a payload nobody
 //! declared, and it renders nothing.
@@ -57,10 +57,10 @@ pub const DEFAULT_STUDY_RESULTS_KEEP: usize = 50;
 /// **Settled here because nothing else declares it.**
 /// `embarch_topology::hardware::SignalLink` records *where* a signal goes,
 /// not how fast it talks, and a `Study`'s tap names the signal rather than
-/// the carrier on purpose (`embarch-study-designer/design.md` §3 decision
+/// the carrier on purpose (`embarch-study-designer` decision
 /// 39) — so the rate had to land somewhere, and it lands as an operator
 /// knob with dev-bench's own link rate as the default.
-/// `embarch-outpost/design.md` §5.2's worked example configures its UART at
+/// `embarch-outpost` spec.md's worked example configures its UART at
 /// exactly this rate.
 pub const DEFAULT_SIGNAL_BAUD: u32 = 1_000_000;
 
@@ -172,7 +172,7 @@ pub struct StreamIndexEntry {
     pub rendered_file: Option<String>,
     /// `frame_index,rx_utc_ms,frame_bytes` — **Core's own receipt time for
     /// every frame of an `OutpostTrace` capture**, and the trace's only clock
-    /// (`embarch-outpost/design.md` §3 decisions 17 and 18). `None` for every
+    /// (`embarch-outpost` decisions 17 and 18). `None` for every
     /// other encoding: a sample and a transcript entry carry
     /// `core_rx_utc_ms` in their own rendered rows, so only the encoding
     /// whose rendering happens post-hoc needs the stamps kept beside the
@@ -203,11 +203,11 @@ pub struct StreamIndexEntry {
     /// Split out from `note` when a trace gained a *second* way of being
     /// incomplete: it can be named and untimed, timed and unnamed, or neither,
     /// and a caller that inferred "named" from "no note" would call an untimed
-    /// trace unnamed (`embarch-outpost/design.md` §3 decision 18).
+    /// trace unnamed (`embarch-outpost` decision 18).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named: Option<bool>,
     /// Whether this trace's frames carry Core's receipt time — the trace's
-    /// only clock (`embarch-outpost/design.md` §3 decision 17). `false` is an
+    /// only clock (`embarch-outpost` decision 17). `false` is an
     /// ordered, untimed trace: a real answer, and one a caller must draw
     /// differently rather than against an axis of milliseconds it does not
     /// have.
@@ -216,7 +216,7 @@ pub struct StreamIndexEntry {
     /// Whether the firmware kept **itself** out of this trace —
     /// `CONFIG_EMBARCH_OUTPOST_TRACE_SELF=n`, which is the default, read off
     /// the header frame's own flags byte
-    /// (`embarch-outpost/design.md` §3 decision 19).
+    /// (`embarch-outpost` decision 19).
     ///
     /// The third way a trace can be incomplete, and the only one the *firmware*
     /// decides rather than the host: no record describes the outpost's own
@@ -444,7 +444,7 @@ struct TapFiles {
 /// raw bytes.
 ///
 /// **This is the trace's clock.** An outpost record carries no timestamp at
-/// all (`embarch-outpost/design.md` §3 decision 4), so the only time a trace
+/// all (`embarch-outpost` decision 4), so the only time a trace
 /// has is when Core received it — and the rendering happens *post-hoc*, from
 /// the complete raw file, long after the read that saw the bytes. Something
 /// has to carry the stamps across that gap, and this is it (decision 18).
@@ -746,7 +746,7 @@ fn rendered_header(encoding: &StreamEncoding, decoders: &[StructLayout]) -> Opti
             Some(format!("{},core_rx_utc_ms", GattTranscriptEntry::csv_header()))
         }
         // The decoded columns come from the engineer's own declared layout
-        // (`embarch-study-designer/design.md` §3 decision 52) — Core supplies
+        // (`embarch-study-designer` decision 52) — Core supplies
         // the fixed columns around them and nothing else, exactly as it does
         // for the two above.
         //
