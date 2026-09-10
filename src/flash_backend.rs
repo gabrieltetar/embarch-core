@@ -1,5 +1,5 @@
 //! Which program actually writes an image to a target, and how Core decides
-//! (design.md §3 decision 48).
+//! (decision 36).
 //!
 //! # Why this module exists
 //!
