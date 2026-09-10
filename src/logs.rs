@@ -4,7 +4,7 @@
 //! established shape (`embarch-topology/design.md` decisions 2/8/14) rather
 //! than the CLI and HTTP paths growing separate copies of "find the current
 //! log file." Moved out of `main.rs` unchanged (`embarch-ui/design.md` §3
-//! decision 7, embarch-ui milestone 1) when the HTTP surface
+//! decision 7) when the HTTP surface
 //! needed the same logic `main.rs`'s `Logs` subcommand already had.
 //!
 //! Reuses the existing daily-rolling logfile (`main.rs`'s `init_tracing`,
@@ -83,7 +83,7 @@ pub(crate) fn read_recent_with_prefix(prefix: &str, tail: usize) -> Result<Vec<S
 /// own `serial::read_log` already reads a live source (a poll loop, not an
 /// OS-level file-change notification), and the same way `embarch-ui`'s own
 /// Dashboard/Study-Designer tabs already relay a server-side poll over SSE
-/// (embarch-ui milestone 1) — chosen over adding a custom
+/// (`embarch-ui` decision 6) — chosen over adding a custom
 /// `tracing` layer that broadcasts each formatted line live, specifically
 /// to avoid touching `main.rs`'s `init_tracing` (a foundational, already-
 /// deployed piece of a real running service) for a debug-tooling feature.
