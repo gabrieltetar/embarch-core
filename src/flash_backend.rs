@@ -37,14 +37,20 @@
 //!
 //! # Why the tools are not bundled
 //!
-//! None of the three can ship inside Core, and the reason is licensing rather
-//! than effort. SEGGER's J-Link software is proprietary and redistribution
-//! requires an agreement with SEGGER; `nrfjprog` is Nordic-proprietary **and**
-//! links SEGGER's `JLinkARM` library, so it inherits that restriction (Nordic
-//! has also deprecated it in favour of nRF Util); and `nrfutil` is a
-//! bootstrapping launcher that downloads its own command packages at runtime,
-//! so a vendored copy would still need the network and would drift. They are
-//! also per-OS native binaries version-coupled to probe firmware.
+//! Neither can ship inside Core, and the reason is licensing rather than
+//! effort. SEGGER's J-Link software is proprietary and redistribution
+//! requires an agreement with SEGGER; and `nrfutil` is a bootstrapping
+//! launcher that downloads its own command packages at runtime, so a vendored
+//! copy would still need the network and would drift. They are also per-OS
+//! native binaries version-coupled to probe firmware.
+//!
+//! **A third backend, `nrfjprog` (Nordic's legacy nRF Command Line Tools,
+//! deprecated upstream in favour of `nrfutil`), was retired 2026-09-10
+//! (decision 50).** No recorded bench in this suite ever had it configured or
+//! selected — the whole-corpus grep behind that decision found zero doctor
+//! runs, status fragments or log entries naming it — so the keep-reason
+//! ("a bench that already has it working should not be forced to migrate")
+//! never applied to anything that existed.
 //!
 //! Hence [`Backend::discover`]: look for the tool, and if it is absent say
 //! exactly which one and how to install it. Same posture `embarch-api` already
@@ -59,8 +65,7 @@ use anyhow::{bail, Context, Result};
 /// [`Backend::discover`] does not look. Checked before `PATH`.
 pub const JLINK_EXE_ENV: &str = "EMBARCH_JLINK_EXE";
 pub const NRFUTIL_EXE_ENV: &str = "EMBARCH_NRFUTIL_EXE";
-pub const NRFJPROG_EXE_ENV: &str = "EMBARCH_NRFJPROG_EXE";
-/// Forces a backend by name (`probe-rs`, `jlink`, `nrfutil`, `nrfjprog`),
+/// Forces a backend by name (`probe-rs`, `jlink`, `nrfutil`),
 /// including forcing `probe-rs` back on for a family this module refuses it
 /// for. An escape hatch for a bench this table is wrong about — it exists so
 /// being wrong here costs a config line rather than a Core release.
@@ -76,10 +81,6 @@ pub enum Backend {
     JLink { exe: PathBuf },
     /// Nordic's nRF Util (`nrfutil device program`).
     NrfUtil { exe: PathBuf },
-    /// Nordic's legacy nRF Command Line Tools. Deprecated upstream; supported
-    /// because a bench that already has it working should not be forced to
-    /// migrate to close this bug.
-    NrfJprog { exe: PathBuf },
 }
 
 impl Backend {
@@ -88,7 +89,6 @@ impl Backend {
             Backend::ProbeRs => "probe-rs",
             Backend::JLink { .. } => "jlink",
             Backend::NrfUtil { .. } => "nrfutil",
-            Backend::NrfJprog { .. } => "nrfjprog",
         }
     }
 }
@@ -152,7 +152,7 @@ fn preferred_for(chip: &str) -> &'static [&'static str] {
         // includes first, and so what `west flash` would pick. `jlink` second
         // because it is a vendor loader keyed off `--device`, and on a Nordic
         // bench it is usually already installed.
-        &["nrfutil", "jlink", "nrfjprog"]
+        &["nrfutil", "jlink"]
     } else {
         &[]
     }
@@ -187,13 +187,6 @@ fn extra_candidates(tool: &str) -> Vec<PathBuf> {
             out.push(PathBuf::from("C:/Program Files/Nordic Semiconductor/nrf-util/nrfutil.exe"));
             out.push(PathBuf::from("/usr/bin/nrfutil"));
             out.push(PathBuf::from("/usr/local/bin/nrfutil"));
-        }
-        "nrfjprog" => {
-            out.push(PathBuf::from(
-                "C:/Program Files/Nordic Semiconductor/nrf-command-line-tools/bin/nrfjprog.exe",
-            ));
-            out.push(PathBuf::from("/usr/local/bin/nrfjprog"));
-            out.push(PathBuf::from("/usr/bin/nrfjprog"));
         }
         _ => {}
     }
@@ -240,7 +233,6 @@ fn env_override(tool: &str) -> Option<PathBuf> {
     let key = match tool {
         "jlink" => JLINK_EXE_ENV,
         "nrfutil" => NRFUTIL_EXE_ENV,
-        "nrfjprog" => NRFJPROG_EXE_ENV,
         _ => return None,
     };
     std::env::var_os(key).map(PathBuf::from).filter(|p| usable_here(p))
@@ -252,7 +244,6 @@ fn on_path(tool: &str) -> Option<PathBuf> {
     let exe_names: &[&str] = match tool {
         "jlink" => &["JLinkExe", "JLink.exe", "JLink"],
         "nrfutil" => &["nrfutil", "nrfutil.exe"],
-        "nrfjprog" => &["nrfjprog", "nrfjprog.exe"],
         _ => return None,
     };
     let path = std::env::var_os("PATH")?;
@@ -277,7 +268,6 @@ fn build(tool: &str, exe: PathBuf) -> Option<Backend> {
     match tool {
         "jlink" => Some(Backend::JLink { exe }),
         "nrfutil" => Some(Backend::NrfUtil { exe }),
-        "nrfjprog" => Some(Backend::NrfJprog { exe }),
         "probe-rs" => Some(Backend::ProbeRs),
         _ => None,
     }
@@ -285,7 +275,7 @@ fn build(tool: &str, exe: PathBuf) -> Option<Backend> {
 
 /// The names [`FLASH_BACKEND_ENV`] accepts — every [`Backend::name`] value
 /// plus `"probe-rs"` itself (handled before any tool lookup, below).
-const KNOWN_BACKEND_NAMES: [&str; 4] = ["probe-rs", "jlink", "nrfutil", "nrfjprog"];
+const KNOWN_BACKEND_NAMES: [&str; 3] = ["probe-rs", "jlink", "nrfutil"];
 
 /// Picks the backend for `chip`, or explains what to install.
 ///
@@ -347,15 +337,13 @@ pub fn discover(chip: &str) -> Result<Backend> {
          Why the refusal: {}\n\n\
          Install ONE of these, on the embarch-core machine (not the build machine):\n  \
          - nRF Util  — {}\n  \
-         - SEGGER J-Link — {}\n  \
-         - nrfjprog (deprecated) — {}\n\n\
+         - SEGGER J-Link — {}\n\n\
          Already installed somewhere unusual? Point Core at it with {JLINK_EXE_ENV} / \
-         {NRFUTIL_EXE_ENV} / {NRFJPROG_EXE_ENV}. To override the choice entirely, set \
+         {NRFUTIL_EXE_ENV}. To override the choice entirely, set \
          {FLASH_BACKEND_ENV}.",
         vendor_tool_refusal_reason(chip),
         install_hint("nrfutil"),
         install_hint("jlink"),
-        install_hint("nrfjprog"),
     )
 }
 
@@ -363,7 +351,6 @@ fn install_hint(tool: &str) -> String {
     match tool {
         "jlink" => "https://www.segger.com/downloads/jlink/ (J-Link Software and Documentation Pack)".into(),
         "nrfutil" => "https://www.nordicsemi.com/Products/Development-tools/nRF-Util, then `nrfutil install device`".into(),
-        "nrfjprog" => "part of nRF Command Line Tools, https://www.nordicsemi.com/Products/Development-tools/nrf-command-line-tools".into(),
         other => format!("unknown tool '{other}'"),
     }
 }
@@ -409,15 +396,6 @@ pub fn run(
             });
             if let Some(sn) = probe_serial {
                 c.arg("--serial-number").arg(sn);
-            }
-            c
-        }
-        Backend::NrfJprog { exe } => {
-            let mut c = Command::new(exe);
-            c.arg("--program").arg(firmware_path);
-            c.arg(if erase { "--sectorerase" } else { "--sectoranduicrerase" });
-            if let Some(sn) = probe_serial {
-                c.arg("--snr").arg(sn);
             }
             c
         }
@@ -757,7 +735,6 @@ mod tests {
         assert!(err.contains("probe-rs"), "{err}");
         assert!(err.contains("jlink"), "{err}");
         assert!(err.contains("nrfutil"), "{err}");
-        assert!(err.contains("nrfjprog"), "{err}");
         // And not the "no such tool was found" install-hint message, which
         // implies openocd was a recognised backend that just was not on disk.
         assert!(!err.contains("no such tool was found"), "{err}");
@@ -768,7 +745,7 @@ mod tests {
         let _guard = ForcedBackendGuard::set("");
         let err = discover("nRF54L15").unwrap_err().to_string();
         assert!(err.contains("is not a known backend"), "{err}");
-        assert!(err.contains("probe-rs") && err.contains("nrfjprog"), "{err}");
+        assert!(err.contains("probe-rs") && err.contains("nrfutil"), "{err}");
     }
 
     #[test]
@@ -784,14 +761,14 @@ mod tests {
     /// this path's behaviour.
     #[test]
     fn forced_known_but_missing_backend_keeps_its_install_hint() {
-        let _guard = ForcedBackendGuard::set("nrfjprog");
-        if locate("nrfjprog").is_some() {
+        let _guard = ForcedBackendGuard::set("jlink");
+        if locate("jlink").is_some() {
             // Guard against a developer machine that happens to have it.
             return;
         }
         let err = discover("nRF54L15").unwrap_err().to_string();
         assert!(err.contains("no such tool was found"), "{err}");
-        assert!(err.contains("nRF Command Line Tools"), "{err}");
+        assert!(err.contains("segger.com"), "{err}");
         assert!(!err.contains("is not a known backend"), "{err}");
     }
 
