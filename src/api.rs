@@ -27,6 +27,14 @@ use crate::{chip_resolve, hardware, logs, serial, study};
 pub struct AppState {
     pub token: String,
     pub hw_lock: Arc<Mutex<()>>,
+    /// The route currently holding `hw_lock`, or `None` when it's free.
+    /// Kept in a plain `std::sync::Mutex` rather than folded into `hw_lock`
+    /// itself (e.g. `Arc<Mutex<Option<String>>>`) because a contending
+    /// caller must be able to read *who* holds the lock while that same
+    /// lock is held — reading it out of the guarded value would need the
+    /// guard. `acquire_hw_lock` below is the only way this is set or
+    /// cleared (decision 14, `tasks/core/013`).
+    pub hw_holder: Arc<StdMutex<Option<String>>>,
     pub study_lock: study::StudyLock,
     pub study_jobs: study::JobRegistry,
     /// Live push for `GET /study/{study_id}/events` (SSE) — every
@@ -51,9 +59,68 @@ impl AppState {
             token,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             hw_lock: Arc::new(Mutex::new(())),
+            hw_holder: Arc::new(StdMutex::new(None)),
             study_lock: Arc::new(StdMutex::new(None)),
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
             study_events,
+        }
+    }
+}
+
+/// How long a caller waits for a contended `hw_lock` before being refused
+/// with `503` naming the holder, rather than queueing silently and
+/// indefinitely (decision 14, `tasks/core/013`). Short enough that the
+/// common case — a flash or reset in the low hundreds of ms — only ever
+/// costs a contending caller a brief wait, not this whole timeout.
+const HW_LOCK_WAIT_MS: u64 = 500;
+
+/// A held `hw_lock`, tagged with the route that took it. Clears
+/// [`AppState::hw_holder`] on drop so the next contender (or the next
+/// `acquire_hw_lock` call) sees the lock as free again — this is the only
+/// place that happens, so a holder string can never outlive the guard that
+/// set it.
+#[derive(Debug)]
+pub(crate) struct HwGuard {
+    _permit: tokio::sync::OwnedMutexGuard<()>,
+    holder: Arc<StdMutex<Option<String>>>,
+}
+
+impl Drop for HwGuard {
+    fn drop(&mut self) {
+        *self.holder.lock().unwrap() = None;
+    }
+}
+
+/// Takes `hw_lock` for `route`, waiting up to [`HW_LOCK_WAIT_MS`] for a
+/// concurrent holder to release it. Past that, refuses with `503` naming
+/// the holder instead of the old behaviour — an unbounded silent wait on
+/// the mutex, indistinguishable from Core being unresponsive, which is
+/// exactly what decision 14 says a `503` exists to avoid (`tasks/core/013`).
+///
+/// Logs on both paths, at different levels, so a wait and a refusal are
+/// distinguishable in `core.log` after the fact rather than both looking
+/// like "the handler took a while."
+pub(crate) async fn acquire_hw_lock(state: &AppState, route: &'static str) -> Result<HwGuard, (StatusCode, String)> {
+    let lock = state.hw_lock.clone();
+    match tokio::time::timeout(std::time::Duration::from_millis(HW_LOCK_WAIT_MS), lock.lock_owned()).await {
+        Ok(permit) => {
+            *state.hw_holder.lock().unwrap() = Some(route.to_string());
+            tracing::info!("{route} took hw_lock");
+            Ok(HwGuard {
+                _permit: permit,
+                holder: state.hw_holder.clone(),
+            })
+        }
+        Err(_) => {
+            let holder = state
+                .hw_holder
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let msg = format!("hw_lock held by {holder}; {route} refused after waiting {HW_LOCK_WAIT_MS}ms");
+            tracing::warn!("{msg}");
+            Err((StatusCode::SERVICE_UNAVAILABLE, msg))
         }
     }
 }
@@ -313,7 +380,7 @@ async fn flash_handler(
         }
     };
 
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /flash").await?;
 
     let chip_for_response = args.chip.clone();
     let FlashArgs {
@@ -466,7 +533,7 @@ async fn reset_handler(
     State(state): State<AppState>,
     Json(req): Json<ResetRequest>,
 ) -> Result<Json<ResetResponse>, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /reset").await?;
     let chip = req.chip;
     let probe_serial = req.probe_serial;
 
@@ -522,7 +589,7 @@ async fn serial_log_handler(
         ));
     }
 
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "GET /serial-log").await?;
 
     let port = q.port.clone();
     let baud = q.baud;
@@ -609,7 +676,7 @@ async fn enroll_probe_handler(
     State(state): State<AppState>,
     Json(req): Json<EnrollProbeRequest>,
 ) -> Result<Json<EnrollProbeResponse>, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /probes/enroll").await?;
 
     let role = req.role;
     let chip = req.chip;
@@ -678,7 +745,7 @@ async fn set_dev_bench_link_handler(
     State(state): State<AppState>,
     Json(req): Json<SetDevBenchLinkRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /dev-bench/link").await?;
     let SetDevBenchLinkRequest { serial, interface } = req;
 
     if serial.is_none() && interface.is_none() {
@@ -730,7 +797,7 @@ async fn declare_signal_handler(
     State(state): State<AppState>,
     Json(link): Json<embarch_topology::hardware::SignalLink>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /signals").await?;
 
     tokio::task::spawn_blocking(move || embarch_topology::hardware::declare_signal(link))
         .await
@@ -781,7 +848,7 @@ async fn remove_signal_handler(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "DELETE /signals/{name}").await?;
 
     let removed = tokio::task::spawn_blocking(move || embarch_topology::hardware::remove_signal(&name))
         .await
@@ -912,7 +979,7 @@ async fn validate_handler(
     State(state): State<AppState>,
     Json(req): Json<ValidateRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    let _guard = state.hw_lock.lock().await;
+    let _guard = acquire_hw_lock(&state, "POST /validate").await?;
     let role = req.role;
 
     let result = tokio::task::spawn_blocking(move || embarch_topology::hardware::validate_role_timed(&role))
@@ -1096,6 +1163,61 @@ mod tests {
         // Not the cap's own message — it got past validation and failed
         // opening the port instead.
         assert_ne!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- decision 14: `503` naming the holder on `hw_lock` contention ------
+
+    /// Real contention, not a mocked one: one task holds `hw_lock` (via
+    /// `acquire_hw_lock` itself, the same path every handler uses) for
+    /// longer than `HW_LOCK_WAIT_MS`, and a second call observes a `503`
+    /// naming the first call's route as the holder. This is the test
+    /// `tasks/core/013` calls for — decision 14 built, not merely typed.
+    #[tokio::test]
+    async fn a_second_caller_is_refused_503_naming_the_holder_under_real_contention() {
+        let state = AppState::new("t".to_string());
+
+        let holder_guard = acquire_hw_lock(&state, "POST /flash").await.expect("first caller must succeed uncontended");
+
+        let contender_state = state.clone();
+        let contender = tokio::spawn(async move { acquire_hw_lock(&contender_state, "POST /reset").await });
+
+        // Hold past the contender's whole wait window before releasing —
+        // this is what makes the contention real rather than a race that
+        // might resolve either way.
+        tokio::time::sleep(std::time::Duration::from_millis(HW_LOCK_WAIT_MS + 200)).await;
+        drop(holder_guard);
+
+        let err = contender.await.unwrap().expect_err("a held hw_lock must refuse, not queue silently");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.1.contains("POST /flash"),
+            "503 body must name the actual holder, not just say 'busy': {}",
+            err.1
+        );
+    }
+
+    /// The mirror case: once the holder releases, a fresh caller succeeds
+    /// uncontended rather than being wedged by stale holder state left over
+    /// from a previous guard — `HwGuard::drop` is what clears it.
+    #[tokio::test]
+    async fn hw_lock_is_free_again_once_the_holder_drops() {
+        let state = AppState::new("t".to_string());
+
+        let first = acquire_hw_lock(&state, "POST /flash").await.unwrap();
+        drop(first);
+
+        let second = acquire_hw_lock(&state, "POST /reset").await;
+        assert!(second.is_ok(), "hw_lock must be free once the prior guard dropped");
+    }
+
+    /// Uncontended acquisitions never wait `HW_LOCK_WAIT_MS` — the common
+    /// case this design is meant to stay cheap for.
+    #[tokio::test]
+    async fn an_uncontended_acquire_does_not_pay_the_wait_timeout() {
+        let state = AppState::new("t".to_string());
+        let started = std::time::Instant::now();
+        let _guard = acquire_hw_lock(&state, "POST /flash").await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(HW_LOCK_WAIT_MS));
     }
 
     /// Hand-built `multipart/form-data` body — no HTTP client needed, this
