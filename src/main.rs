@@ -240,8 +240,7 @@ fn main() -> anyhow::Result<()> {
                         let where_ = match &backend {
                             flash_backend::Backend::ProbeRs => "built in".to_string(),
                             flash_backend::Backend::JLink { exe }
-                            | flash_backend::Backend::NrfUtil { exe }
-                            | flash_backend::Backend::NrfJprog { exe } => exe.display().to_string(),
+                            | flash_backend::Backend::NrfUtil { exe } => exe.display().to_string(),
                         };
                         println!("{c}\t{}\t{where_}", backend.name());
                     }
