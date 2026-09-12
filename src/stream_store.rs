@@ -442,7 +442,8 @@ struct TapFiles {
 /// all (`embarch-outpost` decision 4), so the only time a trace
 /// has is when Core received it — and the rendering happens *post-hoc*, from
 /// the complete raw file, long after the read that saw the bytes. Something
-/// has to carry the stamps across that gap, and this is it (decision 18).
+/// has to carry the stamps across that gap, and this is it
+/// (`embarch-outpost` decision 18).
 ///
 /// **What a row is keyed by.** `frame_index` counts non-empty runs between
 /// `0x00` delimiters from the start of the capture — exactly what

@@ -87,7 +87,7 @@ enum Elevated {
 ///
 /// If elevation genuinely can't be triggered — no GUI, no TTY — prints the
 /// exact command to run in an elevated shell instead and exits nonzero,
-/// falling back to decision 7's original behavior for exactly the case it
+/// falling back to decision 3's original behavior for exactly the case it
 /// still applies to: nobody there to answer a prompt.
 pub fn ensure_elevated_or_fallback() -> Result<()> {
     if is_elevated() {

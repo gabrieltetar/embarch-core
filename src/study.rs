@@ -265,7 +265,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
 
     // The two indices `validate_protocol` structurally cannot see, because
     // they live on a `Step` rather than inside a manifest. Both reach a C array
-    // subscript on dev-bench, and §3 decision 18's rule is that Core names the
+    // subscript on dev-bench, and §3 decision 39's rule is that Core names the
     // specific failure rather than letting a raw index fail.
     for (i, step) in study.steps.iter().enumerate() {
         let Action::RunProtocol { protocol, entry_state } = step.action else {
@@ -1515,7 +1515,7 @@ fn run_study_to_completion(
                 //
                 // Still `warn!` for a truncated transcript specifically: a
                 // capture silently claiming to be exhaustive when it isn't
-                // is exactly what decision 36 exists to prevent.
+                // is exactly what decision 40 exists to prevent.
                 //
                 // **Amended by §3 decision 37.** The reasoning above was
                 // written when every `LogLine` was a deliberate diagnostic,
@@ -2304,8 +2304,9 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         StreamEncoding::GattTranscript => {
             // The record's bytes are one postcard-encoded
             // `GattTranscriptEntry`. `step_index` is whichever step is open
-            // when it arrives, which is what decision 36 defined that column
-            // to mean; the generic record carries no step of its own.
+            // when it arrives, which is what `embarch-study-designer`
+            // decision 14 defined that column to mean; the generic record
+            // carries no step of its own.
             match postcard::from_bytes::<GattTranscriptEntry>(&record.bytes) {
                 Ok(entry) => {
                     write_transcript_entry(capture, tap.id, open_step_index, &entry);
@@ -2863,7 +2864,7 @@ pub struct StreamIndexEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Whether a manifest named this trace (`embarch-outpost` decision 9), and whether its frames carry Core's receipt time
-    /// (decisions 17, 18). Two independent facts, reported as two, because a
+    /// (`embarch-outpost` decisions 17, 18). Two independent facts, reported as two, because a
     /// trace can be either without the other and a caller that read them off
     /// `note`'s text would be re-deriving a judgement Core already made.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3461,7 +3462,7 @@ mod tests {
         assert_eq!(raw.len(), 6);
     }
 
-    // ---- write_transcript_entry (decision 36) ----
+    // ---- write_transcript_entry (`embarch-study-designer` decision 14) ----
 
     fn transcript_entry(payload: &[u8]) -> GattTranscriptEntry {
         use embarch_study_designer::{GattDirection, GattEventKind, Uuid};
@@ -3568,8 +3569,8 @@ mod tests {
     /// Hand-built from the `eap` types rather than parsed from an `.eap`
     /// file, because parsing is behind the `eap-parse` feature and Core
     /// deliberately does not carry it — Core receives a manifest already
-    /// resolved into the `Study`, which is the whole point of §3 decision
-    /// 58's build-time resolution.
+    /// resolved into the `Study`, which is the whole point of
+    /// `embarch-study-designer` decision 58's build-time resolution.
     fn protocol_def() -> embarch_study_designer::ProtocolDef {
         use embarch_study_designer::{
             ActiveState, EventArm, FrameDef, ProtocolDef, ProtocolSource, StateDef, StateKind,

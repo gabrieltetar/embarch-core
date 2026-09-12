@@ -913,7 +913,7 @@ async fn remove_signal_handler(
 /// It has to be Core's, not the asking process's: a serial port on the
 /// machine running the UI is not a serial port on the machine running Core,
 /// which is the entire reason `embarch-ui` links no hardware crate
-/// (decision 5).
+/// (`embarch-ui` decision 5).
 ///
 /// **Not `/dev-bench/port` with the filter off.** That endpoint answers
 /// "which port is dev-bench's link" and applies the VID gate to do it; a
@@ -1161,8 +1161,9 @@ async fn alerts_handler(
 // it too) rather than a second, size-capped mechanism this decision
 // originally proposed before noticing one already existed.
 //
-// `GET /logs/stream`, the live-tail counterpart decision 7 also built, was
-// retired (`tasks/core/021`): decision 13 in that same file structurally
+// `GET /logs/stream`, the live-tail counterpart `embarch-ui` decision 7 also
+// built, was retired (`tasks/core/021`): `embarch-ui` decision 13 in that
+// same file structurally
 // excludes an SSE source by sharing one poll/diff loop across both log
 // sources, nothing replaced it, and no caller anywhere ever used it. This
 // route's own `logs::FollowState` poll-follow machinery went with it;
@@ -1485,7 +1486,7 @@ mod tests {
     // twelve of the twenty-six registered paths had a test and fourteen —
     // including every `/study*` route, the newest surface — had none. So the
     // list is derived from `build_router`'s own source instead
-    // (`embarch-doc/embarch-core/decisions/platform.md` decision 42).
+    // (`embarch-doc/embarch-core/decisions/auth.md` decision 42).
     // `every_registered_route_has_an_auth_case` fails when a
     // registered path has no row in `AUTH_CASES`, and the two sweeps below
     // drive every row through the real router with no token and with a wrong
@@ -2028,7 +2029,7 @@ mod tests {
         assert_eq!(fix_it_url, None);
     }
 
-    /// A live readback that disagrees with the recorded ID — decision 20's
+    /// A live readback that disagrees with the recorded ID — decision 22's
     /// own case — keeps the `mismatch` kind, the `409`, and `fix_it_url`.
     #[test]
     fn a_wrong_live_id_is_a_mismatch() {
