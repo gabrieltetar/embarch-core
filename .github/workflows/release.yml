@@ -1,4 +1,4 @@
-# Release CI for embarch-core (embarch-umbrella/milestone-6.md §3.7).
+# Release CI for embarch-core.
 #
 # Builds the four targets embarch-umbrella decision 14 names —
 # native on their own runner where GitHub provides one, `cross` only for
@@ -77,8 +77,9 @@ jobs:
             os: ubuntu-latest
             cross: true
           # GitHub's macos-14 runner is natively Apple Silicon, so this is a
-          # native build, not a cross-compile — and unsigned, which the user
-          # guide has to mention (milestone-6.md §3.7, §5 open questions).
+          # native build, not a cross-compile — and unsigned, which
+          # `embarch-umbrella`'s open.md flags as a Gatekeeper problem for
+          # the user guide, not for this CI.
           - target: aarch64-apple-darwin
             os: macos-14
     runs-on: ${{ matrix.os }}

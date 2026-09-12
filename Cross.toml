@@ -1,6 +1,6 @@
 # Only `aarch64-unknown-linux-gnu` needs `cross` (a Docker-based build) at
 # all — the other three release targets are native builds on their own OS's
-# GitHub-hosted runner (milestone-6.md §3.7). This is the one target where
+# GitHub-hosted runner (`embarch-umbrella` decision 14). This is the one target where
 # neither is true: no free aarch64-linux GitHub runner exists, so it has to
 # be cross-compiled from the x86_64 Linux runner that builds
 # aarch64-unknown-linux-gnu, and it's the only target where that
