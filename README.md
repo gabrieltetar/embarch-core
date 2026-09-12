@@ -92,6 +92,22 @@ there's no per-caller identity, only "does the caller know the token."
 
 ## Building
 
+**This repo does not build on its own.** Two sibling repos must be cloned into the
+same parent directory, because `Cargo.toml` depends on them by relative path:
+
+| Sibling | Why |
+|---|---|
+| [`embarch-study-designer`](https://github.com/gabrieltetar/embarch-study-designer) | the shared study/registry type model |
+| [`embarch-topology`](https://github.com/gabrieltetar/embarch-topology) | the board registry, with its `hardware` feature |
+
+So the layout cargo expects is `<parent>/embarch-core`, `<parent>/embarch-study-designer`,
+`<parent>/embarch-topology`. Clone this repo on its own and `cargo build` fails with
+`failed to read ../embarch-topology/Cargo.toml` — an error naming a path outside this
+repo, which means nothing more than "the sibling is not there".
+
+Path dependencies rather than git or registry ones is a deliberate choice, not an
+oversight: `embarch-study-designer` decision 8 and `embarch-topology` decision 13.
+
 ```
 cargo build --release
 ```
