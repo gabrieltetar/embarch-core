@@ -26,8 +26,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use embarch_study_designer::{
-    limits::MAX_STREAM_NAME_LEN, GattTranscriptEntry, Sample, StreamEncoding, StreamRef,
-    StreamSource, StreamTap, StructLayout,
+    limits::MAX_STREAM_NAME_LEN, GattTranscriptEntry, Sample, StreamEncoding, StreamRef, StreamTap,
+    StructLayout,
 };
 use serde::{Deserialize, Serialize};
 
@@ -135,16 +135,19 @@ pub fn signal_baud() -> u32 {
 /// `streams/index.json` — written once at study start, before a single byte
 /// has arrived, and never rewritten.
 ///
-/// **Why this exists at all**, since decision 30 didn't name it: the three
-/// retired routes (`/power-data`, `/waveform-data`, `/gatt-data`) are kept as
-/// aliases for one release, and an alias has to answer "which tap is the
-/// power tap?" from a handler that has no `Study` in hand — Core reads
-/// results back off disk, deliberately holding no resident copy of a
-/// finished study (`StudyJob`'s own doc comment). The index is that answer,
-/// and it doubles as the name → file mapping `GET /study/{id}/stream/{name}`
-/// resolves through, which is what makes a tap name incapable of escaping
-/// the streams directory: only a name the index already carries resolves to
-/// anything at all.
+/// **Why this exists at all**, since decision 30 didn't name it: it is the
+/// name → file mapping `GET /study/{id}/stream/{name}` resolves through,
+/// answered from a handler that has no `Study` in hand — Core reads results
+/// back off disk, deliberately holding no resident copy of a finished study
+/// (`StudyJob`'s own doc comment). That mapping is also what makes a tap name
+/// incapable of escaping the streams directory: only a name the index already
+/// carries resolves to anything at all.
+///
+/// It was originally motivated by a second job as well — resolving the three
+/// fixed-channel aliases (`/power-data`, `/waveform-data`, `/gatt-data`) to
+/// whichever tap answered each. Those routes are retired, and the `alias`
+/// field with them; the index stays, because the reason above was always the
+/// load-bearing one.
 ///
 /// Written at start rather than at finish so a study that *failed* still
 /// says which taps it declared — the same reason the capture files
@@ -180,11 +183,6 @@ pub struct StreamIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrival_file: Option<String>,
     pub encoding: StreamEncoding,
-    /// Which of the three retired fixed-path routes this tap answers, if
-    /// any: `"power"`, `"waveform"` or `"gatt"`. The mapping is exactly the
-    /// one Phase A's interim `write_stream_record` used to pick between the
-    /// three CSV files, moved here rather than re-derived.
-    pub alias: Option<String>,
     /// Why this tap's rendering is missing, incomplete, unnamed or untimed —
     /// set only when there is something to say. An `OutpostTrace` tap decoded
     /// without an applicable manifest carries the refusal here, so the reason
@@ -238,9 +236,6 @@ impl StreamIndex {
         self.streams.iter().find(|e| e.name == name)
     }
 
-    pub fn find_alias(&self, alias: &str) -> Option<&StreamIndexEntry> {
-        self.streams.iter().find(|e| e.alias.as_deref() == Some(alias))
-    }
 }
 
 /// Reads `streams/index.json`. `Ok(None)` when there is no `streams/`
@@ -569,7 +564,6 @@ impl StreamStore {
                 rendered_file,
                 arrival_file,
                 encoding: tap.encoding,
-                alias: alias_for(&tap.source, &tap.encoding).map(str::to_string),
                 note: None,
                 named: None,
                 timed: None,
@@ -687,22 +681,6 @@ impl StreamStore {
                 records: None,
             })
             .collect()
-    }
-}
-
-/// Which of the three retired fixed-path routes a tap answers.
-///
-/// Exactly Phase A's interim mapping, moved rather than re-derived:
-/// `GattTranscript` → `gatt.csv`, `Samples` on a `PowerFrontEnd` source →
-/// `data.csv`, `Samples` on anything else → `waveform.csv`.
-fn alias_for(source: &StreamSource, encoding: &StreamEncoding) -> Option<&'static str> {
-    match encoding {
-        StreamEncoding::GattTranscript => Some("gatt"),
-        StreamEncoding::Samples { .. } => Some(match source {
-            StreamSource::PowerFrontEnd { .. } => "power",
-            _ => "waveform",
-        }),
-        _ => None,
     }
 }
 
@@ -861,7 +839,10 @@ fn is_study_id(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embarch_study_designer::{SampleLayout, StreamScope, Unit};
+    // `StreamSource` was a top-level import while `alias_for` existed. That
+    // function is retired with the three fixed-channel routes, and the tests
+    // are now its only users here.
+    use embarch_study_designer::{SampleLayout, StreamScope, StreamSource, Unit};
 
     fn tap(id: u8, name: &str, source: StreamSource, encoding: StreamEncoding) -> StreamTap {
         StreamTap {
@@ -894,13 +875,10 @@ mod tests {
         assert_eq!(index.streams.len(), 3);
         assert_eq!(index.streams[0].raw_file, "power.bin");
         assert_eq!(index.streams[0].rendered_file.as_deref(), Some("power.csv"));
-        assert_eq!(index.streams[0].alias.as_deref(), Some("power"));
         // A `Raw` tap renders nothing — no sniff, no "looks like text"
-        // fallback, and no alias to any of the three retired routes.
+        // fallback.
         assert_eq!(index.streams[1].raw_file, "trace.bin");
         assert_eq!(index.streams[1].rendered_file, None);
-        assert_eq!(index.streams[1].alias, None);
-        assert_eq!(index.streams[2].alias.as_deref(), Some("gatt"));
 
         // Written before a byte arrives, so a study that failed still says
         // which taps it declared.
