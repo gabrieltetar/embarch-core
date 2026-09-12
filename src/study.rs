@@ -87,8 +87,8 @@ pub type StudyLock = Arc<StdMutex<Option<String>>>;
 /// completed study's actual result lives only in `events.json` on disk
 /// (written incrementally by [`EventsJsonWriter`] as each step arrives, not
 /// assembled from this struct) — [`get_study_handler`] reads it back from
-/// there, the same pattern `power_data_handler`/`waveform_data_handler`
-/// already use for `data.csv`/`waveform.csv`.
+/// there, the same pattern [`stream_data_handler`] already uses for a tap's
+/// own capture file.
 #[derive(Debug, Clone)]
 pub struct StudyJob {
     /// `"running" | "completed" | "failed"` (`"pending"` is never actually
@@ -2849,7 +2849,6 @@ pub struct StreamIndexEntryResponse {
     pub id: u8,
     pub name: String,
     pub encoding: StreamEncoding,
-    pub alias: Option<String>,
     /// Whether a decoded rendering exists, i.e. whether
     /// `GET /study/{id}/stream/{name}` (without `?raw=1`) serves something
     /// other than the raw bytes.
@@ -2932,7 +2931,6 @@ fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexRespons
                 id: e.id,
                 name: e.name,
                 encoding: e.encoding,
-                alias: e.alias,
                 rendered: e.rendered_file.is_some(),
                 note: e.note,
                 named: e.named,
@@ -3144,62 +3142,6 @@ pub async fn stream_data_handler(
     })?;
 
     serve_capture(&streams_dir, entry, query.wants_raw(), &format!("stream '{name}'")).await
-}
-
-// The three fixed routes `GET /study/{id}/stream/{name}` replaces, kept as
-// aliases for one release rather than breaking `embarch-api`'s existing
-// `study_power_data`/`study_waveform_data`/`study_gatt_data` tools mid-flight
-// (decision 30). Each resolves through the
-// study's own index to whichever tap answers that alias — which is the whole
-// reason the index exists, since a handler reading results back off disk has
-// no `Study` in hand to ask.
-
-pub async fn power_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_alias(&study_id, "power", "data.csv", "power data").await
-}
-
-pub async fn waveform_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_alias(&study_id, "waveform", "waveform.csv", "waveform data").await
-}
-
-/// `embarch-study-designer` decision 36: the study's whole GATT
-/// transcript, every entry across every step, uncapped — as opposed to
-/// `GET /study/{id}`'s per-step `gatt_activity`, which is a bounded inline
-/// summary.
-pub async fn gatt_data_handler(Path(study_id): Path<String>) -> Result<Response, (StatusCode, String)> {
-    serve_alias(&study_id, "gatt", "gatt.csv", "GATT transcript").await
-}
-
-/// Resolves one of the three retired fixed paths.
-///
-/// `legacy_file` is the pre-`streams/` path the same data used to live at,
-/// and is tried when a study has no index at all: results captured before
-/// this release are still on disk, and an alias that 404'd on them would
-/// break the very tools these aliases exist to keep working.
-async fn serve_alias(
-    study_id: &str,
-    alias: &str,
-    legacy_file: &str,
-    kind: &str,
-) -> Result<Response, (StatusCode, String)> {
-    let streams_dir = streams_dir_for(study_id)?;
-
-    if let Some(index) = read_stream_index(&streams_dir)? {
-        return match index.find_alias(alias) {
-            Some(entry) => serve_capture(&streams_dir, entry, false, kind).await,
-            None => Err((StatusCode::NOT_FOUND, format!("no {kind} captured for this study"))),
-        };
-    }
-
-    // Pre-`streams/` results.
-    let legacy = study_results_dir(study_id).map_err(internal_err)?.join(legacy_file);
-    match tokio::fs::read(&legacy).await {
-        Ok(bytes) => Ok(([(CONTENT_TYPE, "text/csv")], bytes).into_response()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err((StatusCode::NOT_FOUND, format!("no {kind} captured for this study")))
-        }
-        Err(e) => Err(internal_err(e)),
-    }
 }
 
 fn streams_dir_for(study_id: &str) -> Result<PathBuf, (StatusCode, String)> {
@@ -4942,25 +4884,24 @@ mod tests {
         let raw = serve_capture(&streams_dir, entry, true, "power").await.unwrap();
         assert_eq!(raw.headers().get(CONTENT_TYPE).unwrap(), "application/octet-stream");
 
-        // And the three retired routes still resolve, through the same index.
-        assert_eq!(index.find_alias("power").map(|e| e.name.as_str()), Some("power"));
-        assert!(index.find_alias("gatt").is_none());
+        // A name the study never declared resolves to nothing at all, which
+        // is what stops a tap name reaching outside the streams directory.
         assert!(index.find("no-such-tap").is_none());
     }
 
-    /// **The test the aliases exist for** (decision 30,
-    /// `embarch-api` decision 39): each of the
-    /// three retired fixed routes has to keep answering with *exactly* what
-    /// its replacement answers with, for one release, or an agent
-    /// mid-conversation gets silently different data from the same call it
-    /// was already making.
+    /// Every declared tap resolves by **its own declared name** and serves
+    /// something, across all three encodings a study can mix in one run.
     ///
-    /// Asserting the bodies are byte-identical is the point — two paths that
-    /// each merely return "some CSV" would pass a test that checked only
-    /// status codes, and diverge in content the first time one of them picks
-    /// a different entry out of the index.
+    /// This test used to assert the three retired fixed routes returned
+    /// byte-identical bodies to their replacement. The aliases are gone, so
+    /// that half has no subject left — but the half that never depended on
+    /// them does: a study declaring a power tap, a GATT transcript and a
+    /// waveform tap together must have each one resolve to *its own* entry,
+    /// not to whichever entry the index happens to list first. Asserting a
+    /// non-empty body is the point; a test checking only status codes would
+    /// pass while every tap served the same file.
     #[tokio::test]
-    async fn each_alias_returns_byte_for_byte_what_its_replacement_returns() {
+    async fn every_declared_tap_resolves_by_its_own_name_across_encodings() {
         let dir = tempfile::tempdir().unwrap();
         let gatt = tap(1, "gatt-transcript", StreamSource::GattTranscript, StreamEncoding::GattTranscript);
         let waveform = tap(
@@ -5003,30 +4944,18 @@ mod tests {
         let streams_dir = dir.path().join("streams");
         let index = stream_store::read_index(&streams_dir).unwrap().unwrap();
 
-        for (alias, tap_name) in [
-            ("power", "power"),
-            ("gatt", "gatt-transcript"),
-            ("waveform", "sensor-waveform"),
-        ] {
-            let via_alias = index
-                .find_alias(alias)
-                .unwrap_or_else(|| panic!("alias '{alias}' must resolve"));
+        for tap_name in ["power", "gatt-transcript", "sensor-waveform"] {
             let via_name = index
                 .find(tap_name)
                 .unwrap_or_else(|| panic!("tap '{tap_name}' must resolve by its declared name"));
             assert_eq!(
-                via_alias.name, via_name.name,
-                "alias '{alias}' and tap '{tap_name}' must be the same tap"
+                via_name.name, tap_name,
+                "the index handed back a different tap than the one asked for"
             );
 
-            let alias_body = body_bytes(serve_capture(&streams_dir, via_alias, false, alias).await.unwrap()).await;
-            let stream_body =
+            let body =
                 body_bytes(serve_capture(&streams_dir, via_name, false, tap_name).await.unwrap()).await;
-            assert_eq!(
-                alias_body, stream_body,
-                "alias '{alias}' and study_stream_data('{tap_name}') must return identical bytes"
-            );
-            assert!(!alias_body.is_empty(), "alias '{alias}' returned nothing");
+            assert!(!body.is_empty(), "study_stream_data('{tap_name}') returned nothing");
         }
     }
 
@@ -5115,7 +5044,6 @@ mod tests {
                     rendered_file: Some("outpost.trace.csv".to_string()),
                     encoding: StreamEncoding::OutpostTrace,
                     arrival_file: Some("outpost.arrival.csv".to_string()),
-                    alias: None,
                     note: Some("decoded but NOT named: manifest build_id \"a\" != firmware build_id \"b\"".to_string()),
                     named: Some(false),
                     timed: Some(true),
@@ -5128,7 +5056,6 @@ mod tests {
                     rendered_file: Some("power.csv".to_string()),
                     encoding: StreamEncoding::Raw,
                     arrival_file: None,
-                    alias: Some("power".to_string()),
                     note: None,
                     named: None,
                     timed: None,
@@ -5160,7 +5087,6 @@ mod tests {
         // The unrefused tap says nothing, rather than saying "fine" — an
         // absent note is what "nothing to report" looks like.
         assert_eq!(response.streams[1].note, None);
-        assert_eq!(response.streams[1].alias.as_deref(), Some("power"));
     }
 
     /// A tap whose encoding has no rendering must not claim one, or a caller
@@ -5176,7 +5102,6 @@ mod tests {
                 rendered_file: None,
                 encoding: StreamEncoding::Raw,
                 arrival_file: None,
-                alias: None,
                 note: None,
                 named: None,
                 timed: None,

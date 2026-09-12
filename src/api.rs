@@ -154,9 +154,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
         .route("/study/{study_id}/streams", get(study::stream_index_handler))
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
-        .route("/study/{study_id}/power-data", get(study::power_data_handler))
-        .route("/study/{study_id}/waveform-data", get(study::waveform_data_handler))
-        .route("/study/{study_id}/gatt-data", get(study::gatt_data_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -1523,9 +1520,6 @@ mod tests {
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
         ("GET", "/study/{study_id}/streams", "/study/abc/streams"),
         ("GET", "/study/{study_id}/stream/{name}", "/study/abc/stream/power"),
-        ("GET", "/study/{study_id}/power-data", "/study/abc/power-data"),
-        ("GET", "/study/{study_id}/waveform-data", "/study/abc/waveform-data"),
-        ("GET", "/study/{study_id}/gatt-data", "/study/abc/gatt-data"),
     ];
 
     /// Every path `build_router` registers, read out of this file's own
@@ -1545,10 +1539,8 @@ mod tests {
     /// `AUTH_CASES.len()`: `/signals` is one `.route()` call chaining
     /// `.get()`/`.post()`, one line but two auth cases, so this number runs
     /// one behind that one. Hand-counted against
-    /// `embarch-doc/embarch-core/interfaces.md`'s tables, every alias row
-    /// (`/power-data` · `/waveform-data` · `/gatt-data`) counted separately
-    /// even where the doc collapses them onto one markdown row for
-    /// readability. **Not** derived by reading that file: this crate has no
+    /// `embarch-doc/embarch-core/interfaces.md`'s tables. **Not** derived by
+    /// reading that file: this crate has no
     /// reliable relative path to it — the doc repo is a sibling checkout in
     /// the normal layout but a *different* worktree entirely under the
     /// fleet's one-branch-two-worktrees model (`embarch-fleet/protocol.md`
@@ -1558,7 +1550,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 25;
+    const DOCUMENTED_ROUTE_COUNT: usize = 22;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
