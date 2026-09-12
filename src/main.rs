@@ -160,7 +160,8 @@ enum Command {
 /// fixed-capacity `heapless` types, previously reproduced only in debug
 /// builds and "confirmed release-build-safe" as of that doc's 2026-08-19/20
 /// finding. That confirmation didn't hold: the first real `run_study` POST
-/// against this milestone's GATT-extended `StepResult` (decisions 31/32's
+/// against this milestone's GATT-extended `StepResult` (`embarch-study-designer`
+/// decisions 31/32's
 /// `gatt_services`/`gatt_activity`, larger than anything sized when that
 /// finding was written) crashed the real, `--release` Windows service with
 /// `STATUS_STACK_OVERFLOW` (0xc00000fd) — a first real release-build
