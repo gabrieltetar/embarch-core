@@ -256,6 +256,7 @@ struct StatusResponse {
     core_version: &'static str,
 }
 
+// route: GET /status
 async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let probes = tokio::task::spawn_blocking(hardware::list_probes)
         .await
@@ -364,6 +365,7 @@ struct FlashArgs {
 /// sending a path). Branches on `Content-Type` rather than two separate
 /// routes, matching the one-`/flash`-endpoint contract already documented
 /// in §4's endpoint table.
+// route: POST /flash
 async fn flash_handler(
     State(state): State<AppState>,
     request: Request,
@@ -555,6 +557,7 @@ struct ResetResponse {
     reset: bool,
 }
 
+// route: POST /reset
 async fn reset_handler(
     State(state): State<AppState>,
     Json(req): Json<ResetRequest>,
@@ -600,6 +603,7 @@ struct SerialLogResponse {
     truncated: bool,
 }
 
+// route: GET /serial-log
 async fn serial_log_handler(
     State(state): State<AppState>,
     Query(q): Query<SerialLogQuery>,
@@ -650,6 +654,7 @@ struct ResolveChipResponse {
     chip: String,
 }
 
+// route: POST /resolve-chip
 async fn resolve_chip_handler(
     Json(req): Json<ResolveChipRequest>,
 ) -> Result<Json<ResolveChipResponse>, (StatusCode, String)> {
@@ -701,6 +706,7 @@ struct EnrollProbeResponse {
     confirmed_at_utc_ms: u64,
 }
 
+// route: POST /probes/enroll
 async fn enroll_probe_handler(
     State(state): State<AppState>,
     Json(req): Json<EnrollProbeRequest>,
@@ -734,6 +740,7 @@ async fn enroll_probe_handler(
 /// `/dev-bench/port`'s enumeration below). Added alongside the `/enroll`
 /// static UI page so it has something to show without a human needing to
 /// run `embarch-topology list` in a separate terminal.
+// route: GET /probes/enrolled
 async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::hardware::EnrolledBoard>>, (StatusCode, String)> {
     tokio::task::spawn_blocking(embarch_topology::hardware::list_enrolled)
         .await
@@ -770,6 +777,7 @@ struct SetDevBenchLinkRequest {
     interface: Option<u8>,
 }
 
+// route: POST /dev-bench/link
 async fn set_dev_bench_link_handler(
     State(state): State<AppState>,
     Json(req): Json<SetDevBenchLinkRequest>,
@@ -822,6 +830,7 @@ async fn set_dev_bench_link_handler(
 /// where the suite actually runs is a surface to keep in step for no one.
 /// The cost is stated rather than hidden: a bench with no Core running has
 /// no terminal path to declare a signal.
+// route: POST /signals
 async fn declare_signal_handler(
     State(state): State<AppState>,
     Json(link): Json<embarch_topology::hardware::SignalLink>,
@@ -847,6 +856,7 @@ async fn declare_signal_handler(
 /// Added alongside the write because `list_signals` has never had an HTTP
 /// caller at all and `embarch-ui`'s Topology tab needs to list rows
 /// (`embarch-ui` decision 10, routing half).
+// route: GET /signals
 async fn list_signals_handler(
 ) -> Result<Json<Vec<embarch_topology::hardware::SignalLink>>, (StatusCode, String)> {
     tokio::task::spawn_blocking(embarch_topology::hardware::list_signals)
@@ -873,6 +883,7 @@ async fn list_signals_handler(
 /// into a silent success, so a UI that thought a row existed learns it did
 /// not. Takes `hw_lock` for the same reason the write above does: it edits
 /// the same enrollment file.
+// route: DELETE /signals/{name}
 async fn remove_signal_handler(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -914,6 +925,7 @@ async fn remove_signal_handler(
 /// already enumerated, same posture as `/status`'s probe listing and
 /// `/dev-bench/port`. An empty list is a `200` — nothing plugged in is a real
 /// answer, not a failure.
+// route: GET /serial-ports
 async fn serial_ports_handler(
 ) -> Result<Json<Vec<embarch_topology::hardware::DetectedPort>>, (StatusCode, String)> {
     tokio::task::spawn_blocking(embarch_topology::hardware::list_serial_ports)
@@ -935,6 +947,7 @@ async fn serial_ports_handler(
 /// bench, not a Core failure, and `embarch-api` needs to distinguish it from a
 /// genuinely broken detection (an ambiguous match, or an unreadable USB bus),
 /// which still comes back as `500` with the full error chain.
+// route: GET /dev-bench/port
 async fn dev_bench_port_handler(
 ) -> Result<Json<embarch_topology::hardware::DevBenchPort>, (StatusCode, String)> {
     let detected = tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port)
@@ -1037,6 +1050,7 @@ fn classify_topology_mismatch(
     }
 }
 
+// route: POST /validate
 async fn validate_handler(
     State(state): State<AppState>,
     Json(req): Json<ValidateRequest>,
@@ -1125,6 +1139,7 @@ fn default_alerts_limit() -> usize {
     20
 }
 
+// route: GET /alerts
 async fn alerts_handler(
     Query(q): Query<AlertsQuery>,
 ) -> Result<Json<Vec<embarch_topology::hardware::Alert>>, (StatusCode, String)> {
@@ -1178,6 +1193,7 @@ struct LogsRecentResponse {
 /// produces — reformatting Core's actual log output into structured JSON
 /// just for this would be a real change to a foundational, already-
 /// deployed piece of a live service, not something this decision needs).
+// route: GET /logs/recent
 async fn logs_recent_handler(
     Query(q): Query<LogsRecentQuery>,
 ) -> Result<Json<LogsRecentResponse>, (StatusCode, String)> {
@@ -1635,6 +1651,120 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
                 "{method} {path} (sent as {uri}) answered a request carrying the wrong \
                  bearer token"
+            );
+        }
+    }
+
+    // ---- build_router wires every route to its intended handler ----
+    //
+    // The two sweeps above prove rejection: every route refuses an absent or
+    // wrong token. They say nothing about *reach* — a route registered
+    // against the wrong handler (a copy-paste in `build_router`, a path that
+    // shadows another) is invisible to them and still reads green.
+    // `embarch-core/open.md` named this gap directly.
+    //
+    // Closing it the way decision 42 closed the auth gap means never
+    // hand-writing a second "route -> intended handler" table: that table is
+    // exactly the thing a copy-paste bug would also get wrong, so it would
+    // prove nothing. Instead each handler carries a `// route: METHOD path`
+    // comment directly above its own definition — authored once, at the
+    // handler, with no view of `build_router`'s `.route(...)` line for the
+    // same handler. `registered_route_bindings` derives what `build_router`
+    // actually wires from its source, `handler_declared_route` derives what
+    // each handler believes it answers from *its* source, and the test below
+    // requires the two to agree. Wiring a route to the wrong handler makes
+    // them disagree and the failure names both sides.
+
+    /// One `(method, path, handler_name)` triple per verb `build_router`
+    /// wires to a handler, read out of this file's own `.route(...)` lines.
+    /// A path with two chained verbs (`/signals`) yields two rows.
+    /// `handler_name` keeps a leading `study::` where the source has one,
+    /// since that is also how `handler_declared_route` picks the file to
+    /// search.
+    fn registered_route_bindings() -> Vec<(String, String, String)> {
+        include_str!("api.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(ROUTE_MARKER))
+            .flat_map(|l| {
+                // `l` looks like `.route("PATH", verb(handler)[.verb(handler)])`.
+                let rest = &l[ROUTE_MARKER.len()..];
+                let mut parts = rest.splitn(2, '"');
+                let path = parts.next().unwrap().to_string();
+                let after_quote = parts
+                    .next()
+                    .unwrap_or_else(|| panic!("`{l}` has no closing quote after its path"));
+                let verbs_src = after_quote.trim_start_matches(',').trim();
+                // Drop the one trailing `)` that closes `.route(...)` itself.
+                let verbs_src = &verbs_src[..verbs_src.len() - 1];
+                verbs_src
+                    .split('.')
+                    .map(str::trim)
+                    .filter(|seg| !seg.is_empty())
+                    .map(|seg| {
+                        let open = seg
+                            .find('(')
+                            .unwrap_or_else(|| panic!("`{seg}` (from `{l}`) has no `(`"));
+                        let method = seg[..open].to_uppercase();
+                        let handler = seg[open + 1..seg.len() - 1].to_string();
+                        (method, path.clone(), handler)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The `(method, path)` a handler's own `// route: METHOD path` comment
+    /// declares, read from directly above its `[pub] async fn NAME(` line in
+    /// `api.rs` (bare name) or `study.rs` (`study::`-prefixed name). `None`
+    /// if the handler has no such comment immediately above its definition.
+    fn handler_declared_route(handler_name: &str) -> Option<(String, String)> {
+        let (source, bare_name) = match handler_name.strip_prefix("study::") {
+            Some(stripped) => (include_str!("study.rs"), stripped),
+            None => (include_str!("api.rs"), handler_name),
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        let fn_prefixes = [format!("async fn {bare_name}("), format!("pub async fn {bare_name}(")];
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !fn_prefixes.iter().any(|p| trimmed.starts_with(p.as_str())) {
+                continue;
+            }
+            let prev = lines.get(i.checked_sub(1)?)?.trim();
+            let spec = prev.strip_prefix("// route: ")?;
+            let mut it = spec.splitn(2, ' ');
+            let method = it.next()?.to_string();
+            let path = it.next()?.to_string();
+            return Some((method, path));
+        }
+        None
+    }
+
+    #[test]
+    fn every_registered_route_reaches_its_intended_handler() {
+        let bindings = registered_route_bindings();
+        assert!(
+            bindings.len() > 20,
+            "the scan for `{ROUTE_MARKER}` found {} verb/handler bindings, fewer than \
+             `build_router` has ever had — the scan broke, not the router.",
+            bindings.len()
+        );
+
+        for (method, path, handler) in &bindings {
+            let (declared_method, declared_path) = handler_declared_route(handler)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{handler}` is wired to {method} {path} in `build_router` but carries \
+                         no `// route: METHOD path` comment directly above its definition — add \
+                         one so this check can prove the wiring instead of assuming it."
+                    )
+                });
+            assert_eq!(
+                (method.as_str(), path.as_str()),
+                (declared_method.as_str(), declared_path.as_str()),
+                "`build_router` wires {method} {path} to `{handler}`, but `{handler}`'s own \
+                 `// route: {declared_method} {declared_path}` comment says it answers a \
+                 different route — one of the two is wired to the wrong handler."
             );
         }
     }

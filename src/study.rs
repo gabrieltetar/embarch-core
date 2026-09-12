@@ -903,6 +903,7 @@ fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity)
 /// Rejects with `409` if a study is already in flight — the dev-bench link
 /// is a single serial port, and this call would otherwise race
 /// [`post_study_handler`]'s own open of it.
+// route: GET /dev-bench/hello
 pub async fn hello_handler(
     State(state): State<AppState>,
 ) -> Result<Json<HelloAckInfo>, (StatusCode, String)> {
@@ -943,6 +944,7 @@ pub async fn hello_handler(
 /// `embarch-study-designer` spec.md §5.1: validate, take the study lock, open dev-bench and hand it
 /// the study, then return immediately and let a background task own the rest
 /// of the study's lifetime.
+// route: POST /study
 pub async fn post_study_handler(
     State(state): State<AppState>,
     Query(run): Query<StudyRunParams>,
@@ -2722,6 +2724,7 @@ fn finish_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, stu
 
 // ---- GET /study/{study_id} --------------------------------------------------
 
+// route: GET /study/{study_id}
 pub async fn get_study_handler(
     State(state): State<AppState>,
     Path(study_id): Path<String>,
@@ -2793,6 +2796,7 @@ async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
 /// watching one study's `/events` never surfaces a *different* study's
 /// traffic even though, today, `StudyLock` never actually lets two run
 /// concurrently to make that observable.
+// route: GET /study/{study_id}/events
 pub async fn study_events_handler(
     State(state): State<AppState>,
     Path(study_id): Path<String>,
@@ -2901,6 +2905,7 @@ pub struct StreamIndexResponse {
 /// Reads purely off disk, like `stream_data_handler` — a study whose job
 /// registry entry is gone (Core restarted) still answers, because the results
 /// directory is the durable record.
+// route: GET /study/{study_id}/streams
 pub async fn stream_index_handler(
     Path(study_id): Path<String>,
 ) -> Result<Json<StreamIndexResponse>, (StatusCode, String)> {
@@ -3033,6 +3038,7 @@ fn outcome_name_and_reason(outcome: &serde_json::Value) -> (String, Option<Strin
 /// A disk read like `stream_index_handler`, not a registry lookup: the job
 /// registry is in memory and a study outlives the Core process that ran it,
 /// which is exactly the case a post-hoc trace is being read in.
+// route: GET /study/{study_id}/steps
 pub async fn study_steps_handler(
     Path(study_id): Path<String>,
 ) -> Result<Json<StudyStepsResponse>, (StatusCode, String)> {
@@ -3118,6 +3124,7 @@ impl StreamQuery {
 /// A name that isn't in this study's `streams/index.json` is a `404`, which
 /// is also what makes a tap name incapable of naming a file outside the
 /// streams directory: only names the index already carries resolve at all.
+// route: GET /study/{study_id}/stream/{name}
 pub async fn stream_data_handler(
     Path((study_id, name)): Path<(String, String)>,
     Query(query): Query<StreamQuery>,
