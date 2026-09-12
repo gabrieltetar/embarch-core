@@ -45,8 +45,8 @@
 //! native binaries version-coupled to probe firmware.
 //!
 //! **A third backend, `nrfjprog` (Nordic's legacy nRF Command Line Tools,
-//! deprecated upstream in favour of `nrfutil`), was retired 2026-09-10
-//! (decision 50).** No recorded bench in this suite ever had it configured or
+//! deprecated upstream in favour of `nrfutil`), was retired 2026-09-06
+//! (decision 54).** No recorded bench in this suite ever had it configured or
 //! selected — the whole-corpus grep behind that decision found zero doctor
 //! runs, status fragments or log entries naming it — so the keep-reason
 //! ("a bench that already has it working should not be forced to migrate")

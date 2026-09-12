@@ -697,6 +697,9 @@ struct EnrollProbeResponse {
     probe_serial: String,
     role: String,
     chip: String,
+    /// The probe-read (JTAG) hardware ID, not the bench's self-reported one —
+    /// `hardware_id`, unprefixed, is this suite's name for the probe/JTAG-read
+    /// identity everywhere except `GET /dev-bench/hello` (decision 56).
     hardware_id: String,
     confirmed_at_utc_ms: u64,
 }
@@ -975,6 +978,9 @@ struct ValidateOkResponse {
     role: String,
     probe_serial: String,
     chip: String,
+    /// The probe-read (JTAG) hardware ID, not the bench's self-reported one —
+    /// `hardware_id`, unprefixed, is this suite's name for the probe/JTAG-read
+    /// identity everywhere except `GET /dev-bench/hello` (decision 56).
     hardware_id: String,
     confirmed_at_utc_ms: u64,
     /// The instant *this* live check's hardware-ID compare passed — distinct
