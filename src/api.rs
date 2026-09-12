@@ -191,6 +191,35 @@ pub(crate) fn internal_err<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
+/// The same `not_attached`-versus-`mismatch` split `POST /validate` renders
+/// as JSON (`ValidateMismatchResponse`, decision 59), for the three call
+/// sites that only ever surface plain text: `flash`/`reset` (below) and
+/// `study.rs`'s dev-bench handshake gate, which all run the exact same
+/// `embarch_topology::hardware::validate_serial`/`validate_role` check
+/// mid-attach and, before this, rendered both conditions under the same
+/// `topology-mismatch: ...` lead via `{e:?}`'s debug chain. Returns the text
+/// unchanged (via `internal_err`'s own `{e:?}` formatting) for any other
+/// error — only a genuine `TopologyMismatch` gets a distinguishing lead.
+pub(crate) fn describe_topology_error(e: anyhow::Error) -> (StatusCode, String) {
+    match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
+        Some(m) if m.live_hardware_id.is_none() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "probe not attached for role '{}' (probe {}, chip '{}'): {}",
+                m.role, m.probe_serial, m.chip, m.reason
+            ),
+        ),
+        Some(m) => (
+            StatusCode::CONFLICT,
+            format!(
+                "topology mismatch for role '{}' (probe {}, chip '{}'): {} — fix it at {}",
+                m.role, m.probe_serial, m.chip, m.reason, m.fix_it_url
+            ),
+        ),
+        None => internal_err(e),
+    }
+}
+
 // ---- GET /status --------------------------------------------------------
 
 #[derive(Serialize)]
@@ -413,7 +442,7 @@ async fn flash_handler(
     })
     .await
     .map_err(internal_err)?
-    .map_err(internal_err)?;
+    .map_err(describe_topology_error)?;
 
     // Only after the flash actually succeeded: a manifest bound to an image
     // that never reached the board would describe firmware that is not running.
@@ -540,7 +569,7 @@ async fn reset_handler(
     tokio::task::spawn_blocking(move || hardware::reset(&chip, probe_serial.as_deref()))
         .await
         .map_err(internal_err)?
-        .map_err(internal_err)?;
+        .map_err(describe_topology_error)?;
 
     Ok(Json(ResetResponse { reset: true }))
 }
@@ -963,16 +992,46 @@ struct ValidateOkResponse {
 /// this endpoint's own JSON contract doesn't silently shift if that crate's
 /// internal error type ever gains/renames a field (`EnrollProbeResponse`'s
 /// own precedent for the same reasoning against `EnrolledBoard`).
+///
+/// `kind` is the field a caller branches on — never the leading words of
+/// `reason` (`embarch-core` decision 59). `"not_attached"` (`live_hardware_id`
+/// is `None`: nothing was compared, so this is not a mismatch at all) and
+/// `"mismatch"` (`live_hardware_id` is `Some` and differs from
+/// `recorded_hardware_id`) get opposite handling downstream
+/// (`../../embarch-fleet/protocol.md`'s `.claude/leg.md`: one leaves a task
+/// `open`, the other alerts a human) and must be tellable apart without
+/// reading to the end of the sentence. `fix_it_url` is only meaningful for
+/// `"mismatch"` — the fix for a detached probe is a USB cable, not the
+/// Topology tab — so it is `None` on the `"not_attached"` arm.
 #[derive(Serialize)]
 struct ValidateMismatchResponse {
     ok: bool,
+    kind: &'static str,
     role: String,
     probe_serial: String,
     chip: String,
     recorded_hardware_id: String,
     live_hardware_id: Option<String>,
     reason: String,
-    fix_it_url: String,
+    fix_it_url: Option<String>,
+}
+
+/// `live_hardware_id` is `None` exactly when nothing was compared — the
+/// probe couldn't be opened at all, unplugged being the ordinary reason —
+/// which is not a mismatch (`embarch-core` decision 59). Distinguished here
+/// by a `kind` field and a different status, not by the wording of `reason`:
+/// `503` ("try again once it's plugged in") for the absent case, `409` ("a
+/// human must reconcile this") only when a live ID was actually read and
+/// disagreed. `fix_it_url` — the Topology tab — only makes sense for the
+/// latter; the fix for a detached probe is a USB cable.
+fn classify_topology_mismatch(
+    m: &embarch_topology::hardware::TopologyMismatch,
+) -> (StatusCode, &'static str, Option<String>) {
+    if m.live_hardware_id.is_none() {
+        (StatusCode::SERVICE_UNAVAILABLE, "not_attached", None)
+    } else {
+        (StatusCode::CONFLICT, "mismatch", Some(m.fix_it_url.clone()))
+    }
 }
 
 async fn validate_handler(
@@ -1014,17 +1073,19 @@ async fn validate_handler(
             if let Some(m) = e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
                 let msg = format!("{e:?}");
                 tracing::info!("{msg}");
+                let (status, kind, fix_it_url) = classify_topology_mismatch(m);
                 return Ok((
-                    StatusCode::CONFLICT,
+                    status,
                     Json(ValidateMismatchResponse {
                         ok: false,
+                        kind,
                         role: m.role.clone(),
                         probe_serial: m.probe_serial.clone(),
                         chip: m.chip.clone(),
                         recorded_hardware_id: m.recorded_hardware_id.clone(),
                         live_hardware_id: m.live_hardware_id.clone(),
                         reason: m.reason.clone(),
-                        fix_it_url: m.fix_it_url.clone(),
+                        fix_it_url,
                     }),
                 )
                     .into_response());
@@ -1809,5 +1870,61 @@ mod tests {
         let parsed: embarch_topology::hardware::Alert =
             serde_json::from_str(ALERT_RESPONSE_JSON).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), ALERT_RESPONSE_JSON);
+    }
+
+    // ---- decision 59: not-attached is not a mismatch -----------------------
+
+    fn sample_mismatch(live_hardware_id: Option<String>) -> embarch_topology::hardware::TopologyMismatch {
+        embarch_topology::hardware::TopologyMismatch {
+            role: "dev-bench".to_string(),
+            probe_serial: "001057729826".to_string(),
+            chip: "nRF54L15".to_string(),
+            recorded_hardware_id: "6fcddc36cb781b71".to_string(),
+            live_hardware_id,
+            reason: "probe '001057729826' enrolled as role 'dev-bench' is not currently attached"
+                .to_string(),
+            fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
+        }
+    }
+
+    /// The regression this whole task is about: a `live_hardware_id` of
+    /// `None` — nothing was compared, the probe couldn't be opened — must
+    /// come back as `kind: "not_attached"`, never `"mismatch"`, and without
+    /// `fix_it_url` (a USB cable, not the Topology tab, is the fix).
+    #[test]
+    fn a_detached_probe_is_not_attached_not_a_mismatch() {
+        let m = sample_mismatch(None);
+        let (status, kind, fix_it_url) = classify_topology_mismatch(&m);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(kind, "not_attached");
+        assert_eq!(fix_it_url, None);
+    }
+
+    /// A live readback that disagrees with the recorded ID — decision 20's
+    /// own case — keeps the `mismatch` kind, the `409`, and `fix_it_url`.
+    #[test]
+    fn a_wrong_live_id_is_a_mismatch() {
+        let m = sample_mismatch(Some("deadbeefdeadbeef".to_string()));
+        let (status, kind, fix_it_url) = classify_topology_mismatch(&m);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(kind, "mismatch");
+        assert_eq!(fix_it_url, Some("http://127.0.0.1:4890/#topology".to_string()));
+    }
+
+    /// `flash`/`reset`'s plain-text path (`describe_topology_error`) must
+    /// give the two conditions different lead words too, not just `/validate`'s
+    /// JSON — this is the "other call sites" half of the task.
+    #[test]
+    fn flash_reset_path_leads_differ_between_not_attached_and_mismatch() {
+        let not_attached = anyhow::Error::new(sample_mismatch(None));
+        let (status, msg) = describe_topology_error(not_attached);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.starts_with("probe not attached for role"), "got: {msg}");
+        assert!(!msg.contains("topology mismatch"), "got: {msg}");
+
+        let mismatch = anyhow::Error::new(sample_mismatch(Some("deadbeefdeadbeef".to_string())));
+        let (status, msg) = describe_topology_error(mismatch);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.starts_with("topology mismatch for role"), "got: {msg}");
     }
 }

@@ -854,7 +854,29 @@ async fn enforce_dev_bench_gate() -> Result<embarch_topology::hardware::Enrolled
     })
     .await
     .map_err(|e| format!("board-identity gate task panicked: {e:?}"))?
-    .map_err(|e| format!("{e:?}"))
+    .map_err(describe_gate_error)
+}
+
+/// The same `not_attached`-versus-`mismatch` split `api.rs`'s
+/// `describe_topology_error` renders for `flash`/`reset` (`embarch-core`
+/// decision 59) — this call site only has a plain `String` to hand back
+/// (both its callers fold every gate failure into one `BAD_GATEWAY`
+/// regardless), so it distinguishes the two conditions in the text's own
+/// lead rather than in a status code. Before this, both rendered under the
+/// same `{e:?}` debug chain, a `topology-mismatch: ...` lead even for a
+/// probe that was simply unplugged.
+fn describe_gate_error(e: anyhow::Error) -> String {
+    match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
+        Some(m) if m.live_hardware_id.is_none() => format!(
+            "probe not attached for role '{}' (probe {}, chip '{}'): {}",
+            m.role, m.probe_serial, m.chip, m.reason
+        ),
+        Some(m) => format!(
+            "topology mismatch for role '{}' (probe {}, chip '{}'): {} — fix it at {}",
+            m.role, m.probe_serial, m.chip, m.reason, m.fix_it_url
+        ),
+        None => format!("{e:?}"),
+    }
 }
 
 /// Stable strings for [`embarch_topology::hardware::SelfReportedIdentity`],
@@ -5162,5 +5184,38 @@ mod tests {
             }],
         };
         assert!(!stream_index_response(index).streams[0].rendered);
+    }
+
+    /// The dev-bench handshake gate's own version of decision 59's split:
+    /// a detached probe (`live_hardware_id: None`) must not lead with
+    /// "topology mismatch" — that phrase is reserved for a live ID that was
+    /// actually read and disagreed.
+    #[test]
+    fn dev_bench_gate_not_attached_lead_differs_from_mismatch() {
+        let not_attached = embarch_topology::hardware::TopologyMismatch {
+            role: "dev-bench".to_string(),
+            probe_serial: "001057729826".to_string(),
+            chip: "nRF54L15".to_string(),
+            recorded_hardware_id: "6fcddc36cb781b71".to_string(),
+            live_hardware_id: None,
+            reason: "probe '001057729826' enrolled as role 'dev-bench' is not currently attached"
+                .to_string(),
+            fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
+        };
+        let msg = describe_gate_error(anyhow::Error::new(not_attached));
+        assert!(msg.starts_with("probe not attached for role"), "got: {msg}");
+        assert!(!msg.contains("topology mismatch"), "got: {msg}");
+
+        let mismatch = embarch_topology::hardware::TopologyMismatch {
+            role: "dev-bench".to_string(),
+            probe_serial: "001057729826".to_string(),
+            chip: "nRF54L15".to_string(),
+            recorded_hardware_id: "6fcddc36cb781b71".to_string(),
+            live_hardware_id: Some("deadbeefdeadbeef".to_string()),
+            reason: "wrong live id".to_string(),
+            fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
+        };
+        let msg = describe_gate_error(anyhow::Error::new(mismatch));
+        assert!(msg.starts_with("topology mismatch for role"), "got: {msg}");
     }
 }
