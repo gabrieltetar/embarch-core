@@ -4674,13 +4674,19 @@ mod tests {
     /// which `embarch-api` supplies out of band, was logged as the bench's
     /// fault and recorded empty.
     ///
-    /// The message itself is a `tracing::warn!` and nothing here captures a
-    /// subscriber, so what this pins is the half a test can reach: **the two
-    /// subjects are clamped independently.** The subject now being a
-    /// parameter is what makes the message right, and the compiler is what
-    /// enforces that every call site passes one.
+    /// **This test does not pin the fix, and its name says so.** The message
+    /// is a `tracing::warn!` and nothing here captures a subscriber, so what
+    /// it asserts — that the two subjects are clamped independently — was
+    /// already true of the old subject-less `clamp_version`, since each call
+    /// only ever looked at its own string. **What actually enforces the fix is
+    /// the compiler**: `clamp_version` takes a `VersionSubject`, so no call
+    /// site can reach it without saying which board it means.
+    ///
+    /// Kept anyway, as the regression pin for `provenance_for`'s own wiring —
+    /// that the flashed version lands in `firmware_version` with
+    /// `FlashedThisRun` while the bench's own survives intact beside it.
     #[test]
-    fn an_over_long_dut_version_does_not_touch_the_benchs_own() {
+    fn an_over_long_dut_version_is_recorded_empty_and_the_bench_version_survives() {
         let too_long = "g".repeat(MAX_FIRMWARE_VERSION_LEN + 1);
         let provenance = provenance_for(
             &study_with_steps(&[1_000]),
