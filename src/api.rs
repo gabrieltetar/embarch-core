@@ -686,10 +686,9 @@ struct EnrollProbeRequest {
     role: String,
     chip: String,
     /// Picks which currently-attached probe to enroll when more than one
-    /// is present — `/enroll`'s own drag-and-drop UI always sends this
-    /// (§3 decision 15), since it lets a human enroll two visibly-
-    /// different boards without unplugging either. Omitted, `enroll`
-    /// falls back to its original "exactly one attached" requirement.
+    /// is present, so a human can enroll two visibly-different boards
+    /// without unplugging either. Omitted, `enroll` falls back to its
+    /// original "exactly one attached" requirement.
     #[serde(default)]
     probe_serial: Option<String>,
 }
