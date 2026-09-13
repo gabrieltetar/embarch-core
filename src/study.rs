@@ -3721,7 +3721,7 @@ mod tests {
     /// `Action::RunProtocol.protocol` indexes `Study.protocols`, and nothing
     /// else resolves it. Both this and the entry-state check below exist
     /// because each index reaches a hand-written C array subscript on
-    /// dev-bench — §3 decision 18's rule is that Core names the specific
+    /// dev-bench — decision 39's rule is that Core names the specific
     /// failure rather than letting a raw index fail.
     #[test]
     fn validate_study_rejects_a_run_protocol_step_naming_a_protocol_that_is_not_there() {
