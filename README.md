@@ -2,9 +2,10 @@
 
 The OS-level service that owns the debug probe (flash / reset) and the
 serial console log. This is *Core* — it has no idea the EmbArch API or
-Claude Code exist. It just exposes five bearer-token-authed HTTP endpoints
-and holds the hardware connection so nothing else has to fight over the
-USB port.
+Claude Code exist. It just exposes 22 bearer-token-authed HTTP endpoints
+(the full list is in `embarch-doc/embarch-core/interfaces.md`; a handful
+of the core ones are below) and holds the hardware connection so nothing
+else has to fight over the USB port.
 
 Built with **Rust + probe-rs (as a library) + Axum + service-manager**.
 
@@ -32,8 +33,6 @@ src/
 ├── api.rs         — Axum router, handlers, bearer-token auth middleware
 ├── hardware.rs    — probe-rs: list probes, flash, reset
 ├── serial.rs      — serialport: read the UART console log
-├── dev_bench.rs   — serialport: find embarch-dev-bench's port (SEGGER VID +
-│                    product/serial/interface match); enumeration only
 ├── service.rs     — service-manager: register/remove as a background service
 └── token_store.rs — resolves/generates/persists the machine-wide EMBARCH_TOKEN file
 ```
@@ -132,10 +131,18 @@ export EMBARCH_TOKEN=some-long-random-string
 cargo run -- run
 ```
 
-Binds to `0.0.0.0:4884` by default — deliberately not `127.0.0.1`, since
-the point of this service is to be reachable from WSL2 (if Core runs
-native on Windows) or the LAN (if Core moves to a Pi). Override with
-`--bind` / `--port`.
+Binds to `127.0.0.1:4884` by default — loopback-only (decision 6's
+amendment, 2026-08-15). The original default was `0.0.0.0`; it was
+reversed because that plus no TLS plus a static bearer token plus
+`/flash` reading an arbitrary local path, in a process that may run as
+`LocalSystem`, is a posture nobody had assessed as a whole. Override with
+`--bind` / `--port` for a one-off `run`; to widen a permanently
+*installed* service (the WSL2-guest-reaches-Windows-native-Core topology
+needs this), reinstall elevated with `embarch-core install --bind
+0.0.0.0` — the same command `suite/user-guide.md` prescribes for
+`doctor`'s `bound-narrow`. Plain `embarch setup` only widens the bind
+correctly when run from the WSL2 guest side; run natively on Windows it
+infers `local` and reinstalls the narrow bind instead.
 
 ## Installing as a background service
 
@@ -155,10 +162,6 @@ same code, either OS. `uninstall` reverses it.
   covers some ESP flashing via USB-JTAG, but the classic UART bootloader
   path most ESP-IDF workflows use isn't covered. The planned escape hatch
   is an `esptool` subprocess fallback in `hardware.rs`, not yet implemented.
-- **No multi-probe selection.** `open_first_probe()` in `hardware.rs` takes
-  the first probe-rs finds. Fine at single-board scope; the moment you add
-  a second probe, that's the one function that needs a serial-number
-  selector.
 - **`EMBARCH_TOKEN` is a single shared static token**, not per-caller
   credentials. Adequate for one engineer; revisit if this ever needs to
   distinguish *who* is calling, not just *whether* they're allowed to.
