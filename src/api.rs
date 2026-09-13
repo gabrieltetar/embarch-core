@@ -822,7 +822,7 @@ async fn set_dev_bench_link_handler(
 /// outpost from a `Direct` route onto dev-bench pins is one call.
 ///
 /// **Core owns this write, and there is deliberately no `embarch-topology`
-/// CLI mirror**, unlike decision 17's `set-dev-bench-link`. That subcommand
+/// CLI mirror**, unlike `embarch-topology` decision 17's `set-dev-bench-link`. That subcommand
 /// writes `enrollment.toml` directly and a plain-user run hits the NTFS
 /// permission wall on this suite's real primary deployment — which is why
 /// the endpoint has to exist at all. A second writer that does not work
@@ -968,7 +968,7 @@ async fn dev_bench_port_handler(
 
 /// Explicit, non-destructive live re-check of an already-enrolled board's
 /// identity (`embarch_topology::hardware::validate_role_timed`, decision 28) — the exact same check `flash`/`reset`/the dev-bench
-/// handshake already run mid-attach (decisions 8, 22), callable on its own,
+/// handshake already run mid-attach (decision 22), callable on its own,
 /// any time, without an actual `flash`/`reset`/`run_study` call to trigger
 /// it. Takes `hw_lock` like `/flash`/`/reset` — it opens the same physical
 /// probe connection those do, and shouldn't be allowed to race either.
@@ -1421,7 +1421,7 @@ mod tests {
         assert!(err.1.contains("firmware"));
     }
 
-    // base_address (`embarch-dev-bench` decision 26): only meaningful for format = "bin", but parsed
+    // base_address (decision 18): only meaningful for format = "bin", but parsed
     // the same way regardless of which format accompanies it — parsing is a
     // pure string→u64 concern, independent of hardware.rs's own decision to
     // ignore it for every format but Bin.
