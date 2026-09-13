@@ -70,12 +70,19 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 /// than silently picking whichever happened to enumerate first — a wrong
 /// pick is a worse failure mode than an explicit one.
 ///
-/// `pub(crate)`, not just a private helper inside `open_probe` below: this
-/// is also `board_gate.rs`'s one and only source of "which probe did this
-/// call mean" (`enforce`/`enroll`) — the exact selection rule, shared
-/// rather than copied a second time, closing the same class of gap that let
-/// this decision's own serial-number selector go silently unimplemented for
-/// as long as it did (see decision 9's own text).
+/// `pub(crate)`, not just a private helper inside `open_probe` below:
+/// `resolved_serial` below also calls this, to get the serial
+/// `embarch_topology::hardware::validate_serial` (the board-identity gate,
+/// formerly this crate's own `board_gate.rs`) gates on — one selection
+/// rule behind both `open_probe`'s attach and the gate's serial lookup,
+/// shared within this crate rather than copied a second time in it. The
+/// gate's `enroll` counterpart moved into `embarch_topology` with its own,
+/// separately-written probe-selection code (`validate::enroll`) —
+/// `pub(crate)` cannot reach across the crate boundary the move created, so
+/// that side is now a copy, not a share: the same shape of drift this
+/// decision's own serial-number selector already suffered once, sitting
+/// silently unimplemented for months before anyone noticed (see decision
+/// 9's own text).
 pub(crate) fn resolve_probe(probe_serial: Option<&str>) -> Result<probe_rs::probe::DebugProbeInfo> {
     let lister = Lister::new();
     let probes = lister.list_all();
