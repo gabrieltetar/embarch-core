@@ -348,8 +348,8 @@ fn gate_then_start(
         // `Requirements` itself, and each subject is checked at most once.
         let _ = overrides.push(VersionOverride {
             subject,
-            required: clamp_version(required),
-            actual: clamp_version(actual),
+            required: clamp_version(subject, required),
+            actual: clamp_version(subject, actual),
         });
         tracing::warn!(
             field = subject.field_name(),
@@ -472,11 +472,14 @@ fn provenance_for(
     overrides: heapless::Vec<VersionOverride, MAX_VERSION_OVERRIDES>,
 ) -> Provenance {
     let (firmware_version, firmware_source) = match run.flashed_firmware_version.as_deref() {
-        Some(flashed) => (clamp_version(flashed), VersionSource::FlashedThisRun),
+        Some(flashed) => (
+            clamp_version(VersionSubject::Firmware, flashed),
+            VersionSource::FlashedThisRun,
+        ),
         None => (study.requires.firmware_version.clone(), VersionSource::Declared),
     };
     Provenance {
-        dev_bench_version: clamp_version(reported_dev_bench_version),
+        dev_bench_version: clamp_version(VersionSubject::DevBench, reported_dev_bench_version),
         firmware_version,
         dev_bench_source: VersionSource::ReportedByDevBench,
         firmware_source,
@@ -484,9 +487,38 @@ fn provenance_for(
     }
 }
 
-fn clamp_version(v: &str) -> heapless::String<MAX_FIRMWARE_VERSION_LEN> {
+/// Fit a version string into the result's bounded field, or record it empty.
+///
+/// **Takes the subject because two different boards' versions come through
+/// here and the message used to blame one of them for both**
+/// (`tasks/suite/010`). `Provenance` carries a bench version and a DUT
+/// version; `VersionOverride` carries a required and an actual for whichever
+/// subject was waved through. All four reach this function, and until
+/// 2026-09-13 every one of them warned *"dev-bench reported a
+/// firmware_version longer than N bytes"* — so an over-long
+/// `flashed_firmware_version`, which is the DUT's and which `embarch-api`
+/// supplies out of band, was logged as the bench's fault.
+///
+/// The subject also names the field, via [`VersionSubject::field_name`], so no
+/// caller writes `"firmware_version"` as a literal here — which is the same
+/// reason that method exists.
+fn clamp_version(
+    subject: VersionSubject,
+    v: &str,
+) -> heapless::String<MAX_FIRMWARE_VERSION_LEN> {
     heapless::String::try_from(v).unwrap_or_else(|_| {
-        tracing::warn!("dev-bench reported a firmware_version longer than {MAX_FIRMWARE_VERSION_LEN} bytes; recording it empty rather than truncated");
+        // Phrased as in `mismatch_message` above: the board, not the field
+        // name, is what a reader needs first.
+        let who = match subject {
+            VersionSubject::DevBench => "dev-bench reported a",
+            VersionSubject::Firmware => "this run was given a DUT",
+        };
+        tracing::warn!(
+            field = subject.field_name(),
+            max_bytes = MAX_FIRMWARE_VERSION_LEN,
+            "{who} {} longer than {MAX_FIRMWARE_VERSION_LEN} bytes; recording it empty rather than truncated",
+            subject.field_name(),
+        );
         heapless::String::new()
     })
 }
@@ -4634,6 +4666,41 @@ mod tests {
             flashed_firmware_version: Some(version.to_string()),
             ..Default::default()
         }
+    }
+
+    /// `tasks/suite/010`: `clamp_version` is reached by two different boards'
+    /// versions, and until 2026-09-13 it warned about "dev-bench" for both —
+    /// so an over-long `flashed_firmware_version`, which is the **DUT's** and
+    /// which `embarch-api` supplies out of band, was logged as the bench's
+    /// fault and recorded empty.
+    ///
+    /// The message itself is a `tracing::warn!` and nothing here captures a
+    /// subscriber, so what this pins is the half a test can reach: **the two
+    /// subjects are clamped independently.** The subject now being a
+    /// parameter is what makes the message right, and the compiler is what
+    /// enforces that every call site passes one.
+    #[test]
+    fn an_over_long_dut_version_does_not_touch_the_benchs_own() {
+        let too_long = "g".repeat(MAX_FIRMWARE_VERSION_LEN + 1);
+        let provenance = provenance_for(
+            &study_with_steps(&[1_000]),
+            "gbench1",
+            &flashed(&too_long),
+            Default::default(),
+        );
+
+        assert_eq!(
+            provenance.firmware_version.as_str(),
+            "",
+            "an over-long DUT version is recorded empty rather than truncated"
+        );
+        assert_eq!(
+            provenance.dev_bench_version.as_str(),
+            "gbench1",
+            "the bench's own version is a different subject and must survive intact"
+        );
+        assert_eq!(provenance.firmware_source, VersionSource::FlashedThisRun);
+        assert_eq!(provenance.dev_bench_source, VersionSource::ReportedByDevBench);
     }
 
     #[test]
