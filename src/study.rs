@@ -4165,11 +4165,13 @@ mod tests {
             // `embarch-study-designer` decisions 31/32 — new
             // fields this test fixture doesn't need to populate.
             gatt_services: None,
-            // Decision 44's `security_level`, likewise: this fixture has no
-            // link, and `None` is what a step with no connection reports.
+            // `embarch-study-designer` decision 44's `security_level`, likewise:
+            // this fixture has no link, and `None` is what a step with no
+            // connection reports.
             security_level: None,
-            // Decision 62's `protocol`: `None` for every action kind that
-            // is not `RunProtocol`, which is every one this fixture uses.
+            // `embarch-study-designer` decision 62's `protocol`: `None` for every
+            // action kind that is not `RunProtocol`, which is every one this
+            // fixture uses.
             protocol: None,
         }
     }
