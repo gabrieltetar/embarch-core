@@ -2921,6 +2921,15 @@ pub struct StreamIndexEntryResponse {
     /// by no lane are the instrument's own rather than unexplained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_excluded: Option<bool>,
+    /// Whether this tap's declared source has no front end on this bench yet
+    /// — currently `StreamSource::PowerFrontEnd`, deferred by
+    /// `embarch-dev-bench` decision 24. `None` for every other source.
+    /// **Core states this, it does not measure it**: without it, a tap
+    /// asking for hardware that does not exist is indistinguishable from a
+    /// mis-named signal — both produce `bytes_written: 0` and nothing else
+    /// (decision 63).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_deferred: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2985,6 +2994,7 @@ fn stream_index_response(index: stream_store::StreamIndex) -> StreamIndexRespons
                 named: e.named,
                 timed: e.timed,
                 self_excluded: e.self_excluded,
+                source_deferred: e.source_deferred,
             })
             .collect(),
     }
@@ -5215,6 +5225,7 @@ mod tests {
                     named: Some(false),
                     timed: Some(true),
                     self_excluded: Some(true),
+                    source_deferred: None,
                 },
                 stream_store::StreamIndexEntry {
                     id: 1,
@@ -5227,6 +5238,7 @@ mod tests {
                     named: None,
                     timed: None,
                     self_excluded: None,
+                    source_deferred: None,
                 },
             ],
         };
@@ -5273,6 +5285,7 @@ mod tests {
                 named: None,
                 timed: None,
                 self_excluded: None,
+                source_deferred: None,
             }],
         };
         assert!(!stream_index_response(index).streams[0].rendered);

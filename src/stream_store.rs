@@ -26,8 +26,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use embarch_study_designer::{
-    limits::MAX_STREAM_NAME_LEN, GattTranscriptEntry, Sample, StreamEncoding, StreamRef, StreamTap,
-    StructLayout,
+    limits::MAX_STREAM_NAME_LEN, GattTranscriptEntry, Sample, StreamEncoding, StreamRef,
+    StreamSource, StreamTap, StructLayout,
 };
 use serde::{Deserialize, Serialize};
 
@@ -229,6 +229,19 @@ pub struct StreamIndexEntry {
     /// this suite does not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_excluded: Option<bool>,
+    /// Whether this tap's declared source has no front end on this bench yet
+    /// — currently `StreamSource::PowerFrontEnd`, deferred by
+    /// `embarch-dev-bench` decision 24. `None` for every other source.
+    ///
+    /// **Core states this, it does not measure it**: the flag is set from the
+    /// tap's declared `StreamSource` at index-build time, before any bytes
+    /// arrive, the same way `bytes_written: 0` already distinguishes
+    /// "captured nothing" from "not captured yet" — without this a tap
+    /// asking for hardware that does not exist is indistinguishable from a
+    /// mis-named signal, both producing `bytes_written: 0` and no other
+    /// evidence (decision 63).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deferred: Option<bool>,
 }
 
 impl StreamIndex {
@@ -560,6 +573,20 @@ impl StreamStore {
                 lost_at_source: false,
             });
 
+            // Core states this, it does not measure it: the front end this
+            // tap asks for is not wired on any bench (`embarch-dev-bench`
+            // decision 24), so the fact is knowable from the tap's declared
+            // source alone, at this same before-any-bytes-arrive point every
+            // other index field is set from (decision 63).
+            let source_deferred = matches!(tap.source, StreamSource::PowerFrontEnd { .. })
+                .then_some(true);
+            let note = source_deferred.map(|_| {
+                "SOURCE DEFERRED: this tap's declared source (PowerFrontEnd) has no front end \
+                 wired on this bench (`embarch-dev-bench` decision 24), so it will capture \
+                 nothing until one exists. This is not a mis-declared or mis-named signal."
+                    .to_string()
+            });
+
             entries.push(StreamIndexEntry {
                 id: tap.id,
                 name: tap.name.as_str().to_string(),
@@ -567,10 +594,11 @@ impl StreamStore {
                 rendered_file,
                 arrival_file,
                 encoding: tap.encoding,
-                note: None,
+                note,
                 named: None,
                 timed: None,
                 self_excluded: None,
+                source_deferred,
             });
         }
 
@@ -843,9 +871,10 @@ fn is_study_id(name: &str) -> bool {
 mod tests {
     use super::*;
     // `StreamSource` was a top-level import while `alias_for` existed. That
-    // function is retired with the three fixed-channel routes, and the tests
-    // are now its only users here.
-    use embarch_study_designer::{SampleLayout, StreamScope, StreamSource, Unit};
+    // function is retired with the three fixed-channel routes; it is now a
+    // top-level import again for `source_deferred` (decision 63), so the
+    // tests take it from `super::*` rather than re-importing it.
+    use embarch_study_designer::{SampleLayout, StreamScope, Unit};
 
     fn tap(id: u8, name: &str, source: StreamSource, encoding: StreamEncoding) -> StreamTap {
         StreamTap {
@@ -887,6 +916,41 @@ mod tests {
         // which taps it declared.
         assert!(store.dir().join(INDEX_FILE).exists());
         assert!(!store.dir().join("power.bin").exists());
+    }
+
+    /// Decision 63's whole point: a tap declared against a source this bench
+    /// has no front end for must not read the same as a tap that was
+    /// declared correctly and simply produced nothing yet. Both start with
+    /// `bytes_written: 0` and no capture on disk — `source_deferred` is the
+    /// only thing that tells them apart, and it has to be set at
+    /// `create()`, before either tap has received a single byte.
+    #[test]
+    fn a_power_tap_says_source_deferred_and_an_empty_tap_of_another_source_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![
+            tap(0, "power", StreamSource::PowerFrontEnd { sample_hz: 1000 }, samples()),
+            tap(1, "gatt", StreamSource::GattTranscript, StreamEncoding::GattTranscript),
+        ];
+        let store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
+        let index = read_index(store.dir()).unwrap().unwrap();
+
+        assert_eq!(index.streams[0].source_deferred, Some(true));
+        assert!(
+            index.streams[0]
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("SOURCE DEFERRED") && n.contains("decision 24")),
+            "the note must say why, and cite the decision that deferred it"
+        );
+
+        // The gatt tap produced nothing either (neither tap has written a
+        // byte at this point), but its source is not deferred, so it must
+        // not carry the flag or the note — that is the exact confusion
+        // decision 63 exists to end.
+        assert_eq!(index.streams[1].source_deferred, None);
+        assert_eq!(index.streams[1].note, None);
+        assert_eq!(store.refs()[0].bytes_written, 0);
+        assert_eq!(store.refs()[1].bytes_written, 0);
     }
 
     #[test]
