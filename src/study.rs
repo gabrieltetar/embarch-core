@@ -83,7 +83,7 @@ pub type StudyLock = Arc<StdMutex<Option<String>>>;
 /// 64>` × `StepResult`'s own `gatt_activity` capacity), a value that's
 /// genuinely unsafe to clone by value on a normal thread stack, which is
 /// exactly what every `GET /study/{study_id}` call used to do
-/// (`embarch-study-designer` decision 63's stack-overflow finding). A
+/// (decision 24's stack-overflow finding). A
 /// completed study's actual result lives only in `events.json` on disk
 /// (written incrementally by [`EventsJsonWriter`] as each step arrives, not
 /// assembled from this struct) — [`get_study_handler`] reads it back from
@@ -137,10 +137,11 @@ pub struct StudyAcceptedResponse {
 
 /// One live event pushed to every subscriber of `GET /study/{study_id}/
 /// events` (SSE) the instant Core processes it off the dev-bench link —
-/// never buffered until the study finishes. Mirrors `embarch-topology`'s own
-/// durable-log-plus-live-push shape (`embarch-topology` decision 12: write
-/// it to disk *and* push it live if anyone's watching)
-/// applied here to study progress instead of a topology mismatch. Every
+/// never buffered until the study finishes. Mirrors the durable-first
+/// posture `embarch-topology` decision 12 takes toward a mismatch — record
+/// it the instant it happens, no loss to bad timing — applied here to study
+/// progress; unlike this SSE route, that crate's own live-push half is
+/// retired (`embarch-topology` decision 19). Every
 /// variant carries `study_id` so a subscriber that reconnects across studies
 /// can tell them apart, even though today only one study is ever in flight
 /// at a time (`StudyLock`).
@@ -563,8 +564,11 @@ fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study
     });
     // No subscribers is the common case (nobody's watching `/events` right
     // now) — `send` erroring just means that, not a real failure, so the
-    // result is intentionally discarded, same posture `embarch-topology`'s
-    // own live-push takes (`embarch-topology` decision 12).
+    // result is intentionally discarded. `embarch-topology` reached the same
+    // posture from the other direction: its own live-push half is retired
+    // (`embarch-topology` decision 19) because a subscriber that isn't there
+    // is exactly this — nothing lost, since the durable record already
+    // landed (decision 12).
     let _ = events_tx.send(StudyEvent::StatusChanged {
         study_id: study_id.to_string(),
         status: "failed".to_string(),
@@ -1346,7 +1350,7 @@ fn run_study_to_completion(
     // than accumulating them and assembling a `StudyResult` only at the
     // end — see `EventsJsonWriter`'s own doc comment for why that
     // accumulate-then-build step is exactly what used to overflow the
-    // stack (`embarch-study-designer` decision 63).
+    // stack (decision 24).
     let mut writer = match EventsJsonWriter::start(&results_dir, study.name.as_str(), &provenance) {
         Ok(w) => w,
         Err(e) => {
@@ -1905,8 +1909,10 @@ fn render_outpost_traces(
             entry.raw_file.strip_suffix(".bin").unwrap_or(&entry.raw_file)
         );
         let out_path = streams_dir.join(&rendered_name);
-        // Core's own receipt time per frame, written during the capture — the
-        // trace's only clock, since a record carries none of its own
+        // Core's own receipt time per frame, written during the capture —
+        // the clock that *places* the trace against another stream in the
+        // same study, since the DUT's own per-record `cycles` stamp only
+        // *measures* and has no sync point to anything else
         // (`embarch-outpost` decisions 4, 17, 18).
         let arrival_path = entry.arrival_file.as_ref().map(|f| streams_dir.join(f));
 
@@ -2525,7 +2531,7 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
     // Core's receipt time, not part of the wire type (decision 30), same
     // split `write_sample` uses. It is also the only wall-clock timestamp on
     // the row today: `rx_utc_ms` is dev-bench uptime until the clock-resync
-    // gap (`embarch-study-designer` decision 30) closes.
+    // gap (`embarch-study-designer` decision 72) closes.
     capture
         .store
         .lock()
@@ -2535,7 +2541,7 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
 
 /// Streams `events.json` to disk one `StepResult` at a time, as each
 /// arrives — the file is never assembled from a fully-materialized
-/// `StudyResult` held in memory. `embarch-study-designer` decision 63
+/// `StudyResult` held in memory. `embarch-study-designer` decision 49
 /// measured that type at **~1.3 MB**, purely from its `no_std` worst-case-
 /// capacity fields (`heapless::Vec<StepResult, 64>`, each `StepResult`
 /// itself carrying up to 32 `GattActivityRecord`s at up to 512 bytes each) —
@@ -2814,9 +2820,12 @@ async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
 /// [`StudyEvent`] is forwarded to a connected client the instant Core
 /// broadcasts it — a step completing, a sample batch arriving, or the
 /// study's own status changing — rather than requiring the client to poll
-/// and hope it didn't miss something in between. Mirrors `embarch-
-/// topology`'s own live-push shape (`embarch-topology` decision 12) applied here
-/// to study progress. Only one study is ever in flight at a time
+/// and hope it didn't miss something in between. `embarch-topology` once had
+/// the same shape for a mismatch and retired the live-push half
+/// (`embarch-topology` decision 19) once its only consumer, a now-deleted
+/// UI, stopped existing; this route has a real, connected consumer, which is
+/// the condition that decision's own reasoning turns on. Only one study is
+/// ever in flight at a time
 /// (`StudyLock`), so a single process-wide broadcast channel (`AppState::
 /// study_events`) is enough — no per-study subscription bookkeeping.
 ///
@@ -4208,7 +4217,7 @@ mod tests {
     }
 
     /// Regression test for the real stack overflow this streaming rework
-    /// fixes (`embarch-study-designer` decision 63): the old version of
+    /// fixes (`embarch-study-designer` decision 49): the old version of
     /// this test built a full `StudyResult` (~1.3 MB, all no_std worst-case
     /// capacity) and cloned a `StudyJob` holding one — both routinely
     /// overflowed a normal thread stack. `EventsJsonWriter` never
@@ -4549,7 +4558,7 @@ mod tests {
     fn a_raw_tap_writes_its_bytes_and_renders_nothing() {
         // No sniff, no heuristic, no "looks like text" fallback: `Raw` is
         // the honest default for a payload nobody declared a meaning for
-        // (`embarch-study-designer` decision 35).
+        // (`embarch-study-designer` decision 39).
         let dir = tempfile::tempdir().unwrap();
         let study = study_with_taps(
             &[1_000],
