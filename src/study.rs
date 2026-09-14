@@ -3195,6 +3195,79 @@ pub async fn stream_data_handler(
     serve_capture(&streams_dir, entry, query.wants_raw(), &format!("stream '{name}'")).await
 }
 
+/// One outpost tap's load repartition — per-subject shares and the coverage
+/// line — computed once here from the rendered CSV [`stream_data_handler`]
+/// would otherwise only serve as bytes for someone else to compute
+/// (`embarch-core` decision, `decisions/streams.md`; suite decision 4,
+/// `../../embarch-doc/suite/decisions.md`).
+///
+/// Only meaningful for a `StreamEncoding::OutpostTrace` tap — a `400` names
+/// the tap's real encoding rather than a caller guessing why the numbers
+/// came back empty. A tap that has not rendered (no manifest applied yet, or
+/// the render failed) is a `404` carrying the same reason
+/// `GET /study/{id}/streams`'s own `note` would.
+// route: GET /study/{study_id}/stream/{name}/load
+pub async fn stream_load_handler(
+    Path((study_id, name)): Path<(String, String)>,
+) -> Result<Json<crate::outpost_load::LoadAnswer>, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(&study_id)?;
+    let index = read_stream_index(&streams_dir)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "study '{study_id}' has no captured streams (it may predate streams/, or never \
+                 have started)"
+            ),
+        )
+    })?;
+
+    let entry = index.find(&name).ok_or_else(|| {
+        let declared: Vec<&str> = index.streams.iter().map(|e| e.name.as_str()).collect();
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "study '{study_id}' declares no stream tap named '{name}' — it declared: {}",
+                if declared.is_empty() { "(none)".to_string() } else { declared.join(", ") }
+            ),
+        )
+    })?;
+
+    if !matches!(entry.encoding, StreamEncoding::OutpostTrace) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "stream '{name}' is a {:?} tap, not an outpost trace — there is no timeline in it \
+                 to repartition",
+                entry.encoding
+            ),
+        ));
+    }
+    let Some(rendered) = entry.rendered_file.clone() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            match &entry.note {
+                Some(note) => format!("stream '{name}' has no rendered trace to load: {note}"),
+                None => format!("stream '{name}' has not been rendered yet"),
+            },
+        ));
+    };
+
+    let dir = streams_dir.clone();
+    let bytes = tokio::task::spawn_blocking(move || stream_store::read_capture(&dir, &rendered, true))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream '{name}' has no captured trace on disk")))?;
+    let csv = String::from_utf8(bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("stream '{name}''s rendered trace is not valid UTF-8: {e}"),
+        )
+    })?;
+
+    crate::outpost_load::load_answer(&csv).map(Json).map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))
+}
+
 fn streams_dir_for(study_id: &str) -> Result<PathBuf, (StatusCode, String)> {
     Ok(study_results_dir(study_id).map_err(internal_err)?.join(stream_store::STREAMS_DIR))
 }

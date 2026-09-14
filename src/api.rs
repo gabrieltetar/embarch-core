@@ -154,6 +154,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
         .route("/study/{study_id}/streams", get(study::stream_index_handler))
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
+        .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -1536,6 +1537,7 @@ mod tests {
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
         ("GET", "/study/{study_id}/streams", "/study/abc/streams"),
         ("GET", "/study/{study_id}/stream/{name}", "/study/abc/stream/power"),
+        ("GET", "/study/{study_id}/stream/{name}/load", "/study/abc/stream/power/load"),
     ];
 
     /// Every path `build_router` registers, read out of this file's own
@@ -1566,7 +1568,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 22;
+    const DOCUMENTED_ROUTE_COUNT: usize = 23;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
