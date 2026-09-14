@@ -2822,9 +2822,11 @@ async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
 /// study's own status changing — rather than requiring the client to poll
 /// and hope it didn't miss something in between. `embarch-topology` once had
 /// the same shape for a mismatch and retired the live-push half
-/// (`embarch-topology` decision 19) once its only consumer, a now-deleted
-/// UI, stopped existing; this route has a real, connected consumer, which is
-/// the condition that decision's own reasoning turns on. Only one study is
+/// (`embarch-topology` decision 19). **Do not read that retirement as a
+/// precedent for or against this route** — decision 19 turns on whether
+/// push's latency win is wanted for *that* signal, not on whether a
+/// consumer exists, and it declined to restore push even for a consumer
+/// that does exist. Only one study is
 /// ever in flight at a time
 /// (`StudyLock`), so a single process-wide broadcast channel (`AppState::
 /// study_events`) is enough — no per-study subscription bookkeeping.
