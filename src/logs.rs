@@ -18,7 +18,9 @@
 //! logfile, written before this session noticed Core already had a real,
 //! tested, daily-rotating one (7-file retention). This crate builds no
 //! second mechanism to match that description (see this crate's own
-//! decisions for the full account); `embarch-ui`'s own text is unchanged.
+//! decisions for the full account); `embarch-ui` decision 7's sentence
+//! itself still stands as the record of that proposal, but now carries a
+//! dated correction pointing at this crate's real mechanism (`ui/052`).
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
