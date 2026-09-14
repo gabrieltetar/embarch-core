@@ -14,11 +14,11 @@
 //!
 //! Reuses the existing daily-rolling logfile (`main.rs`'s `init_tracing`,
 //! decision 16) rather than introducing a second, size-capped log
-//! mechanism — `embarch-ui` decision 7 originally described a
-//! new size-capped rotating logfile, written before this session noticed
-//! Core already had a real, tested, daily-rotating one (7-file retention).
-//! That decision is corrected in place rather than building a redundant
-//! second mechanism (see this crate's own decisions for the full account).
+//! mechanism — `embarch-ui` decision 7 describes a size-capped rotating
+//! logfile, written before this session noticed Core already had a real,
+//! tested, daily-rotating one (7-file retention). This crate builds no
+//! second mechanism to match that description (see this crate's own
+//! decisions for the full account); `embarch-ui`'s own text is unchanged.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

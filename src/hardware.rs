@@ -139,7 +139,7 @@ fn resolved_serial(probe_serial: Option<&str>, action: &str) -> Result<String> {
 /// `base_address` is only meaningful for `format = "bin"` — a raw binary has
 /// no self-describing load address (unlike ELF/hex/uf2, and unlike `idf`,
 /// which builds its own bootloader+partition-table+app image from an ELF's
-/// ESP-IDF app-descriptor section, `embarch-dev-bench` decision 26). Zephyr's own ESP32 `west flash` merges bootloader+partition-
+/// ESP-IDF app-descriptor section, decision 18). Zephyr's own ESP32 `west flash` merges bootloader+partition-
 /// table+app into one flat image (its build already logs the merge address,
 /// e.g. `0x2000`) and writes it as one `esptool write-flash <addr> zephyr.bin`
 /// call — `Format::Idf` doesn't apply to that image at all (Zephyr doesn't

@@ -157,18 +157,20 @@ enum Command {
 /// The explicit 64 MiB `thread_stack_size` (applied to worker *and*
 /// `spawn_blocking` threads alike — Tokio's `Builder` doesn't distinguish)
 /// is a real fix, not a defensive default: `embarch-study-designer`
-/// decision 63 tracked a `Study`/`StepResult` stack-overflow risk from large
+/// decision 46 tracked a `Study`/`StepResult` stack-overflow risk from large
 /// fixed-capacity `heapless` types, previously reproduced only in debug
-/// builds and "confirmed release-build-safe" as of that doc's 2026-08-19/20
-/// finding. That confirmation didn't hold: the first real `run_study` POST
+/// builds and "confirmed release-build-safe" by that decision's own
+/// mitigation. That confirmation didn't hold: the first real `run_study` POST
 /// against this milestone's GATT-extended `StepResult` (`embarch-study-designer`
 /// decisions 31/32's
-/// `gatt_services`/`gatt_activity`, larger than anything sized when that
-/// finding was written) crashed the real, `--release` Windows service with
+/// `gatt_services`/`gatt_activity`, larger than anything sized when decision 46
+/// was written) crashed the real, `--release` Windows service with
 /// `STATUS_STACK_OVERFLOW` (0xc00000fd) — a first real release-build
 /// occurrence, on `run_study`'s `spawn_blocking(run_study_to_completion)`
 /// specifically (`study.rs`), not on a debug build's default `tokio-rt-worker`
-/// stack as `embarch-study-designer` decision 63 had only ever seen before. Matches the size
+/// stack as decision 46 had only ever seen before (`embarch-study-designer`
+/// decision 49 is where this crash and the 64 MiB figure are recorded on that
+/// side). Matches the size
 /// already known to clear it in tests (`RUST_MIN_STACK=67108864`) rather than
 /// picking a new number — made an explicit runtime setting here instead of
 /// an ambient env var, since a Windows service's environment isn't something
@@ -372,9 +374,9 @@ where
 /// matching file once an 8th day's worth exist, keeping the most recent 7 —
 /// this same file is what `GET /logs/recent` (`api.rs`)
 /// and `logs::read_recent` read, not a second,
-/// size-capped mechanism (`embarch-ui` decision 7, corrected in
-/// place once this crate's own decisions noted the daily-rolling file
-/// already existed).
+/// size-capped mechanism — `embarch-ui` decision 7 describes Core's
+/// retention that way, but this crate has only ever had the daily-rolling
+/// file above.
 fn build_log_file_writer() -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
     let log_dir = token_store::local_data_dir()?.join("logs");
     tracing_appender::rolling::Builder::new()
