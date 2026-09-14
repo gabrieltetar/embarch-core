@@ -135,7 +135,7 @@ pub fn signal_baud() -> u32 {
 /// `streams/index.json` — written once at study start, before a single byte
 /// has arrived, and never rewritten.
 ///
-/// **Why this exists at all**, since decision 30 didn't name it: it is the
+/// **Why this exists at all**, per decision 30: it is the
 /// name → file mapping `GET /study/{id}/stream/{name}` resolves through,
 /// answered from a handler that has no `Study` in hand — Core reads results
 /// back off disk, deliberately holding no resident copy of a finished study
@@ -438,12 +438,14 @@ struct TapFiles {
 /// Core's receipt time for each frame of an outpost capture, kept beside the
 /// raw bytes.
 ///
-/// **This is the trace's clock.** An outpost record carries no timestamp at
-/// all (`embarch-outpost` decision 4), so the only time a trace
-/// has is when Core received it — and the rendering happens *post-hoc*, from
-/// the complete raw file, long after the read that saw the bytes. Something
-/// has to carry the stamps across that gap, and this is it
-/// (`embarch-outpost` decision 18).
+/// **This is the trace's clock.** An outpost record's own stamp is the DUT's
+/// local `cycles` counter (`embarch-outpost` decision 4), which measures a
+/// span but cannot place it against anything outside the DUT itself — there
+/// is no sync point between that counter and a wall clock (`embarch-outpost`
+/// decision 17). So the only time this trace can be placed against is when
+/// Core received it — and the rendering happens *post-hoc*, from the complete
+/// raw file, long after the read that saw the bytes. Something has to carry
+/// the stamps across that gap, and this is it (`embarch-outpost` decision 18).
 ///
 /// **What a row is keyed by.** `frame_index` counts non-empty runs between
 /// `0x00` delimiters from the start of the capture — exactly what
