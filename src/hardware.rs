@@ -73,69 +73,54 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 /// `pub(crate)`, not just a private helper inside `open_probe` below:
 /// `resolved_serial` below also calls this, to get the serial
 /// `embarch_topology::hardware::validate_serial` (the board-identity gate,
-/// formerly this crate's own `board_gate.rs`) gates on — one selection
-/// rule behind both `open_probe`'s attach and the gate's serial lookup,
-/// shared within this crate rather than copied a second time in it. The
-/// gate's `enroll` counterpart moved into `embarch_topology` with its own,
-/// separately-written probe-selection code (`validate::enroll`) —
-/// `pub(crate)` cannot reach across the crate boundary the move created, so
-/// that side is now a copy, not a share: the same shape of drift this
-/// decision's own serial-number selector already suffered once, sitting
-/// silently unimplemented for months before anyone noticed (see decision
-/// 9's own text).
-pub(crate) fn resolve_probe(probe_serial: Option<&str>) -> Result<probe_rs::probe::DebugProbeInfo> {
+/// formerly this crate's own `board_gate.rs`) gates on.
+///
+/// **No longer this crate's own copy of the rule (decision 61).** Before
+/// decision 61, this function *was* the selection logic — `pub(crate)`
+/// couldn't reach the `enroll` counterpart decision 22 moved into
+/// `embarch_topology`, so that side re-implemented it independently and the
+/// two silently drifted (three concrete divergences by the time
+/// `embarch-topology` decision 33 looked: the zero-probe usbipd hint,
+/// `len() > 1` vs `len() != 1`, and every error string — see that decision).
+/// `embarch-topology` decision 33 reconciled the drift and exposed the
+/// result as `pub fn select_probe(probes, probe_serial, action)`
+/// specifically so this side could stop keeping a second copy; this
+/// function now just enumerates and delegates. `action` is threaded
+/// straight through from `flash`/`reset` (decision 61) so each keeps its
+/// own verb in the multi-probe refusal without either caller — or this
+/// function — keeping a second copy of the message.
+pub(crate) fn resolve_probe(
+    probe_serial: Option<&str>,
+    action: &str,
+) -> Result<probe_rs::probe::DebugProbeInfo> {
     let lister = Lister::new();
     let probes = lister.list_all();
-
-    if probes.is_empty() {
-        anyhow::bail!(
-            "no debug probe found — check the USB connection (and usbipd attach, if Core is \
-             on a Pi and the probe is elsewhere)"
-        );
-    }
-
-    if let Some(serial) = probe_serial {
-        return probes
-            .into_iter()
-            .find(|p| p.serial_number.as_deref() == Some(serial))
-            .with_context(|| {
-                format!("no attached probe has serial_number '{serial}'")
-            });
-    }
-
-    if probes.len() > 1 {
-        let known: Vec<String> = probes
-            .iter()
-            .map(|p| format!("{} (serial={:?})", p.identifier, p.serial_number))
-            .collect();
-        anyhow::bail!(
-            "more than one debug probe is attached and no probe_serial was given — pass one \
-             to disambiguate. Attached probes: {known:?}"
-        );
-    }
-
-    Ok(probes.into_iter().next().expect("checked non-empty above"))
+    embarch_topology::hardware::select_probe(probes, probe_serial, action)
 }
 
 /// Opens `probe_serial`'s probe if given, or the sole attached probe when
-/// omitted (`resolve_probe` above resolves which one; this just opens it).
-/// `embarch_topology::hardware::validate_serial` (the board-identity gate,
-/// formerly this crate's own `board_gate.rs`) opens the exact same probe
-/// again for its own gate-check attach, a separate connection from
-/// `flash`/`reset`'s own subsequent attach (`embarch-core` spec.md §2: probe attach is
-/// per-call, never held open across calls).
-pub(crate) fn open_probe(probe_serial: Option<&str>) -> Result<probe_rs::probe::Probe> {
-    resolve_probe(probe_serial)?.open().context("failed to open debug probe")
+/// omitted (`resolve_probe` above picks which one — by delegating to
+/// `embarch_topology::hardware::select_probe` as of decision 61, not by
+/// resolving it itself; this just opens what comes back). `action` is
+/// passed straight through to that shared rule (`resolve_probe`'s own doc
+/// comment). `embarch_topology::hardware::validate_serial` (the
+/// board-identity gate, formerly this crate's own `board_gate.rs`) opens
+/// the exact same probe again for its own gate-check attach, a separate
+/// connection from `flash`/`reset`'s own subsequent attach (`embarch-core`
+/// spec.md §2: probe attach is per-call, never held open across calls).
+pub(crate) fn open_probe(probe_serial: Option<&str>, action: &str) -> Result<probe_rs::probe::Probe> {
+    resolve_probe(probe_serial, action)?.open().context("failed to open debug probe")
 }
 
-/// Resolves which attached probe a call means (same rule as `open_probe`)
-/// and returns its USB serial number — what the board-identity gate
+/// Resolves which attached probe a call means (same rule as `open_probe`,
+/// delegated the same way as of decision 61) and returns its USB serial
+/// number — what the board-identity gate
 /// (`embarch_topology::hardware::validate_serial`) keys on. A probe with no
 /// serial number can't be gated at all, since enrollment itself has nothing
 /// to key on either (`embarch-topology`'s own `enroll` has the same
 /// requirement).
-fn resolved_serial(probe_serial: Option<&str>) -> Result<String> {
-    let info = resolve_probe(probe_serial)?;
+fn resolved_serial(probe_serial: Option<&str>, action: &str) -> Result<String> {
+    let info = resolve_probe(probe_serial, action)?;
     info.serial_number.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "the resolved probe ({}) reports no USB serial number — board-identity gating \
@@ -182,7 +167,7 @@ pub fn flash(
     probe_serial: Option<&str>,
     erase: bool,
 ) -> Result<()> {
-    let gated_serial = resolved_serial(probe_serial)?;
+    let gated_serial = resolved_serial(probe_serial, "flash")?;
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this flash")?;
 
@@ -202,14 +187,14 @@ pub fn flash(
         // and **drops it before spawning**, because the vendor tool claims the
         // same USB interface and two owners is a hang, not an error.
         {
-            let mut probe = open_probe(probe_serial)?;
+            let mut probe = open_probe(probe_serial, "flash")?;
             embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
         }
         return flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase);
     }
 
     let format = parse_format(format, base_address)?;
-    let mut probe = open_probe(probe_serial)?;
+    let mut probe = open_probe(probe_serial, "flash")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
 
     let mut session = probe
@@ -316,10 +301,10 @@ pub fn flash(
 /// boot-strap-pin re-sample decision 21 was written to provide; relying on
 /// `target_reset()` alone silently never did.
 pub fn reset(chip: &str, probe_serial: Option<&str>) -> Result<()> {
-    let gated_serial = resolved_serial(probe_serial)?;
+    let gated_serial = resolved_serial(probe_serial, "reset")?;
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this reset")?;
-    let mut probe = open_probe(probe_serial)?;
+    let mut probe = open_probe(probe_serial, "reset")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't reset")?;
 
     match probe.target_reset() {
