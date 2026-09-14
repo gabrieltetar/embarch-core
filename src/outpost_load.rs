@@ -806,6 +806,89 @@ mod tests {
         assert_eq!(answer.rows_unparsed, 1);
     }
 
+    // ---- three behaviours recovered from `embarch-ui`'s deleted
+    // ---- `load_summary_tests` module (`git show 87d01b4^:src/trace.rs` in
+    // ---- `embarch-ui`), whose only test they were before `ui/051` deleted it
+    // ---- once this arithmetic was ported here. Expectations below are taken
+    // ---- from that history, not re-derived from this file's own
+    // ---- implementation.
+
+    /// Ported from `load_summary_tests::overlapping_gap_bands_are_counted_as_a_union`.
+    /// Overlapping bands are counted once. Summing raw widths instead is the
+    /// bug that lets `gap_fraction` exceed 1.
+    #[test]
+    fn overlapping_gap_bands_are_counted_as_a_union() {
+        let gaps = vec![Gap { from: 100, to: 200 }, Gap { from: 150, to: 250 }, Gap { from: 400, to: 450 }];
+        // Union is 100..250 (150) plus 400..450 (50), not 100+100+50.
+        assert_eq!(merged_gap_extent(&gaps, 0, 1_000), 200);
+        // And it clamps to the window rather than counting outside it.
+        assert_eq!(merged_gap_extent(&gaps, 0, 120), 20);
+    }
+
+    /// Ported from `load_summary_tests::idle_is_not_counted_twice`. The
+    /// double count this design exists to avoid: idle is reported both by
+    /// `RecordKind::Idle` records (the `cpu-idle` lane) and by switches of
+    /// whatever thread the manifest itself names `idle`. The two must stay
+    /// apart, and the `cpu-idle` lane must never also appear as a `thread`
+    /// subject.
+    #[test]
+    fn idle_is_not_counted_twice() {
+        let csv = format!(
+            "{}\n\
+             0,0,,0,0,thread_switch_in,1,0,idle\n\
+             1,1,,50,50,thread_switch_out,1,0,idle\n\
+             2,2,,50,50,idle,0,0,\n\
+             3,3,,150,150,thread_switch_in,2,0,worker\n\
+             4,4,,200,200,thread_switch_out,2,0,worker\n",
+            header()
+        );
+        let answer = load_answer(&csv).unwrap();
+        let s = &answer.summary;
+        let idle_thread = s
+            .subjects
+            .iter()
+            .find(|x| x.kind == "thread" && x.label == "idle")
+            .expect("this capture's manifest names an idle thread");
+        assert!(idle_thread.total_extent > 0, "the idle thread ran and was measured");
+        assert!(
+            s.subjects.iter().any(|x| x.kind == "idle"),
+            "the idle *record* lane exists as its own subject"
+        );
+        assert!(
+            !s.subjects.iter().filter(|x| x.kind == "thread").any(|x| x.key == "cpu-idle"),
+            "the idle record lane leaked into the thread total"
+        );
+        // Exactly the two threads' 50 + 50, not the `cpu-idle` lane's 100
+        // folded in on top: a naive "threads plus idle" total would double
+        // this to 200.
+        assert_eq!(s.thread_extent, 100);
+        assert_eq!(s.idle_record_extent, 100);
+        assert!(s.thread_extent <= s.window_extent);
+    }
+
+    /// Ported from `load_summary_tests::subjects_are_sorted_by_measured_time`.
+    /// Sorted heaviest-first, so the load repartition reads as one.
+    #[test]
+    fn subjects_are_sorted_by_measured_time() {
+        let csv = format!(
+            "{}\n\
+             0,0,,0,0,thread_switch_in,1,0,a\n\
+             1,1,,30,30,thread_switch_out,1,0,a\n\
+             2,2,,30,30,thread_switch_in,2,0,b\n\
+             3,3,,130,130,thread_switch_out,2,0,b\n\
+             4,4,,130,130,thread_switch_in,3,0,c\n\
+             5,5,,175,175,thread_switch_out,3,0,c\n",
+            header()
+        );
+        let answer = load_answer(&csv).unwrap();
+        let totals: Vec<u64> = answer.summary.subjects.iter().map(|s| s.total_extent).collect();
+        let mut sorted = totals.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(totals, sorted);
+        // And it is a real order, not three equal totals passing vacuously.
+        assert_eq!(totals, vec![100, 45, 30]);
+    }
+
     // ---- against the same real firmware capture `outpost_manifest.rs` tests
     // ---- itself against — not a fixture built for this file alone.
 
