@@ -68,34 +68,40 @@ const IDLE_LANE: &str = "cpu-idle";
 /// interrupt vector. Carries only what [`summarize`] needs; the label
 /// bookkeeping, point events and browser-search indices `embarch-ui`'s own
 /// `Lane` carries alongside these are chart concerns and stay there.
-struct Lane {
-    key: String,
-    label: String,
-    unnamed: bool,
-    kind: &'static str,
-    spans: Vec<Span>,
+///
+/// `pub` and `Serialize` since `core/076`: this is also the wire shape
+/// `GET .../load/spans` serves, unchanged from what `summarize` already
+/// consumed — no second timeline type, per decision 65
+/// (`decisions/stream-index.md`).
+#[derive(Debug, Clone, Serialize)]
+pub struct Lane {
+    pub key: String,
+    pub label: String,
+    pub unnamed: bool,
+    pub kind: &'static str,
+    pub spans: Vec<Span>,
 }
 
 /// One interval a subject was running, in [`LoadSummary::unit`]s. Same shape
 /// and same four doubts as `embarch-ui/src/trace.rs`'s `Span` — see there for
 /// why each exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Span {
-    from: u64,
-    to: u64,
-    open_start: bool,
-    open_end: bool,
-    crosses_gap: bool,
-    below_resolution: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Span {
+    pub from: u64,
+    pub to: u64,
+    pub open_start: bool,
+    pub open_end: bool,
+    pub crosses_gap: bool,
+    pub below_resolution: bool,
 }
 
 /// Records the firmware itself reported dropping, and the interval they were
 /// lost somewhere inside. Same shape as `embarch-ui/src/trace.rs`'s `Gap` —
 /// see there for why the DUT and host clocks bound it so differently.
-#[derive(Debug, Clone, Copy)]
-struct Gap {
-    from: u64,
-    to: u64,
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Gap {
+    pub from: u64,
+    pub to: u64,
 }
 
 /// One traced subject's share of the capture window — the "load repartition"
@@ -153,6 +159,31 @@ pub struct LoadAnswer {
     /// `TraceView::rows_unparsed`.
     pub rows_unparsed: usize,
     pub summary: LoadSummary,
+}
+
+/// The decoded per-lane timeline [`load_answer`] builds and then discards
+/// once [`summarize`] reduces it — served directly by `GET
+/// .../load/spans` (`embarch-core` decision 65, `decisions/stream-index.md`)
+/// for a caller (`embarch-ui`'s Trace tab) that wants the spans themselves,
+/// not the repartition. Built from the same [`decode_with_cap`] call
+/// [`load_answer`] uses — this is not a second decode.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpansAnswer {
+    /// Same meaning as [`LoadSummary::unit`]: which clock draws the axis
+    /// `from`/`to` below are stamped in.
+    pub unit: &'static str,
+    /// The capture window's bounds, in `unit`s — [`Span::from`]/[`Span::to`]
+    /// and [`Gap::from`]/[`Gap::to`] are absolute against these, unlike
+    /// [`LoadSummary::window_extent`], which only carries their difference.
+    pub t_from: u64,
+    pub t_to: u64,
+    pub records_lost: u64,
+    pub rows: usize,
+    pub rows_dropped_by_cap: usize,
+    pub row_cap: usize,
+    pub rows_unparsed: usize,
+    pub gaps: Vec<Gap>,
+    pub lanes: Vec<Lane>,
 }
 
 fn kind_of(name: &str) -> Option<RecordKind> {
@@ -398,6 +429,60 @@ pub fn load_answer(csv: &str) -> Result<LoadAnswer, String> {
 /// [`load_answer`] with the row cap as a parameter, for tests that want to
 /// exercise the cap itself without a quarter-million-row fixture.
 fn load_answer_with_cap(csv: &str, cap: usize) -> Result<LoadAnswer, String> {
+    let d = decode_with_cap(csv, cap)?;
+    let summary = summarize(&d.lanes, &d.gaps, d.unit, d.t_from, d.t_to, d.records_lost);
+    Ok(LoadAnswer {
+        rows: d.rows,
+        rows_dropped_by_cap: d.rows_dropped_by_cap,
+        row_cap: cap,
+        rows_unparsed: d.rows_unparsed,
+        summary,
+    })
+}
+
+/// Computes [`SpansAnswer`] from the same rendered `*.trace.csv` — the
+/// decoded timeline [`load_answer`] discards after [`summarize`] reduces it,
+/// served here instead.
+pub fn spans_answer(csv: &str) -> Result<SpansAnswer, String> {
+    spans_answer_with_cap(csv, MAX_ROWS)
+}
+
+/// [`spans_answer`] with the row cap as a parameter, mirroring
+/// [`load_answer_with_cap`].
+fn spans_answer_with_cap(csv: &str, cap: usize) -> Result<SpansAnswer, String> {
+    let d = decode_with_cap(csv, cap)?;
+    Ok(SpansAnswer {
+        unit: d.unit,
+        t_from: d.t_from,
+        t_to: d.t_to,
+        records_lost: d.records_lost,
+        rows: d.rows,
+        rows_dropped_by_cap: d.rows_dropped_by_cap,
+        row_cap: cap,
+        rows_unparsed: d.rows_unparsed,
+        gaps: d.gaps,
+        lanes: d.lanes,
+    })
+}
+
+/// Everything [`load_answer`] and [`spans_answer`] both need: the CSV read,
+/// the stale-prefix and axis-unit decisions, gap extraction and lane
+/// construction — the one decode both response shapes are built from, so a
+/// wire-schema change to `RecordKind` or the five-lies rules only has to be
+/// made once here.
+struct Decoded {
+    rows: usize,
+    rows_dropped_by_cap: usize,
+    rows_unparsed: usize,
+    unit: &'static str,
+    t_from: u64,
+    t_to: u64,
+    records_lost: u64,
+    gaps: Vec<Gap>,
+    lanes: Vec<Lane>,
+}
+
+fn decode_with_cap(csv: &str, cap: usize) -> Result<Decoded, String> {
     let mut lines = csv.split('\n');
     let header = lines.next().unwrap_or_default().trim_end_matches('\r');
     if header != outpost::csv_header() {
@@ -698,9 +783,7 @@ fn load_answer_with_cap(csv: &str, cap: usize) -> Result<LoadAnswer, String> {
         }
     }
 
-    let summary = summarize(&lanes, &gaps, unit, t_from, t_to, records_lost);
-
-    Ok(LoadAnswer { rows: rows.len(), rows_dropped_by_cap, row_cap: cap, rows_unparsed, summary })
+    Ok(Decoded { rows: rows.len(), rows_dropped_by_cap, rows_unparsed, unit, t_from, t_to, records_lost, gaps, lanes })
 }
 
 #[cfg(test)]
@@ -942,5 +1025,104 @@ mod tests {
         );
         assert!(answer.summary.gap_extent > 0, "a capture with dropped records has a real gap band");
         assert!(answer.summary.gap_fraction > 0.0 && answer.summary.gap_fraction <= 1.0);
+    }
+
+    /// A single closed span, straight through [`spans_answer`] rather than
+    /// [`load_answer`]'s reduction of it — `core/076`'s own route.
+    #[test]
+    fn spans_answer_serves_the_closed_span_a_single_thread_left_behind() {
+        let csv = format!(
+            "{}\n0,0,,0,0,thread_switch_in,1,0,worker\n1,1,,100,100,thread_switch_out,1,0,worker\n",
+            header()
+        );
+        let answer = spans_answer(&csv).unwrap();
+        assert_eq!(answer.unit, "us");
+        assert_eq!(answer.t_from, 0);
+        assert_eq!(answer.t_to, 100);
+        assert!(answer.gaps.is_empty());
+        assert_eq!(answer.lanes.len(), 1);
+        let lane = &answer.lanes[0];
+        assert_eq!(lane.label, "worker");
+        assert!(!lane.unnamed);
+        assert_eq!(lane.kind, "thread");
+        assert_eq!(lane.spans, vec![Span {
+            from: 0,
+            to: 100,
+            open_start: false,
+            open_end: false,
+            crosses_gap: false,
+            below_resolution: false,
+        }]);
+    }
+
+    /// [`spans_answer`] and [`load_answer`] must agree on the same real
+    /// capture, because they are two views of one [`decode_with_cap`] call,
+    /// not two computations: every [`LoadSubject`] `summarize` produced must
+    /// be reconstructable from the [`Lane`] `spans_answer` served for the
+    /// same key — the exclusion rules ([`Span::crosses_gap`],
+    /// `open_start`/`open_end`, `below_resolution`) applied to the raw spans
+    /// must reduce to exactly the extent and counts `summarize` reported.
+    #[test]
+    fn spans_answer_and_load_answer_agree_on_the_same_real_capture() {
+        let manifest = crate::outpost_manifest::parse(include_str!(
+            "../tests/fixtures/outpost-native-sim-manifest.json"
+        ))
+        .expect("the real manifest parses");
+        let raw_bytes = include_bytes!("../tests/fixtures/outpost-native-sim.bin");
+
+        let dir = std::env::temp_dir().join(format!(
+            "embarch-core-outpost-spans-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw_path = dir.join("outpost.bin");
+        let out_path = dir.join("outpost.trace.csv");
+        std::fs::write(&raw_path, raw_bytes).unwrap();
+        crate::outpost_manifest::render(&raw_path, &out_path, None, Some(&manifest))
+            .expect("a real capture with its own manifest renders");
+        let csv = std::fs::read_to_string(&out_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let load = load_answer(&csv).expect("a real rendered trace parses via load_answer");
+        let spans = spans_answer(&csv).expect("the same rendered trace parses via spans_answer");
+
+        assert_eq!(spans.unit, load.summary.unit);
+        assert_eq!(spans.t_to.saturating_sub(spans.t_from), load.summary.window_extent);
+        assert_eq!(spans.records_lost, load.summary.records_lost);
+        assert_eq!(spans.rows, load.rows);
+        assert_eq!(spans.rows_dropped_by_cap, load.rows_dropped_by_cap);
+        assert_eq!(spans.rows_unparsed, load.rows_unparsed);
+        assert_eq!(spans.lanes.len(), load.summary.subjects.len(), "same lane count on both sides");
+
+        for subject in &load.summary.subjects {
+            let lane = spans
+                .lanes
+                .iter()
+                .find(|l| l.key == subject.key)
+                .unwrap_or_else(|| panic!("spans_answer must carry a lane for key {}", subject.key));
+            assert_eq!(lane.label, subject.label);
+            assert_eq!(lane.unnamed, subject.unnamed);
+            assert_eq!(lane.kind, subject.kind);
+            assert_eq!(lane.spans.len(), subject.entries);
+
+            let excluded = |s: &Span| s.crosses_gap || s.open_end || s.open_start || s.below_resolution;
+            let measured_extent: u64 =
+                lane.spans.iter().filter(|s| !excluded(s)).map(|s| s.to.saturating_sub(s.from)).sum();
+            assert_eq!(
+                measured_extent, subject.total_extent,
+                "reducing lane '{}'s own spans by the same exclusion rule must reproduce \
+                 summarize's total_extent",
+                subject.key
+            );
+            let measured_count = lane.spans.iter().filter(|s| !excluded(s)).count();
+            assert_eq!(measured_count, subject.measured_spans);
+            let crossing_count = lane.spans.iter().filter(|s| s.crosses_gap).count();
+            assert_eq!(crossing_count, subject.gap_crossing_spans);
+        }
+
+        // The gap bands themselves cross too, not only the per-lane counts —
+        // `summarize`'s `gap_extent` is a union of these same raw bands.
+        assert!(!spans.gaps.is_empty(), "the real capture's dropped records must show up as raw gap bands too");
     }
 }
