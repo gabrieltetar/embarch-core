@@ -10,17 +10,14 @@ license = "MIT"
 anyhow = "1.0.103"
 axum = { version = "0.8.9", features = ["multipart"] }
 clap = { version = "4.6.2", features = ["derive"] }
-# `core-validation` is the feature this crate's own Cargo.toml comments name
-# as the one component meant to enable it (SignalCheck evaluation,
-# `embarch-study-designer` decision 19) — study.rs doesn't call that evaluation
-# code yet (the self-test study it validates against has no `validations`),
-# but the feature costs nothing to turn on now and this is the intended place.
 # `std` (which implies `alloc`) is what Core needs from this crate: the
 # `gatt.csv`/`data.csv` rendering helpers (`GattTranscriptEntry::csv_header`,
 # `Sample::to_csv_row`) are std-gated, and `alloc` backs `Study.steps` with a
 # heap Vec (that crate's decision 46). Core used to reach `std` indirectly
-# via `core-validation = ["std"]`; that feature is gone with post-hoc
-# validation, so the dependency now says what it actually wants.
+# via `core-validation = ["std"]`; `embarch-study-designer` decision 19
+# retired that feature along with the rest of post-hoc validation (the
+# `SignalCheck` evaluation it would have run was never built), so the
+# dependency now says what it actually wants.
 embarch-study-designer = { path = "../embarch-study-designer", features = ["std"] }
 # study.rs constructs embarch-study-designer types' heapless::Vec fields
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
@@ -49,9 +46,12 @@ probe-rs = "0.31"
 rand = "0.10.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# `usbportinfo-interface` surfaces UsbPortInfo::interface, which dev_bench.rs
-# needs to tell two VCOM interfaces of one on-board J-Link apart
-# (`embarch-dev-bench` decision 12, spec.md §4).
+# `usbportinfo-interface` surfaces UsbPortInfo::interface, which
+# `embarch-topology`'s port detection (the code that used to be this
+# crate's own dev_bench.rs, before it moved wholesale) needs to tell two
+# VCOM interfaces of one on-board J-Link apart — `embarch-dev-bench`
+# decision 43, the nRF54L15DK's interface-2 VCOM1 fact, not decision 12
+# (that one is the VID-match rule, unrelated to interface index).
 serialport = { version = "4.9.0", features = ["usbportinfo-interface"] }
 service-manager = "0.11.0"
 tempfile = "3.24"
@@ -67,8 +67,17 @@ tokio = { version = "1.53.0", features = ["full"] }
 # pulling in all of `futures`.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# known_boards.toml (`decision 22`) — same version embarch-api
-# already pins, no reason for the two to drift.
+# Formerly for known_boards.toml. `decision 22` is real but is not about
+# this: it's the probe/board identity gate, and its own text says that
+# whole mechanism — table, storage, and the `toml` it was serialized
+# with — moved wholesale into `embarch-topology`. No decision anywhere
+# in this repo records a same-version-as-embarch-api pinning rule; that
+# was this comment's own claim, not a cited one. `embarch-topology`'s
+# `hardware` feature (enabled below) already depends on `toml` at the
+# same "1.1", and grep finds no `toml::` call left in this crate's own
+# src/ — this direct dependency looks vestigial from before the move,
+# kept rather than dropped here since removing it is a build change, not
+# a citation fix.
 toml = "1.1"
 tracing = "0.1.44"
 tracing-appender = "0.2"
