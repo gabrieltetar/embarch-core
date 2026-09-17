@@ -870,8 +870,9 @@ async fn open_and_handshake(
 /// second, dedicated USB-UART bridge chip: a plain UART bridge has no
 /// JTAG/SWD capability, so it can never be a `POST /probes/enroll` candidate
 /// and its serial can never be enrolled.
-/// `embarch_topology::hardware::validate_role` (formerly this crate's own
-/// `board_gate::enforce_for_role`) looks up dev-bench's already-enrolled
+/// `embarch_topology::hardware::validate_role` (decision 22; formerly this
+/// crate's own `board_gate::enforce_for_role`) looks up dev-bench's
+/// already-enrolled
 /// entry by role instead and re-verifies identity over its still-attached
 /// native USB/JTAG connection — the wire carrying `DevBenchMessage` traffic
 /// and the wire identity gets confirmed over no longer need to be the same
