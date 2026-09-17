@@ -902,10 +902,18 @@ async fn enforce_dev_bench_gate() -> Result<embarch_topology::hardware::Enrolled
 /// lead rather than in a status code. Before this, both rendered under the
 /// same `{e:?}` debug chain, a `topology-mismatch: ...` lead even for a
 /// probe that was simply unplugged.
+///
+/// **The `live_hardware_id.is_none()` lead no longer says "not attached"**
+/// — same fix as `api.rs`'s twin (`embarch-core` decision 59's second
+/// amendment, `core/077`): this arm now also covers `embarch-topology`
+/// decision 34's five stuck-mid-open failures, where the probe *was* found
+/// and opened partway. Saying "not attached" there would contradict
+/// `reason`'s own text; the lead stays neutral and lets `reason` carry the
+/// distinction, as it always has.
 fn describe_gate_error(e: anyhow::Error) -> String {
     match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
         Some(m) if m.live_hardware_id.is_none() => format!(
-            "probe not attached for role '{}' (probe {}, chip '{}'): {}",
+            "probe unavailable for role '{}' (probe {}, chip '{}'): {}",
             m.role, m.probe_serial, m.chip, m.reason
         ),
         Some(m) => format!(
@@ -5309,7 +5317,7 @@ mod tests {
             fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
         };
         let msg = describe_gate_error(anyhow::Error::new(not_attached));
-        assert!(msg.starts_with("probe not attached for role"), "got: {msg}");
+        assert!(msg.starts_with("probe unavailable for role"), "got: {msg}");
         assert!(!msg.contains("topology mismatch"), "got: {msg}");
 
         let mismatch = embarch_topology::hardware::TopologyMismatch {
@@ -5323,5 +5331,29 @@ mod tests {
         };
         let msg = describe_gate_error(anyhow::Error::new(mismatch));
         assert!(msg.starts_with("topology mismatch for role"), "got: {msg}");
+    }
+
+    /// `core/077`: the dev-bench gate's own copy of the same regression
+    /// guard as `api.rs` — a stuck-mid-open probe (`embarch-topology`
+    /// decision 34) still has `live_hardware_id: None`, so it must not get
+    /// the "topology mismatch" lead, and its lead must not claim "not
+    /// attached" when `reason` says the probe *is* attached.
+    #[test]
+    fn dev_bench_gate_stuck_mid_open_lead_does_not_contradict_reason() {
+        let stuck = embarch_topology::hardware::TopologyMismatch {
+            role: "dev-bench".to_string(),
+            probe_serial: "001057729826".to_string(),
+            chip: "nRF54L15".to_string(),
+            recorded_hardware_id: "6fcddc36cb781b71".to_string(),
+            live_hardware_id: None,
+            reason: "probe '001057729826' enrolled as role 'dev-bench' opened but failed to \
+                      attach to chip 'nRF54L15' (some probe-rs error)"
+                .to_string(),
+            fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
+        };
+        let msg = describe_gate_error(anyhow::Error::new(stuck));
+        assert!(!msg.starts_with("probe not attached"), "lead must not contradict reason: {msg}");
+        assert!(!msg.contains("topology mismatch"), "got: {msg}");
+        assert!(msg.contains("opened but failed to attach"), "got: {msg}");
     }
 }

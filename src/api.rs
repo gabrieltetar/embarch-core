@@ -198,12 +198,26 @@ pub(crate) fn internal_err<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
 /// `topology-mismatch: ...` lead via `{e:?}`'s debug chain. Returns the text
 /// unchanged (via `internal_err`'s own `{e:?}` formatting) for any other
 /// error — only a genuine `TopologyMismatch` gets a distinguishing lead.
+///
+/// **The `live_hardware_id.is_none()` lead no longer says "not attached"**
+/// (`embarch-core` decision 59's second amendment, `core/077`): as of
+/// `embarch-topology` decision 34, this arm also carries five failures where
+/// the probe *was* found and opened partway — `.open()` itself, the
+/// target-power check, `.attach()`, core-select, and the hardware-ID read —
+/// each already `None` here for the same reason the truly-absent case is
+/// (nothing was ever compared to disagree with). Asserting "not attached"
+/// on those would contradict `reason`'s own text ("... is attached but
+/// could not be opened ..."), so the lead is now neutral about attachment
+/// and lets `reason` — which already names the specific failing step —
+/// carry the distinction, same as it always has for a human reading the
+/// full message. It is still never `"mismatch"`'s `topology mismatch`
+/// wording: that lead is reserved for a live ID actually read and disagreed.
 pub(crate) fn describe_topology_error(e: anyhow::Error) -> (StatusCode, String) {
     match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
         Some(m) if m.live_hardware_id.is_none() => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "probe not attached for role '{}' (probe {}, chip '{}'): {}",
+                "probe unavailable for role '{}' (probe {}, chip '{}'): {}",
                 m.role, m.probe_serial, m.chip, m.reason
             ),
         ),
@@ -1020,6 +1034,28 @@ struct ValidateOkResponse {
 /// reading to the end of the sentence. `fix_it_url` is only meaningful for
 /// `"mismatch"` — the fix for a detached probe is a USB cable, not the
 /// Topology tab — so it is `None` on the `"not_attached"` arm.
+///
+/// **`"not_attached"` is deliberately still one value, not three, as of
+/// `embarch-topology` decision 34 (`core/077`, considered and declined).**
+/// That decision routed five more failure points — probe-open,
+/// target-power, attach, core-select, hardware-ID-read — through the same
+/// `raise()` path, each with `live_hardware_id: None`, so this arm now also
+/// covers "the enrolled probe is physically attached but something failed
+/// before a live ID could even be read," not only "not currently attached at
+/// all." Both a real absence and a stuck-mid-open probe route to the exact
+/// same downstream handling this comment already describes — neither is an
+/// identity mismatch, both are non-destructive and worth retrying, and
+/// `.claude/leg.md`'s "leave the task open" side, not its "alert a human"
+/// side, applies to every one of the six causes. A fourth-of-a-kind
+/// distinction (unplugged vs. busy/permission-denied vs. unpowered vs. wrong
+/// chip name vs. …) would need a wire change here plus consumers in
+/// `embarch-api`, `embarch-ui` and the user guide, for a set of causes that
+/// already differ, in full, in `reason`'s own text — which every plain-text
+/// path already relays verbatim and no caller in this suite currently
+/// branches on structurally. See `decisions/surfaces.md` decision 59's
+/// second amendment for the full reasoning and the one concrete gap this
+/// left (`embarch-api`'s own "plug it in" phrasing), filed to that crate's
+/// inbox rather than fixed here.
 #[derive(Serialize)]
 struct ValidateMismatchResponse {
     ok: bool,
@@ -2050,12 +2086,46 @@ mod tests {
         let not_attached = anyhow::Error::new(sample_mismatch(None));
         let (status, msg) = describe_topology_error(not_attached);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(msg.starts_with("probe not attached for role"), "got: {msg}");
+        assert!(msg.starts_with("probe unavailable for role"), "got: {msg}");
         assert!(!msg.contains("topology mismatch"), "got: {msg}");
 
         let mismatch = anyhow::Error::new(sample_mismatch(Some("deadbeefdeadbeef".to_string())));
         let (status, msg) = describe_topology_error(mismatch);
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(msg.starts_with("topology mismatch for role"), "got: {msg}");
+    }
+
+    /// `core/077`: a probe found but stuck partway through opening it
+    /// (`embarch-topology` decision 34's five new `raise()` sites) sets
+    /// `live_hardware_id: None` exactly like true not-attached, so it must
+    /// classify identically — `kind: "not_attached"`, `503`, no
+    /// `fix_it_url` — and the plain-text lead must not claim "not attached"
+    /// when `reason` says the probe *is* attached. This is the regression
+    /// this task's own decision guards against: a lead that contradicts its
+    /// own reason text.
+    #[test]
+    fn a_stuck_mid_open_probe_classifies_as_not_attached_without_contradicting_reason() {
+        let stuck = embarch_topology::hardware::TopologyMismatch {
+            role: "dev-bench".to_string(),
+            probe_serial: "001057729826".to_string(),
+            chip: "nRF54L15".to_string(),
+            recorded_hardware_id: "6fcddc36cb781b71".to_string(),
+            live_hardware_id: None,
+            reason: "probe '001057729826' enrolled as role 'dev-bench' is attached but could not \
+                      be opened (permission denied) — another process may be holding it, the OS \
+                      may be denying permission, or it may be a half-wedged debug probe; close \
+                      other tools that might have it open, or unplug and replug it, then retry"
+                .to_string(),
+            fix_it_url: "http://127.0.0.1:4890/#topology".to_string(),
+        };
+        let (status, kind, fix_it_url) = classify_topology_mismatch(&stuck);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(kind, "not_attached");
+        assert_eq!(fix_it_url, None);
+
+        let (status, msg) = describe_topology_error(anyhow::Error::new(stuck));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!msg.starts_with("probe not attached"), "lead must not contradict reason: {msg}");
+        assert!(msg.contains("is attached but could not be opened"), "got: {msg}");
     }
 }
