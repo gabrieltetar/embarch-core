@@ -149,9 +149,13 @@ fn resolved_serial(probe_serial: Option<&str>, action: &str) -> Result<String> {
 /// symbols — no `esp_app_desc` symbol, no `.flash.appdesc` section). `bin` at
 /// the same merge address `west flash` would have used is the mechanism that
 /// actually matches what Zephyr already produces.
-/// `erase` requests a **full chip erase** before writing, rather than erasing
-/// only the sectors the image covers (probe-rs's default, and what
-/// `download_file` alone does).
+/// `erase` requests an erase before writing, rather than only the sectors the
+/// image covers (probe-rs's default, and what `download_file` alone does) —
+/// **deliberately never a full chip erase** (decision 32: that bricked a real
+/// board). On this function's probe-rs path (below) that means every region
+/// the target declares as NVM; when `flash_backend::discover` below routes
+/// to a vendor tool instead (decision 36), that tool's own non-chip-erase
+/// mode is what runs, not this function's own erase logic at all.
 ///
 /// Added 2026-08-25 for the same reason `west flash --erase` exists: a
 /// sector-erase flash leaves every region the new image doesn't cover exactly
