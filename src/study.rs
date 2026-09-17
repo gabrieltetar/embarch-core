@@ -3229,7 +3229,38 @@ pub async fn stream_data_handler(
 pub async fn stream_load_handler(
     Path((study_id, name)): Path<(String, String)>,
 ) -> Result<Json<crate::outpost_load::LoadAnswer>, (StatusCode, String)> {
-    let streams_dir = streams_dir_for(&study_id)?;
+    let csv = rendered_outpost_csv(&study_id, &name, "repartition").await?;
+    crate::outpost_load::load_answer(&csv).map(Json).map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))
+}
+
+/// The same tap's decoded per-lane spans [`stream_load_handler`] reduces into
+/// a [`crate::outpost_load::LoadSummary`] and then discards — served here
+/// instead, for a caller (`embarch-ui`'s Trace tab) that wants the timeline
+/// itself rather than the repartition (`embarch-core` decision 65,
+/// `decisions/stream-index.md`; `embarch-core` decision 64 decided this
+/// should ship at all).
+///
+/// Additive: `GET .../load` keeps serving exactly the `LoadSummary` it served
+/// before this route existed. Same tap-resolution and error handling as
+/// [`stream_load_handler`] (shared via [`rendered_outpost_csv`]) — only the
+/// final decode call differs, and `outpost_load`'s internal decode is reused
+/// between the two, not duplicated.
+// route: GET /study/{study_id}/stream/{name}/load/spans
+pub async fn stream_load_spans_handler(
+    Path((study_id, name)): Path<(String, String)>,
+) -> Result<Json<crate::outpost_load::SpansAnswer>, (StatusCode, String)> {
+    let csv = rendered_outpost_csv(&study_id, &name, "serve").await?;
+    crate::outpost_load::spans_answer(&csv).map(Json).map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))
+}
+
+/// Resolves `name` to a rendered outpost-trace CSV for `study_id`, exactly as
+/// [`stream_load_handler`] always has — shared so the `/load` and
+/// `/load/spans` routes agree on tap resolution and error text and only
+/// differ in which `outpost_load` function they hand the CSV to. `verb` names
+/// what the caller wanted the timeline for, in the `400` a non-trace tap
+/// gets (`"repartition"` or `"serve"`).
+async fn rendered_outpost_csv(study_id: &str, name: &str, verb: &str) -> Result<String, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(study_id)?;
     let index = read_stream_index(&streams_dir)?.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -3240,7 +3271,7 @@ pub async fn stream_load_handler(
         )
     })?;
 
-    let entry = index.find(&name).ok_or_else(|| {
+    let entry = index.find(name).ok_or_else(|| {
         let declared: Vec<&str> = index.streams.iter().map(|e| e.name.as_str()).collect();
         (
             StatusCode::NOT_FOUND,
@@ -3256,7 +3287,7 @@ pub async fn stream_load_handler(
             StatusCode::BAD_REQUEST,
             format!(
                 "stream '{name}' is a {:?} tap, not an outpost trace — there is no timeline in it \
-                 to repartition",
+                 to {verb}",
                 entry.encoding
             ),
         ));
@@ -3277,14 +3308,12 @@ pub async fn stream_load_handler(
         .map_err(internal_err)?
         .map_err(internal_err)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream '{name}' has no captured trace on disk")))?;
-    let csv = String::from_utf8(bytes).map_err(|e| {
+    String::from_utf8(bytes).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("stream '{name}''s rendered trace is not valid UTF-8: {e}"),
         )
-    })?;
-
-    crate::outpost_load::load_answer(&csv).map(Json).map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))
+    })
 }
 
 fn streams_dir_for(study_id: &str) -> Result<PathBuf, (StatusCode, String)> {
