@@ -292,9 +292,10 @@ struct FlashRequest {
     /// now a named `500` rather than a silent, possibly-wrong pick.
     #[serde(default)]
     probe_serial: Option<String>,
-    /// Full chip erase before writing, rather than erasing only the sectors
-    /// the image covers (`hardware::flash`'s own doc comment has why that
-    /// distinction matters). The equivalent of `west flash --erase`.
+    /// An erase before writing, rather than erasing only the sectors the
+    /// image covers — never a full chip erase (`hardware::flash`'s own doc
+    /// comment has why that distinction matters). The equivalent of
+    /// `west flash --erase`.
     /// Defaults to `false` — the previous behavior, so an existing caller
     /// that omits it is unaffected.
     #[serde(default)]
