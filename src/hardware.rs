@@ -73,7 +73,7 @@ fn parse_format(format: &str, base_address: Option<u64>) -> Result<Format> {
 /// `pub(crate)`, not just a private helper inside `open_probe` below:
 /// `resolved_serial` below also calls this, to get the serial
 /// `embarch_topology::hardware::validate_serial` (the board-identity gate,
-/// formerly this crate's own `board_gate.rs`) gates on.
+/// decision 22; formerly this crate's own `board_gate.rs`) gates on.
 ///
 /// **No longer this crate's own copy of the rule (decision 61).** Before
 /// decision 61, this function *was* the selection logic — `pub(crate)`
@@ -104,8 +104,9 @@ pub(crate) fn resolve_probe(
 /// resolving it itself; this just opens what comes back). `action` is
 /// passed straight through to that shared rule (`resolve_probe`'s own doc
 /// comment). `embarch_topology::hardware::validate_serial` (the
-/// board-identity gate, formerly this crate's own `board_gate.rs`) opens
-/// the exact same probe again for its own gate-check attach, a separate
+/// board-identity gate, decision 22; formerly this crate's own
+/// `board_gate.rs`) opens the exact same probe again for its own gate-check
+/// attach, a separate
 /// connection from `flash`/`reset`'s own subsequent attach (`embarch-core`
 /// spec.md §2: probe attach is per-call, never held open across calls).
 pub(crate) fn open_probe(probe_serial: Option<&str>, action: &str) -> Result<probe_rs::probe::Probe> {
