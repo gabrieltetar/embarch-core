@@ -10,8 +10,8 @@
 //! ported from `embarch-ui/src/trace.rs`'s `parse`/`parse_with_cap` and
 //! `summarize` — the CSV-to-timeline-to-repartition arithmetic — **not**
 //! `embarch-ui`'s chart geometry: windowed binning and the `TraceView`
-//! payload shape stay there per that file's own decision 18, and the
-//! study-step row stays there per decision 10's chart half — neither is
+//! payload shape stay there per `embarch-ui` decision 18, and the study-step
+//! row stays there per `embarch-ui` decision 10's chart half — neither is
 //! reopened by this move.
 //!
 //! **This is deliberately not a second decoder.** Core already owns the one
