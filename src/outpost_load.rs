@@ -96,12 +96,29 @@ pub struct Span {
 }
 
 /// Records the firmware itself reported dropping, and the interval they were
-/// lost somewhere inside. Same shape as `embarch-ui/src/trace.rs`'s `Gap` —
-/// see there for why the DUT and host clocks bound it so differently.
+/// lost somewhere inside. Full parity with `embarch-ui/src/trace.rs`'s own
+/// `Gap` since `embarch-core` decision 66 (`decisions/stream-index.md`) — see
+/// there for why the DUT and host clocks bound `from`/`to` so differently, and
+/// for each of the fields below.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Gap {
     pub from: u64,
     pub to: u64,
+    pub records_lost: u32,
+    /// The firmware's own cycle span between the first and last dropped
+    /// record (`OUTPOST_KIND_GAP`'s `b`). Carried, not drawn — see
+    /// `trace.rs`'s own field for why converting it would introduce a
+    /// rounding error this struct exists to avoid.
+    pub cycle_span: u32,
+    pub frame_index: u64,
+    /// This gap's position in the rendered CSV's row order (post-header),
+    /// not its frame — a caller wanting a specific line back needs this,
+    /// `frame_index` alone is not enough where one frame carries several rows.
+    pub row_index: usize,
+    /// `from == to` and the extent is genuinely unknown, not zero — only
+    /// reachable for the capture's first record-carrying frame, which has no
+    /// earlier arrival to bound it with.
+    pub unbounded_start: bool,
 }
 
 /// One traced subject's share of the capture window — the "load repartition"
@@ -580,23 +597,31 @@ fn decode_with_cap(csv: &str, cap: usize) -> Result<Decoded, String> {
     // pair switch-ins against.
     let mut gaps: Vec<Gap> = Vec::new();
     let mut records_lost = 0u64;
-    for r in rows.iter() {
+    for (i, r) in rows.iter().enumerate() {
         if r.kind != Some(RecordKind::Gap) {
             continue;
         }
         records_lost += u64::from(r.a);
-        let (from, to) = if unit == "us" {
+        let (from, to, unbounded_start) = if unit == "us" {
             let span_us = match (r.dut_cycles, r.dut_us) {
                 (Some(c), Some(u)) if c > 0 => ((f64::from(r.b) * (u as f64) / (c as f64)).round()) as u64,
                 _ => 0,
             };
-            (r.t, r.t.saturating_add(span_us))
+            (r.t, r.t.saturating_add(span_us), span_us == 0 && r.b > 0)
         } else {
             let pos = frame_pos.get(&r.frame_index).copied().unwrap_or(0);
             let from = if pos == 0 { r.t } else { frame_order[pos - 1].1 };
-            (from, r.t)
+            (from, r.t, pos == 0)
         };
-        gaps.push(Gap { from, to });
+        gaps.push(Gap {
+            from,
+            to,
+            records_lost: r.a,
+            cycle_span: r.b,
+            frame_index: r.frame_index,
+            row_index: i,
+            unbounded_start,
+        });
     }
     gaps.sort_by_key(|g| g.from);
 
@@ -794,6 +819,12 @@ mod tests {
         outpost::csv_header()
     }
 
+    /// A `Gap` with only `from`/`to` set, for tests that exercise band
+    /// merging and do not care about the firmware-reported fields.
+    fn test_gap(from: u64, to: u64) -> Gap {
+        Gap { from, to, records_lost: 0, cycle_span: 0, frame_index: 0, row_index: 0, unbounded_start: false }
+    }
+
     #[test]
     fn a_mismatched_column_list_is_refused_not_guessed() {
         let csv = "frame_index,kind,a,b,name\n0,thread_switch_in,1,0,\n";
@@ -902,7 +933,7 @@ mod tests {
     /// bug that lets `gap_fraction` exceed 1.
     #[test]
     fn overlapping_gap_bands_are_counted_as_a_union() {
-        let gaps = vec![Gap { from: 100, to: 200 }, Gap { from: 150, to: 250 }, Gap { from: 400, to: 450 }];
+        let gaps = vec![test_gap(100, 200), test_gap(150, 250), test_gap(400, 450)];
         // Union is 100..250 (150) plus 400..450 (50), not 100+100+50.
         assert_eq!(merged_gap_extent(&gaps, 0, 1_000), 200);
         // And it clamps to the window rather than counting outside it.
@@ -1053,6 +1084,29 @@ mod tests {
             crosses_gap: false,
             below_resolution: false,
         }]);
+    }
+
+    /// `Gap`'s firmware-reported fields (`records_lost`, `cycle_span`,
+    /// `frame_index`, `row_index`) must all come through `spans_answer`, not
+    /// just `from`/`to` — decision 66's widening, checked field-for-field the
+    /// way `tasks/ui/065` checked this route against `trace.rs`'s own `Gap`.
+    #[test]
+    fn spans_answer_carries_the_gap_records_lost_cycle_span_and_position() {
+        let csv = format!(
+            "{}\n\
+             0,0,,0,0,thread_switch_in,1,0,worker\n\
+             1,1,,100,100,gap,5,50,\n\
+             2,2,,200,200,thread_switch_out,1,0,worker\n",
+            header()
+        );
+        let answer = spans_answer(&csv).unwrap();
+        assert_eq!(answer.gaps.len(), 1);
+        let gap = &answer.gaps[0];
+        assert_eq!(gap.records_lost, 5);
+        assert_eq!(gap.cycle_span, 50);
+        assert_eq!(gap.frame_index, 1);
+        assert_eq!(gap.row_index, 1, "the gap's own row, not its frame");
+        assert!(!gap.unbounded_start, "both ends measured off the row's own cycles/us ratio");
     }
 
     /// [`spans_answer`] and [`load_answer`] must agree on the same real
