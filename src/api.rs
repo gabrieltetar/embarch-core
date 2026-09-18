@@ -155,6 +155,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
         .route("/study/{study_id}/streams", get(study::stream_index_handler))
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
+        .route("/study/{study_id}/stream/{name}/arrivals", get(study::stream_arrivals_handler))
         .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
         .route("/study/{study_id}/stream/{name}/load/spans", get(study::stream_load_spans_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -1605,6 +1606,7 @@ mod tests {
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
         ("GET", "/study/{study_id}/streams", "/study/abc/streams"),
         ("GET", "/study/{study_id}/stream/{name}", "/study/abc/stream/power"),
+        ("GET", "/study/{study_id}/stream/{name}/arrivals", "/study/abc/stream/power/arrivals"),
         ("GET", "/study/{study_id}/stream/{name}/load", "/study/abc/stream/power/load"),
         ("GET", "/study/{study_id}/stream/{name}/load/spans", "/study/abc/stream/power/load/spans"),
     ];
@@ -1637,7 +1639,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 25;
+    const DOCUMENTED_ROUTE_COUNT: usize = 26;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
