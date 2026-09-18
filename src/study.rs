@@ -160,7 +160,25 @@ pub enum StudyEvent {
     /// point of boxing here is keeping `StudyEvent` itself small to move
     /// around and clone, not avoiding a stack overflow the way the fields
     /// this whole rework removed from `StudyJob` did.
-    StepCompleted { study_id: String, step_index: u32, result: Box<StepResult> },
+    /// with the three values the step's `events.json` row already carries.
+    ///
+    /// **A pure omission, corrected.** All three are live locals one statement
+    /// above this send, already being written to `events.json` by the
+    /// `write_step` call immediately before it — so a subscriber watching a
+    /// study live could render everything about a step except *when* it
+    /// happened, and had to wait for the run to end and re-read the record to
+    /// place it. No new clock and no new measurement: `started_utc_ms` is when
+    /// Core started waiting for this step and `ended_utc_ms` when its
+    /// `StepResult` arrived, both `current_utc_ms()`, and `delay_before_ms` is
+    /// the study's own declared delay, which falls **inside** that window.
+    StepCompleted {
+        study_id: String,
+        step_index: u32,
+        result: Box<StepResult>,
+        started_utc_ms: u64,
+        ended_utc_ms: u64,
+        delay_before_ms: u32,
+    },
     /// One batch of power/waveform samples, pushed the instant Core decodes
     /// it off the wire — the same samples [`write_sample`] is appending to
     /// `data.csv`/`waveform.csv` in the same pass, not held back until the
@@ -169,12 +187,38 @@ pub enum StudyEvent {
     /// Keyed by the tap that produced them (`stream_id` is its index in
     /// `Study.streams`, `stream_name` its declared name) rather than by the
     /// retired `StreamChannel` — `embarch-study-designer` decision 39.
-    SampleBatch { study_id: String, stream_id: u8, stream_name: String, samples: Vec<Sample> },
+    ///
+    /// `core_rx_utc_ms` is Core's own receipt time for the record these
+    /// samples came out of — the same column `write_sample` appends to each
+    /// row. A `Sample`'s own `rx_utc_ms` is dev-bench uptime on a
+    /// bench-mediated tap, so it is not a clock a subscriber can lay this
+    /// batch against anything else on; this one is.
+    SampleBatch {
+        study_id: String,
+        stream_id: u8,
+        stream_name: String,
+        samples: Vec<Sample>,
+        core_rx_utc_ms: u64,
+    },
     /// One GATT transcript entry, pushed the instant Core decodes it off the
     /// wire — the same entry [`write_transcript_entry`] is appending to
     /// `gatt.csv` in the same pass (`embarch-study-designer` decision 36). Boxed for the same reason `StepCompleted` is: a
     /// `MAX_PAYLOAD_LEN` payload would otherwise set this whole enum's size.
-    GattTranscript { study_id: String, step_index: u32, entry: Box<GattTranscriptEntry> },
+    ///
+    /// **`core_rx_utc_ms` is carried and `entry.rx_utc_ms` keeps its name.**
+    /// The two are different clocks under one word: the entry's own is
+    /// dev-bench uptime (`embarch-study-designer` decision 72) and this one is
+    /// Core's real epoch clock, the same value `write_transcript_entry`
+    /// appends to `gatt.csv`'s last column. It was computed and thrown away
+    /// until 2026-09-18, which left a live subscriber with no clock it could
+    /// lay this entry against anything else on. Suite decision 3 declined the
+    /// rename, so both travel, both named as what they are.
+    GattTranscript {
+        study_id: String,
+        step_index: u32,
+        entry: Box<GattTranscriptEntry>,
+        core_rx_utc_ms: u64,
+    },
     /// One chunk off a `Text`-encoded tap, pushed the instant Core reads it
     /// off the wire — the same bytes [`write_stream_record`]'s raw write
     /// just appended to the tap's `.txt` file, which for `Text` *is* the
@@ -194,13 +238,58 @@ pub enum StudyEvent {
     /// **`Raw` deliberately gets no event of its own.** A console of hex is
     /// noise and nothing has asked for one — this is a decision, not an
     /// oversight.
+    /// `core_rx_utc_ms` is Core's own receipt time for this chunk, beside the
+    /// record's own `rx_utc_ms` — which on a bench-mediated tap is dev-bench
+    /// uptime and on the reserved `dev-bench` log tap is already Core's. Two
+    /// fields because the caller cannot tell which tap it is looking at from
+    /// the event, and guessing is the confusion suite decision 3 named.
     StreamText {
         study_id: String,
         stream_id: u8,
         stream_name: String,
         step_index: u32,
         rx_utc_ms: u64,
+        core_rx_utc_ms: u64,
         text: String,
+    },
+    /// One frame of an `OutpostTrace` tap, **decoded and pushed as it
+    /// arrives** — `embarch-outpost` decision 10 reversed.
+    ///
+    /// That decision made an outpost capture study-scoped with no live feed and
+    /// priced a live one exactly: a decode-and-push path in Core, an SSE
+    /// channel, and a renderer that can draw a partial timeline. This is the
+    /// first of the three.
+    ///
+    /// **`rows` are CSV lines in [`embarch_study_designer::outpost::csv_header`]'s
+    /// own shape**, not a struct. The consumer already parses those nine
+    /// positional fields to read a rendered capture, so pushing the same shape
+    /// means live and post-hoc decode through literally the same function on
+    /// the other side rather than through two implementations of a column order
+    /// that belongs to `embarch-study-designer`.
+    ///
+    /// **The post-hoc render still runs and stays authoritative.** It has a
+    /// whole-capture header pre-pass, the stale-prefix drop over everything, and
+    /// the verified arrival join — none of which a live path can have. See
+    /// [`crate::outpost_manifest::LiveDecoder`] for what the two agree on
+    /// exactly (`frame_index`) and where they differ.
+    ///
+    /// `header_seen: false` means this frame was decoded before any header
+    /// frame had arrived, so its rows carry an empty `us` and an empty `name` —
+    /// not because the capture has no header, but because it had not arrived
+    /// yet. A header frame itself pushes with an empty `rows`, so a consumer
+    /// learns the tier improved at the instant it did.
+    OutpostRows {
+        study_id: String,
+        stream_id: u8,
+        stream_name: String,
+        frame_index: u64,
+        frame_seq: u32,
+        /// embarch-core's own receipt time for the read this frame completed
+        /// in — the same clock, and the same value, the arrival sidecar
+        /// records for it.
+        rx_utc_ms: u64,
+        header_seen: bool,
+        rows: Vec<String>,
     },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
@@ -1253,6 +1342,17 @@ struct Capture {
     /// (`embarch-core/decisions.md` decision 43). Read by signal threads,
     /// written by the main loop.
     open_step_index: AtomicU32,
+    /// One live outpost decoder per `OutpostTrace` tap, keyed by
+    /// `StreamTap.id`.
+    ///
+    /// **Per capture, never per chunk**, which is the whole reason it lives
+    /// here: a cycle-counter wrap is only detectable against the previous
+    /// record, a frame routinely splits across two reads, and the header that
+    /// names and dates everything arrives once and applies to every frame after
+    /// it. A decoder rebuilt per read would lose all three.
+    ///
+    /// Empty for a study with no trace tap, which costs nothing.
+    outpost: StdMutex<HashMap<u8, crate::outpost_manifest::LiveDecoder>>,
 }
 
 /// Advance both of a run's step counters now that the step at `step_index`
@@ -1395,6 +1495,23 @@ fn run_study_to_completion(
         }
     };
 
+    // One decoder per declared outpost tap, built before any byte arrives and
+    // carrying the manifest the flash bound — the same one `render` is handed
+    // when the capture closes, so live names and rendered names come from one
+    // source rather than two.
+    let outpost: HashMap<u8, crate::outpost_manifest::LiveDecoder> = taps
+        .iter()
+        .filter(|t| matches!(t.encoding, StreamEncoding::OutpostTrace))
+        .map(|t| {
+            (
+                t.id,
+                crate::outpost_manifest::LiveDecoder::new(
+                    study_manifest.as_ref().map(|s| s.manifest.clone()),
+                ),
+            )
+        })
+        .collect();
+
     let capture = Arc::new(Capture {
         study,
         taps,
@@ -1402,6 +1519,7 @@ fn run_study_to_completion(
         events_tx: events_tx.clone(),
         store: StdMutex::new(store),
         open_step_index: AtomicU32::new(0),
+        outpost: StdMutex::new(outpost),
     });
 
     // Which taps dev-bench currently has open, by `StreamTap.id`. Purely
@@ -1480,12 +1598,20 @@ fn run_study_to_completion(
                 {
                     break Err(format!("failed to write step {step_index}'s result to events.json: {e:?}"));
                 }
-                step_started_utc_ms = step_ended_utc_ms;
                 let _ = events_tx.send(StudyEvent::StepCompleted {
                     study_id: study_id.clone(),
                     step_index,
                     result: Box::new(result),
+                    // **This send moved above the reassignment below**, which
+                    // is the whole subtlety: `step_started_utc_ms` becomes the
+                    // *next* step's start the moment this one ends, so reading
+                    // it after that line would stamp every step with its
+                    // successor's start.
+                    started_utc_ms: step_started_utc_ms,
+                    ended_utc_ms: step_ended_utc_ms,
+                    delay_before_ms,
                 });
+                step_started_utc_ms = step_ended_utc_ms;
                 next_expected = advance_step_counters(&capture, &jobs, &study_id, step_index) as usize;
                 // A signal tap's `StreamScope` is a step range like any
                 // other tap's, so Core opens and closes its port on the same
@@ -2342,6 +2468,15 @@ fn tap_for(taps: &[StreamTap], id: u8) -> Option<&StreamTap> {
 /// §4.8) — never from the bytes. There is no sniff and no fallback here:
 /// `Raw` renders nothing because nobody declared anything to render it as.
 fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord) {
+    // **Core's own receipt time for this record, taken once, before anything
+    // is written.** Every rendered row this function writes, every arrival row
+    // it appends and every event it pushes carries this same value, rather
+    // than each stamping itself a few microseconds apart — a console line and
+    // the sample batch that arrived in the same read must not land at two
+    // different instants on a shared axis. `record.rx_utc_ms` is a different
+    // clock on a bench-mediated tap (suite decision 3) and is carried
+    // separately where it is carried at all.
+    let core_rx_utc_ms = current_utc_ms();
     {
         // Raw first. Unconditionally, for every encoding. The arrival stamp
         // goes down in the same lock, immediately after, because for an
@@ -2352,7 +2487,7 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
         // carry `core_rx_utc_ms` themselves.
         let mut store = capture.store.lock().unwrap();
         store.write_raw(tap.id, &record.bytes);
-        store.note_arrival(tap.id, &record.bytes, record.rx_utc_ms);
+        store.note_arrival(tap.id, &record.bytes, record.rx_utc_ms, core_rx_utc_ms);
     }
 
     let open_step_index = capture.open_step_index.load(Ordering::Relaxed);
@@ -2366,13 +2501,14 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             let samples: Vec<Sample> =
                 samples_in(record, layout, unit, channel_id, sample_hz).collect();
             for sample in &samples {
-                write_sample(capture, tap.id, open_step_index, *sample);
+                write_sample(capture, tap.id, open_step_index, *sample, core_rx_utc_ms);
             }
             let _ = capture.events_tx.send(StudyEvent::SampleBatch {
                 study_id: capture.study_id.clone(),
                 stream_id: tap.id,
                 stream_name: tap.name.as_str().to_string(),
                 samples,
+                core_rx_utc_ms,
             });
         }
         StreamEncoding::GattTranscript => {
@@ -2383,11 +2519,13 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // carries no step of its own.
             match postcard::from_bytes::<GattTranscriptEntry>(&record.bytes) {
                 Ok(entry) => {
-                    write_transcript_entry(capture, tap.id, open_step_index, &entry);
+                    let core_rx_utc_ms =
+                        write_transcript_entry(capture, tap.id, open_step_index, &entry);
                     let _ = capture.events_tx.send(StudyEvent::GattTranscript {
                         study_id: capture.study_id.clone(),
                         step_index: open_step_index,
                         entry: Box::new(entry),
+                        core_rx_utc_ms,
                     });
                 }
                 // The bytes are already on disk — this costs the row, not
@@ -2416,16 +2554,44 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
                 stream_name: tap.name.as_str().to_string(),
                 step_index: open_step_index,
                 rx_utc_ms: record.rx_utc_ms,
+                core_rx_utc_ms,
                 text: String::from_utf8_lossy(&record.bytes).into_owned(),
             });
         }
         StreamEncoding::OutpostTrace => {
-            // Rendered **post-hoc, from the complete raw file**, not here.
-            // `embarch-outpost` decision 10 settled that a trace
-            // is recorded for a study's duration and drawn afterwards, and
-            // decoding at the end is also what lets a header frame that
-            // arrived late name every record before it. See
-            // `render_outpost_traces`, which runs once the capture is closed.
+            // **Rendered post-hoc *and* decoded live, and the post-hoc render
+            // stays authoritative.** `embarch-outpost` decision 10 settled that
+            // a trace is recorded for a study's duration and drawn afterwards,
+            // and `render_outpost_traces` still does exactly that once the
+            // capture closes — it has a whole-capture header pre-pass, the
+            // stale-prefix drop over everything, and the verified arrival join,
+            // none of which a live path can have.
+            //
+            // What is new is a *preview* of it: the same decode, one arriving
+            // chunk at a time, pushed as it happens. Decision 10 priced this
+            // path itself and called it a plausible later addition; this is it.
+            let frames = {
+                let mut decoders = capture.outpost.lock().unwrap();
+                match decoders.get_mut(&tap.id) {
+                    Some(decoder) => decoder.push(&record.bytes, core_rx_utc_ms),
+                    // A tap declared `OutpostTrace` with no decoder is not
+                    // reachable — the map is built from the same tap list — so
+                    // there is nothing to report and nothing to guess.
+                    None => Vec::new(),
+                }
+            };
+            for frame in frames {
+                let _ = capture.events_tx.send(StudyEvent::OutpostRows {
+                    study_id: capture.study_id.clone(),
+                    stream_id: tap.id,
+                    stream_name: tap.name.as_str().to_string(),
+                    frame_index: frame.frame_index,
+                    frame_seq: frame.frame_seq,
+                    rx_utc_ms: core_rx_utc_ms,
+                    header_seen: frame.header_seen,
+                    rows: frame.rows,
+                });
+            }
         }
         StreamEncoding::Struct { decoder } => {
             // The record's bytes are one instance of the layout the engineer
@@ -2522,7 +2688,13 @@ fn hex_of(bytes: &[u8]) -> String {
 /// beyond what `Sample::to_csv_row` already renders. The row shape itself
 /// lives entirely in `embarch-study-designer` and is unchanged by both the
 /// tap reshape and the move to `streams/` — only the path changed.
-fn write_sample(capture: &Capture, tap_id: u8, step_index: u32, sample: Sample) {
+fn write_sample(
+    capture: &Capture,
+    tap_id: u8,
+    step_index: u32,
+    sample: Sample,
+    core_rx_utc_ms: u64,
+) {
     // An out-of-range step index labels the row with an empty step name
     // rather than dropping a real sample — the same trade
     // `write_transcript_entry` already makes for a transcript entry.
@@ -2540,11 +2712,7 @@ fn write_sample(capture: &Capture, tap_id: u8, step_index: u32, sample: Sample) 
         return;
     };
 
-    capture
-        .store
-        .lock()
-        .unwrap()
-        .write_rendered_row(tap_id, &format!("{row},{}", current_utc_ms()));
+    capture.store.lock().unwrap().write_rendered_row(tap_id, &format!("{row},{core_rx_utc_ms}"));
 }
 
 /// Appends one GATT transcript entry to its tap's rendered CSV
@@ -2560,7 +2728,16 @@ fn write_sample(capture: &Capture, tap_id: u8, step_index: u32, sample: Sample) 
 /// out-of-range `step_index` still gets written, with an empty `step_name`,
 /// rather than dropped: the entry is real GATT traffic that happened, and
 /// losing it because Core couldn't label it would be the worse trade.
-fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry: &GattTranscriptEntry) {
+///
+/// Returns the `core_rx_utc_ms` it wrote, so the live event carries the same
+/// value the row does — computed once, in one place, rather than stamped twice
+/// a few microseconds apart.
+fn write_transcript_entry(
+    capture: &Capture,
+    tap_id: u8,
+    step_index: u32,
+    entry: &GattTranscriptEntry,
+) -> u64 {
     let step_name = capture
         .study
         .steps
@@ -2568,12 +2745,15 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
         .map(|s| s.name.as_str())
         .unwrap_or("");
 
+    let core_rx_utc_ms = current_utc_ms();
     let Some(row) = entry.to_csv_row(step_index, step_name) else {
         tracing::warn!(
             "a GATT transcript entry for step '{step_name}' doesn't fit in one CSV row; dropping \
              its row (its raw bytes are already on disk)"
         );
-        return;
+        // The row is gone and the entry is not: it still happened, and the
+        // live event still carries the instant Core received it.
+        return core_rx_utc_ms;
     };
 
     // `core_rx_utc_ms` appended by Core, not by the crate's own renderer —
@@ -2581,11 +2761,8 @@ fn write_transcript_entry(capture: &Capture, tap_id: u8, step_index: u32, entry:
     // split `write_sample` uses. It is also the only wall-clock timestamp on
     // the row today: `rx_utc_ms` is dev-bench uptime until the clock-resync
     // gap (`embarch-study-designer` decision 72) closes.
-    capture
-        .store
-        .lock()
-        .unwrap()
-        .write_rendered_row(tap_id, &format!("{row},{}", current_utc_ms()));
+    capture.store.lock().unwrap().write_rendered_row(tap_id, &format!("{row},{core_rx_utc_ms}"));
+    core_rx_utc_ms
 }
 
 /// Streams `events.json` to disk one `StepResult` at a time, as each
@@ -3007,6 +3184,7 @@ fn event_study_id(event: &StudyEvent) -> &str {
         | StudyEvent::SampleBatch { study_id, .. }
         | StudyEvent::GattTranscript { study_id, .. }
         | StudyEvent::StreamText { study_id, .. }
+        | StudyEvent::OutpostRows { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -3708,6 +3886,76 @@ pub async fn stream_data_handler(
     serve_capture(&streams_dir, entry, query.wants_raw(), &format!("stream '{name}'")).await
 }
 
+/// One tap's **arrival sidecar** — Core's own receipt times for the bytes of a
+/// capture that carries none of its own.
+///
+/// Only two encodings have one, and each keys it by the only coordinate its
+/// bytes have (`stream_store::ArrivalKind`):
+///
+/// - an `OutpostTrace` tap, by **frame index**. Core already joins this one
+///   into the rendered CSV itself, so nothing outside Core has needed it.
+/// - a `Text` tap, by **byte offset**. This one has no rendered CSV to join it
+///   into — a console's raw file *is* its rendering — so serving it is the only
+///   way a reader can place a console line after the run. Without it a console
+///   lane exists live and vanishes on reload, which is a chart that changes
+///   shape when you reload it.
+///
+/// A tap with no sidecar is a `404` naming its encoding, rather than an empty
+/// body a caller would read as "this console had no times".
+// route: GET /study/{study_id}/stream/{name}/arrivals
+pub async fn stream_arrivals_handler(
+    Path((study_id, name)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, String)> {
+    let streams_dir = streams_dir_for(&study_id)?;
+    let index = read_stream_index(&streams_dir)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("study '{study_id}' has no captured streams"),
+        )
+    })?;
+    let entry = index.find(&name).ok_or_else(|| {
+        let declared: Vec<&str> = index.streams.iter().map(|e| e.name.as_str()).collect();
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "study '{study_id}' declares no stream tap named '{name}' — it declared: {}",
+                if declared.is_empty() { "(none)".to_string() } else { declared.join(", ") }
+            ),
+        )
+    })?;
+    let Some(file) = entry.arrival_file.clone() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "tap '{name}' keeps no arrival sidecar — its encoding is {:?}, whose rendered rows \
+                 carry embarch-core's own core_rx_utc_ms themselves",
+                entry.encoding
+            ),
+        ));
+    };
+
+    let dir = streams_dir.to_path_buf();
+    let file_for_read = file.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        stream_store::read_capture(&dir, &file_for_read, true)
+    })
+    .await
+    .map_err(internal_err)?
+    .map_err(internal_err)?;
+
+    match read {
+        Some(bytes) => {
+            Ok(([(CONTENT_TYPE, stream_store::content_type_for(&file))], bytes).into_response())
+        }
+        // The sidecar is created with the study and written to as bytes
+        // arrive, so an absent one means nothing ever arrived on this tap.
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("tap '{name}' captured nothing, so it has no arrival stamps"),
+        )),
+    }
+}
+
 /// One outpost tap's load repartition — per-subject shares and the coverage
 /// line — computed once here from the rendered CSV [`stream_data_handler`]
 /// would otherwise only serve as bytes for someone else to compute
@@ -3919,6 +4167,11 @@ mod tests {
         taps.push(dev_bench_log_tap(&study.streams));
         let store = StreamStore::create(dir, &taps, &study.decoders, 0).unwrap();
         let (events_tx, _rx) = broadcast::channel(64);
+        let outpost = taps
+            .iter()
+            .filter(|t| matches!(t.encoding, StreamEncoding::OutpostTrace))
+            .map(|t| (t.id, crate::outpost_manifest::LiveDecoder::new(None)))
+            .collect();
         Capture {
             study,
             taps,
@@ -3926,6 +4179,7 @@ mod tests {
             events_tx,
             store: StdMutex::new(store),
             open_step_index: AtomicU32::new(0),
+            outpost: StdMutex::new(outpost),
         }
     }
 
@@ -5291,14 +5545,39 @@ mod tests {
         );
 
         // A Text tap's raw file *is* its rendering (no second copy), so the
-        // bytes are readable straight out of streams/.
+        // bytes are readable straight out of streams/. Matched on the `.txt`
+        // rather than on the prefix: a Text tap now has a second file beside
+        // it, and the prefix match found whichever the directory listed first.
         let written = std::fs::read_dir(dir.path().join("streams"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy().starts_with(RESERVED_DEV_BENCH_STREAM_NAME))
+            .find(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with(RESERVED_DEV_BENCH_STREAM_NAME) && n.ends_with(".txt")
+            })
             .expect("the reserved tap has a file under streams/");
         let body = std::fs::read_to_string(written.path()).unwrap();
         assert!(body.contains("link RX overrun"), "got {body:?}");
+
+        // **And the console is placeable now.** A `Text` tap's capture used to
+        // be bytes with no times anywhere, so a console read back off disk
+        // could not be laid against any other stream in the study — the one
+        // stream an engineer most wants to correlate. The sidecar keys Core's
+        // own receipt time to the byte offset the chunk landed at, which is
+        // the only coordinate a console line has.
+        let sidecar = std::fs::read_to_string(
+            dir.path().join("streams").join(format!("{RESERVED_DEV_BENCH_STREAM_NAME}.arrival.csv")),
+        )
+        .expect("a Text tap gets an arrival sidecar");
+        let mut rows = sidecar.lines();
+        assert_eq!(rows.next().unwrap(), "byte_offset,core_rx_utc_ms,bytes");
+        let row = rows.next().expect("one row for the chunk that arrived");
+        let fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(fields[0], "0", "the first chunk starts at byte zero");
+        assert_eq!(fields[2], line.len().to_string(), "its length is what was written");
+        // Core's own wall clock, not the record's `rx_utc_ms` of 7 — a
+        // bench-mediated Text tap stamps that with its own uptime.
+        assert!(fields[1].parse::<u64>().unwrap() > 1_600_000_000_000);
     }
 
     #[test]
@@ -5357,8 +5636,8 @@ mod tests {
             channel_id: 0,
         };
 
-        write_sample(&capture, 0, 0, sample);
-        write_sample(&capture, 0, 0, sample);
+        write_sample(&capture, 0, 0, sample, current_utc_ms());
+        write_sample(&capture, 0, 0, sample, current_utc_ms());
 
         // Named by the tap, under `streams/` — the row shape is exactly what
         // `data.csv` carried before decision 30 moved the path.
@@ -5382,7 +5661,7 @@ mod tests {
 
         let sample = Sample { rx_utc_ms: 1, value: 1.0, unit: embarch_study_designer::Unit::Raw, channel_id: 0 };
 
-        write_sample(&capture, 0, 99, sample);
+        write_sample(&capture, 0, 99, sample, current_utc_ms());
 
         let contents =
             std::fs::read_to_string(dir.path().join("streams").join("power.csv")).unwrap();
@@ -5589,7 +5868,7 @@ mod tests {
             unit: embarch_study_designer::Unit::Volts,
             channel_id: 0,
         };
-        write_sample(&capture, 0, step, sample);
+        write_sample(&capture, 0, step, sample, current_utc_ms());
         write_transcript_entry(&capture, 1, step, &transcript_entry(b"x"));
 
         let streams = dir.path().join("streams");

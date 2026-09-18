@@ -497,6 +497,210 @@ pub fn render(
     Ok(outcome)
 }
 
+
+// ---- the live half: the same decode, one arriving chunk at a time -----------
+//
+// **This is `embarch-outpost` decision 10 reversed, and the reversal is
+// deliberately narrow.** That decision made an outpost capture study-scoped
+// with no live feed, and priced a live one exactly: "a decode-and-push path in
+// Core, an SSE channel, a renderer that can draw a partial timeline". This is
+// the first of the three.
+//
+// **`render` stays authoritative and still runs.** It has three things this
+// cannot have and never will:
+//
+// 1. **A whole-capture header pre-pass**, so a header frame that arrives late
+//    still names and dates every record *before* it. Live cannot see the
+//    future, so rows that arrive before the first header carry an empty `us`
+//    and an empty `name`, and say so with `header_seen: false`.
+// 2. **The stale-prefix drop over everything**, which needs the whole capture
+//    to decide what a prefix is.
+// 3. **The verified arrival join**, which checks every frame length against the
+//    sidecar before a single row is stamped, and refuses the whole join rather
+//    than shifting every timestamp.
+//
+// So the live path is a *preview* of what the render will say, and the tab
+// re-reads the rendered file when the run ends. What the two agree on exactly
+// is `frame_index`: both count non-empty zero-delimited runs, in order,
+// including frames that fail their CRC — because a bad frame still consumed an
+// index while its bytes were being stamped. The one frame the render sees that
+// this cannot is a **trailing partial one**: `outpost::chunks` yields bytes
+// after the last delimiter, and this emits a frame only once its terminator has
+// arrived.
+
+/// One frame's worth of decoded rows, ready to push.
+#[derive(Debug, Clone)]
+pub struct LiveFrame {
+    /// The frame's position in the capture — the same index `render` will give
+    /// it, which is what lets a browser hold live rows and rendered rows in one
+    /// list without re-keying them.
+    pub frame_index: u64,
+    pub frame_seq: u32,
+    /// Whether a header frame had been seen **by the time this frame was
+    /// decoded**. False means every row below carries an empty `us` and an
+    /// empty `name` — not because the capture has no header, but because it had
+    /// not arrived yet. The post-hoc render will fill both in.
+    pub header_seen: bool,
+    /// One CSV line per record, in [`outpost::csv_header`]'s own shape.
+    ///
+    /// **Rows rather than a struct, and that is the point.** The consumer
+    /// already parses exactly these nine positional fields to read a rendered
+    /// capture; pushing the same shape means live and post-hoc decode through
+    /// literally the same function on the other side, instead of a second
+    /// implementation of a column order that belongs to
+    /// `embarch-study-designer`.
+    pub rows: Vec<String>,
+}
+
+/// Decodes an outpost capture as it arrives, one chunk of bytes at a time.
+///
+/// Held **per capture**, never per chunk, for three reasons that are each
+/// individually sufficient: a cycle-counter wrap is only detectable against the
+/// previous record, a frame routinely splits across two reads, and the header
+/// that names and dates everything arrives once and applies to every frame
+/// after it.
+pub struct LiveDecoder {
+    /// Bytes of the frame in progress. A frame split across two reads is the
+    /// normal case, not an edge one.
+    pending: Vec<u8>,
+    scratch: Vec<u8>,
+    /// One unwrapper for the whole stream, in frame order — restarting it per
+    /// frame would lose every wrap that falls on a frame boundary.
+    unwrapper: Unwrapper,
+    /// Non-empty delimiter-separated runs seen so far, decodable or not.
+    frame_index: u64,
+    /// The manifest the flash bound, and whether this capture's header let it
+    /// apply. `applied` is only ever set once, by the first header.
+    manifest: Option<OutpostManifest>,
+    applied: bool,
+    header_seen: bool,
+    cycles_per_sec: u32,
+}
+
+impl LiveDecoder {
+    pub fn new(manifest: Option<OutpostManifest>) -> LiveDecoder {
+        LiveDecoder {
+            pending: Vec::new(),
+            scratch: vec![0u8; 4096],
+            unwrapper: Unwrapper::new(),
+            frame_index: 0,
+            manifest,
+            applied: false,
+            header_seen: false,
+            cycles_per_sec: 0,
+        }
+    }
+
+    /// Feeds one arriving chunk in, returning a [`LiveFrame`] per frame that
+    /// *completed* in it.
+    ///
+    /// A frame that fails its CRC yields nothing and still consumes an index,
+    /// exactly as it does in `render` — skipping the index would shift every
+    /// frame after it against the rendered file.
+    pub fn push(&mut self, bytes: &[u8], rx_utc_ms: u64) -> Vec<LiveFrame> {
+        let mut out = Vec::new();
+        for byte in bytes {
+            if *byte != 0 {
+                // A frame past this bound is a configuration Core cannot
+                // decode rather than one it should truncate — but a *pending*
+                // buffer that grows without one is a memory leak on a link
+                // that stopped delimiting. `render` grows its scratch and
+                // retries; here the bound is on the accumulated frame, and a
+                // run past it is dropped with its bytes still on disk for the
+                // render to read.
+                if self.pending.len() < MAX_LIVE_FRAME_BYTES {
+                    self.pending.push(*byte);
+                }
+                continue;
+            }
+            if self.pending.is_empty() {
+                continue;
+            }
+            let chunk = std::mem::take(&mut self.pending);
+            let frame_index = self.frame_index;
+            self.frame_index += 1;
+            if let Some(frame) = self.decode(&chunk, frame_index, rx_utc_ms) {
+                out.push(frame);
+            }
+        }
+        out
+    }
+
+    fn decode(&mut self, chunk: &[u8], frame_index: u64, rx_utc_ms: u64) -> Option<LiveFrame> {
+        if chunk.len() > self.scratch.len() {
+            self.scratch.resize(chunk.len() * 2, 0);
+        }
+        // `decode_frame` borrows `scratch`, so it comes out of `self` for the
+        // duration: the arms below write back to `self`.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let decoded = outpost::decode_frame(chunk, &mut scratch);
+
+        let result = match decoded {
+            // A bad frame costs the frame, not the link — and it has already
+            // consumed its index above.
+            Err(_) => None,
+            Ok(Frame::Header { header, seq }) => {
+                // **The first header latches, and only the first.** That is
+                // the same rule `render`'s pre-pass holds, and it assumes one
+                // firmware build per capture, which is what makes retroactive
+                // application there sound and forward application here sound.
+                if !self.header_seen {
+                    self.header_seen = true;
+                    self.cycles_per_sec = header.cycles_per_sec;
+                    if let Some(m) = self.manifest.as_ref() {
+                        self.applied =
+                            m.check(header.build_id.as_str(), header.record_layout_version).is_ok();
+                    }
+                }
+                // A header frame carries no records. It is still reported, so
+                // a consumer learns the tier improved at the instant it did
+                // rather than on the next records frame.
+                Some(LiveFrame {
+                    frame_index,
+                    frame_seq: u32::from(seq),
+                    header_seen: self.header_seen,
+                    rows: Vec::new(),
+                })
+            }
+            Ok(Frame::Records { records, seq }) => {
+                let applied = self.applied.then_some(self.manifest.as_ref()).flatten();
+                let mut rows = Vec::new();
+                for record in records {
+                    let Ok(record) = record else {
+                        // The rest of this frame is not interpretable; what
+                        // decoded before it is real and is kept.
+                        break;
+                    };
+                    let absolute = self.unwrapper.absolute(record.cycles);
+                    rows.push(record.to_csv_row(
+                        frame_index,
+                        u32::from(seq),
+                        Some(rx_utc_ms),
+                        absolute,
+                        self.cycles_per_sec,
+                        applied,
+                    ));
+                }
+                Some(LiveFrame {
+                    frame_index,
+                    frame_seq: u32::from(seq),
+                    header_seen: self.header_seen,
+                    rows,
+                })
+            }
+        };
+
+        self.scratch = scratch;
+        result
+    }
+}
+
+/// The largest frame the live decoder will accumulate before dropping the run
+/// in progress. Well past `CONFIG_EMBARCH_OUTPOST_BATCH_BYTES` on any real
+/// build; it exists so a link that stops delimiting costs a frame rather than
+/// the process. The bytes are on disk regardless, and `render` reads them.
+const MAX_LIVE_FRAME_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +918,150 @@ mod tests {
             "no row before the header resolved a name out of the manifest"
         );
     }
+
+    // ---- the live decoder, against the post-hoc render -------------------
+
+    /// Feeds `REAL_CAPTURE` through [`LiveDecoder`] in chunks of `n` bytes,
+    /// returning every row it pushed, in order.
+    fn live_rows(n: usize, manifest: Option<&OutpostManifest>) -> Vec<String> {
+        let mut decoder = LiveDecoder::new(manifest.cloned());
+        let mut rows = Vec::new();
+        for (i, chunk) in REAL_CAPTURE.chunks(n).enumerate() {
+            for frame in decoder.push(chunk, 1_700_000_000_000 + i as u64) {
+                rows.extend(frame.rows);
+            }
+        }
+        rows
+    }
+
+    /// **The live decode and the post-hoc render are the same decode.**
+    /// Every field that does not depend on seeing the whole capture must agree
+    /// row for row — which is what makes a live timeline and the rendered one
+    /// the same object rather than two pictures of the same run.
+    ///
+    /// The three that *do* depend on it are `rx_utc_ms` (the render joins a
+    /// verified arrival index, live stamps the read), and `us`/`name` on rows
+    /// that arrived **before** the first header frame — live cannot see a
+    /// header that has not come yet, and the render's pre-pass applies it
+    /// retroactively.
+    #[test]
+    fn a_live_decode_and_the_render_agree_row_for_row() {
+        let manifest = parse(REAL_MANIFEST).expect("the fixture's own manifest parses");
+        let (_, rendered) = render_real(Some(&manifest));
+        let mut rendered_rows = rendered.lines();
+        assert_eq!(rendered_rows.next().unwrap(), outpost::csv_header());
+        let rendered_rows: Vec<&str> = rendered_rows.collect();
+
+        let live = live_rows(64, Some(&manifest));
+        assert!(!live.is_empty(), "the fixture must decode into rows");
+        assert_eq!(
+            live.len(),
+            rendered_rows.len(),
+            "live pushed a different number of rows than the render wrote"
+        );
+
+        // Field 0 is `frame_index`, 1 `frame_seq`, 2 `rx_utc_ms`, 3 `cycles`,
+        // 4 `us`, 5 `kind`, 6 `a`, 7 `b`, 8 `name`.
+        for (i, (a, b)) in live.iter().zip(rendered_rows.iter()).enumerate() {
+            let l: Vec<&str> = a.split(',').collect();
+            let r: Vec<&str> = b.split(',').collect();
+            for f in [0usize, 1, 3, 5, 6, 7] {
+                assert_eq!(l[f], r[f], "row {i} field {f} disagrees:\n  live {a}\n  rend {b}");
+            }
+            // The fixture opens with its header frame, so every row here is
+            // after it and `us`/`name` must agree too.
+            assert_eq!(l[4], r[4], "row {i}'s us disagrees:\n  live {a}\n  rend {b}");
+            assert_eq!(l[8], r[8], "row {i}'s name disagrees:\n  live {a}\n  rend {b}");
+        }
+    }
+
+    /// **A frame split across reads is the normal case, not an edge one**, and
+    /// the decoded rows must not depend on where the reads fell.
+    #[test]
+    fn where_the_reads_fall_does_not_change_what_was_decoded() {
+        let manifest = parse(REAL_MANIFEST).expect("parses");
+        let one_byte_at_a_time = live_rows(1, Some(&manifest));
+        let whole_capture = live_rows(REAL_CAPTURE.len(), Some(&manifest));
+        // Only `rx_utc_ms` can differ — it is the read's stamp, and the reads
+        // are different reads.
+        let strip = |rows: Vec<String>| -> Vec<String> {
+            rows.iter()
+                .map(|r| {
+                    let f: Vec<&str> = r.split(',').collect();
+                    format!("{},{},{},{},{},{},{},{}", f[0], f[1], f[3], f[4], f[5], f[6], f[7], f[8])
+                })
+                .collect()
+        };
+        assert_eq!(strip(one_byte_at_a_time), strip(whole_capture));
+    }
+
+    /// **Rows that arrive before the header carry an empty `us` and an empty
+    /// `name`, and say so** — not because the capture has no header, but
+    /// because it had not arrived yet. Inventing a rate to divide `cycles` by
+    /// is the plausible-and-wrong answer this module refuses everywhere else.
+    #[test]
+    fn rows_before_the_header_are_undated_and_unnamed_and_the_frame_says_so() {
+        let manifest = parse(REAL_MANIFEST).expect("parses");
+        // The fixture's own first frame is its header, so it is moved to the
+        // back to produce the case: a records frame decoded before any header.
+        let frames: Vec<Vec<u8>> =
+            outpost::chunks(REAL_CAPTURE).map(<[u8]>::to_vec).collect();
+        let mut reordered: Vec<u8> = Vec::new();
+        for frame in frames.iter().skip(1).chain(frames.iter().take(1)) {
+            reordered.extend_from_slice(frame);
+            reordered.push(0);
+        }
+
+        let mut decoder = LiveDecoder::new(Some(manifest));
+        let pushed = decoder.push(&reordered, 1_700_000_000_000);
+        let first = pushed.iter().find(|f| !f.rows.is_empty()).expect("some frame carried records");
+        assert!(!first.header_seen, "no header had arrived when this frame was decoded");
+        for row in &first.rows {
+            let f: Vec<&str> = row.split(',').collect();
+            assert_eq!(f[4], "", "us must be empty, not invented: {row}");
+            assert_eq!(f[8], "", "name must be empty, not guessed: {row}");
+            assert_ne!(f[3], "", "the cycle count itself is still exact: {row}");
+        }
+        // And once it arrives, the frame that carried it says so.
+        let last = pushed.last().expect("the header frame is the last one here");
+        assert!(last.header_seen);
+        assert!(last.rows.is_empty(), "a header frame carries no records");
+    }
+
+    /// A frame that fails its CRC costs the frame and **still consumes its
+    /// index** — skipping it would shift every frame after it against the
+    /// rendered file, which is the one thing live and post-hoc must agree on.
+    #[test]
+    fn a_corrupt_frame_costs_the_frame_and_not_the_indexes_after_it() {
+        let manifest = parse(REAL_MANIFEST).expect("parses");
+        let frames: Vec<Vec<u8>> =
+            outpost::chunks(REAL_CAPTURE).map(<[u8]>::to_vec).collect();
+        assert!(frames.len() > 3);
+        let mut damaged: Vec<u8> = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let mut frame = frame.clone();
+            if i == 1 {
+                // Flip a byte in the middle: COBS still frames it, the CRC
+                // does not hold.
+                let at = frame.len() / 2;
+                frame[at] ^= 0xff;
+            }
+            damaged.extend_from_slice(&frame);
+            damaged.push(0);
+        }
+
+        let mut decoder = LiveDecoder::new(Some(manifest));
+        let pushed = decoder.push(&damaged, 1_700_000_000_000);
+        assert!(
+            pushed.iter().all(|f| f.frame_index != 1),
+            "the damaged frame must yield nothing"
+        );
+        assert!(
+            pushed.iter().any(|f| f.frame_index == 2),
+            "and the frames after it must keep their own indexes"
+        );
+    }
+
 
     #[test]
     fn a_manifest_from_another_build_is_refused_and_the_rows_stay_unnamed() {
