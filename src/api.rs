@@ -148,6 +148,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
         .route("/logs/recent", get(logs_recent_handler))
+        .route("/studies", get(study::studies_handler))
         .route("/study", post(study::post_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
@@ -1597,6 +1598,7 @@ mod tests {
         ("POST", "/validate", "/validate"),
         ("GET", "/alerts", "/alerts"),
         ("GET", "/logs/recent", "/logs/recent"),
+        ("GET", "/studies", "/studies"),
         ("POST", "/study", "/study"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
@@ -1635,7 +1637,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 24;
+    const DOCUMENTED_ROUTE_COUNT: usize = 25;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
