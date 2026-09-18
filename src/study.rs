@@ -2812,6 +2812,23 @@ fn finish_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, stu
 
 // ---- GET /study/{study_id} --------------------------------------------------
 
+/// The job registry's answer, or the durable record's where the registry has
+/// nothing — **decision 71**.
+///
+/// This route used to `404` for any id the in-memory registry had forgotten,
+/// which after a restart is every study that ever ran, and decision 19 called
+/// that indistinguishable-by-design. It is not, and the cost was concrete:
+/// `StudyResult.streams` — every tap's `bytes_written`, its `truncated` flag
+/// and its record check — and the run's `provenance` exist **only** here, in
+/// this route's `result`. A reader opening a study from `GET /studies` got a
+/// `404` and, with it, no way to learn that a capture was short.
+///
+/// So a missing job falls through to `events.json` on disk, with the status
+/// derived exactly as `GET /studies` derives it ([`study_status_from_disk`]):
+/// a finalized file is `completed`, a `.partial` is `interrupted`, and
+/// nothing at all is still a `404`. A study that never existed and one this
+/// Core has forgotten are now genuinely distinguishable, which is what the
+/// old wording claimed was impossible.
 // route: GET /study/{study_id}
 pub async fn get_study_handler(
     State(state): State<AppState>,
@@ -2819,15 +2836,10 @@ pub async fn get_study_handler(
 ) -> Result<Json<StudyJobResponse>, (StatusCode, String)> {
     let job = {
         let jobs = state.study_jobs.lock().unwrap();
-        match jobs.get(&study_id) {
-            Some(job) => job.clone(),
-            None => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("no study job found for study_id '{study_id}' (never existed, or Core has restarted since)"),
-                ))
-            }
-        }
+        jobs.get(&study_id).cloned()
+    };
+    let Some(job) = job else {
+        return get_study_from_disk(&study_id).await;
     };
 
     // Only a `"completed"` study has a finished `events.json` to read back
@@ -2857,9 +2869,81 @@ pub async fn get_study_handler(
     }))
 }
 
+/// [`get_study_handler`]'s fallback: the study as its own results directory
+/// records it.
+///
+/// `current_step`/`total_steps` are **absent, not reconstructed**. Both are
+/// the job's own bookkeeping and neither is written to `events.json`; a
+/// completed study's step count could be inferred from the file, but
+/// `current_step` is documented as the index of the last step that *finished*
+/// (decision 43) and inferring it from a record that may be truncated would
+/// put a different number under the same name.
+async fn get_study_from_disk(study_id: &str) -> Result<Json<StudyJobResponse>, (StatusCode, String)> {
+    let dir = study_results_dir(study_id).map_err(internal_err)?;
+    let id = study_id.to_string();
+    tokio::task::spawn_blocking(move || study_response_from_dir(&dir, &id))
+        .await
+        .map_err(internal_err)?
+}
+
+/// [`get_study_from_disk`]'s whole body minus the path resolution, so it is
+/// testable against a temporary directory rather than the machine-wide
+/// results root.
+fn study_response_from_dir(
+    dir: &FsPath,
+    study_id: &str,
+) -> Result<Json<StudyJobResponse>, (StatusCode, String)> {
+    let events = fingerprint_study_dir(dir)
+        .events
+        .map(|(state, _, _)| state)
+        .unwrap_or(EventsFileState::Missing);
+    if events == EventsFileState::Missing {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no study job found for study_id '{study_id}', and no results directory on disk                  either — it never existed, or the retention sweep has since removed it"
+            ),
+        ));
+    }
+
+    // A `.partial` is read too, and usually fails to parse — the process died
+    // mid-write. That is reported as a note rather than as a `404`: the status
+    // is still real, and `interrupted` with no result is a better answer than
+    // nothing at all.
+    let (result, reason) = match read_events_json_at(dir) {
+        Ok(value) => (Some(value), None),
+        Err(e) if events == EventsFileState::Finalized => {
+            tracing::error!("study {study_id} has a finalized events.json that could not be read back: {e:?}");
+            (None, Some(format!("its events.json could not be read back: {e}")))
+        }
+        Err(_) => (
+            None,
+            Some("this study stopped without finalizing its record, so there is no result to read".to_string()),
+        ),
+    };
+
+    Ok(Json(StudyJobResponse {
+        status: study_status_from_disk(events).to_string(),
+        current_step: None,
+        total_steps: None,
+        result,
+        reason,
+    }))
+}
+
 async fn read_events_json(study_id: &str) -> anyhow::Result<serde_json::Value> {
     let dir = study_results_dir(study_id)?;
     let bytes = tokio::fs::read(dir.join("events.json")).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The same read against a directory already resolved, blocking — the shape
+/// [`study_response_from_dir`] needs, since it already runs on a blocking
+/// thread. **`events.json` only**: a `.partial` is not a finished record, and
+/// serving one as `result` would hand a caller a truncated `StudyResult` under
+/// the field that means a complete one.
+fn read_events_json_at(dir: &FsPath) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(dir.join("events.json"))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -4697,6 +4781,54 @@ mod tests {
         let parsed: EventsFileForSteps =
             serde_json::from_str(r#"{"study_name":"s","steps":[]}"#).unwrap();
         assert!(!steps_response(parsed).timed);
+    }
+
+
+    #[test]
+    fn a_study_the_registry_has_forgotten_is_served_from_disk() {
+        // Decision 71. Before this, every study that outlived its Core `404`ed
+        // here — and `StudyResult.streams` (each tap's bytes, its `truncated`
+        // flag and its record check) and the run's `provenance` exist only in
+        // this route's `result`, so a reader had no way to learn a capture was
+        // short.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("71aa71aa71aa71aa71aa71aa71aa71aa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.json"), TWO_STEPS).unwrap();
+
+        let Json(resp) = study_response_from_dir(&dir, "71aa").expect("a finalized record answers");
+        assert_eq!(resp.status, "completed");
+        assert_eq!(resp.result.as_ref().unwrap()["study_name"], "nightly");
+        // Neither is in `events.json`, and inferring `current_step` from a
+        // record that may be truncated would put a different number under a
+        // documented name (decision 43).
+        assert_eq!(resp.current_step, None);
+        assert_eq!(resp.total_steps, None);
+    }
+
+    #[test]
+    fn a_partial_record_answers_interrupted_with_no_result_rather_than_404() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("71bb71bb71bb71bb71bb71bb71bb71bb");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.json.partial"), "{\"steps\":[").unwrap();
+
+        let Json(resp) = study_response_from_dir(&dir, "71bb").expect("a partial record still answers");
+        assert_eq!(resp.status, "interrupted");
+        assert!(resp.result.is_none(), "there is no finalized record to serve");
+        assert!(resp.reason.as_deref().unwrap().contains("without finalizing"));
+    }
+
+    #[test]
+    fn a_study_id_with_no_directory_at_all_is_still_a_404() {
+        // The one case the old blanket `404` was right about, kept.
+        let root = tempfile::tempdir().unwrap();
+        let err = match study_response_from_dir(&root.path().join("gone"), "71cc") {
+            Err(e) => e,
+            Ok(_) => panic!("a directory that is not there must not answer"),
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(err.1.contains("no results directory on disk"));
     }
 
     // ---- GET /studies ------------------------------------------------------
