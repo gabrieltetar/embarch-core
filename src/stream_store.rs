@@ -819,11 +819,42 @@ pub fn sweep_study_results(root: &Path, keep: usize) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
+    let dirs = study_result_dirs(root)?;
+    if dirs.len() <= keep {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for (_, path) in dirs.into_iter().skip(keep) {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!("retention: removed old study results at {}", path.display());
+                removed += 1;
+            }
+            Err(e) => tracing::warn!("retention: failed to remove {}: {e:?}", path.display()),
+        }
+    }
+    Ok(removed)
+}
+
+/// Every study results directory under `root`, **newest first**, paired with
+/// the mtime it was ordered on.
+///
+/// The one definition of "the studies on disk, in order" — shared by the
+/// retention sweep, which deletes past `keep`, and by `GET /studies`, which
+/// lists up to `keep`. Two orderings would mean a listing that disagrees
+/// with what the sweep is about to keep.
+///
+/// Only directories whose name is a 32-hex-character study id are
+/// considered, for the reason [`sweep_study_results`] states: a results root
+/// is Core's, but "act on everything I did not expect to find" is not a
+/// posture either caller should take. A directory whose metadata cannot be
+/// read is skipped rather than failing the whole listing.
+pub fn study_result_dirs(root: &Path) -> anyhow::Result<Vec<(std::time::SystemTime, PathBuf)>> {
     let entries = match fs::read_dir(root) {
         Ok(e) => e,
-        // No results have ever been written — nothing to sweep, not a
-        // failure.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        // No results have ever been written — an empty list, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
 
@@ -842,25 +873,10 @@ pub fn sweep_study_results(root: &Path, keep: usize) -> anyhow::Result<usize> {
         dirs.push((modified, entry.path()));
     }
 
-    if dirs.len() <= keep {
-        return Ok(0);
-    }
-
-    // Newest first, then drop everything past `keep`. Ties break on path so
-    // the order is total and the sweep is deterministic.
+    // Newest first. Ties break on path so the order is total and both
+    // callers are deterministic.
     dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut removed = 0;
-    for (_, path) in dirs.into_iter().skip(keep) {
-        match fs::remove_dir_all(&path) {
-            Ok(()) => {
-                tracing::info!("retention: removed old study results at {}", path.display());
-                removed += 1;
-            }
-            Err(e) => tracing::warn!("retention: failed to remove {}: {e:?}", path.display()),
-        }
-    }
-    Ok(removed)
+    Ok(dirs)
 }
 
 fn is_study_id(name: &str) -> bool {

@@ -175,6 +175,33 @@ pub enum StudyEvent {
     /// `gatt.csv` in the same pass (`embarch-study-designer` decision 36). Boxed for the same reason `StepCompleted` is: a
     /// `MAX_PAYLOAD_LEN` payload would otherwise set this whole enum's size.
     GattTranscript { study_id: String, step_index: u32, entry: Box<GattTranscriptEntry> },
+    /// One chunk off a `Text`-encoded tap, pushed the instant Core reads it
+    /// off the wire — the same bytes [`write_stream_record`]'s raw write
+    /// just appended to the tap's `.txt` file, which for `Text` *is* the
+    /// rendering (the decode is the identity).
+    ///
+    /// **The chunk is carried verbatim, with no line framing.** A record can
+    /// split a line and can split a UTF-8 character; assembling lines is the
+    /// consumer's job, because Core inventing line boundaries would be Core
+    /// interpreting a payload — the one thing `write_stream_record`'s own
+    /// doc refuses. `text` is `String::from_utf8_lossy` over the record, so
+    /// a split character surfaces as a replacement character rather than
+    /// costing the chunk.
+    ///
+    /// Bounded without a cap of its own: a record is at most
+    /// `limits::MAX_STREAM_CHUNK_BYTES`.
+    ///
+    /// **`Raw` deliberately gets no event of its own.** A console of hex is
+    /// noise and nothing has asked for one — this is a decision, not an
+    /// oversight.
+    StreamText {
+        study_id: String,
+        stream_id: u8,
+        stream_name: String,
+        step_index: u32,
+        rx_utc_ms: u64,
+        text: String,
+    },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
 }
@@ -2378,6 +2405,19 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // rendering — it is named `.txt` rather than `.bin` to say so.
             // Writing the same bytes twice would double the disk cost of the
             // one encoding whose render adds nothing.
+            //
+            // The push, though, is this arm's own: the bytes are on disk but
+            // were reaching no live subscriber, which is what kept a console
+            // out of `embarch-ui`. Carried verbatim — no line framing here,
+            // see `StudyEvent::StreamText`.
+            let _ = capture.events_tx.send(StudyEvent::StreamText {
+                study_id: capture.study_id.clone(),
+                stream_id: tap.id,
+                stream_name: tap.name.as_str().to_string(),
+                step_index: open_step_index,
+                rx_utc_ms: record.rx_utc_ms,
+                text: String::from_utf8_lossy(&record.bytes).into_owned(),
+            });
         }
         StreamEncoding::OutpostTrace => {
             // Rendered **post-hoc, from the complete raw file**, not here.
@@ -2882,6 +2922,7 @@ fn event_study_id(event: &StudyEvent) -> &str {
         StudyEvent::StepCompleted { study_id, .. }
         | StudyEvent::SampleBatch { study_id, .. }
         | StudyEvent::GattTranscript { study_id, .. }
+        | StudyEvent::StreamText { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -3155,6 +3196,375 @@ fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
     let timed = !steps.is_empty()
         && steps.iter().all(|s| s.started_utc_ms.is_some() && s.ended_utc_ms.is_some());
     StudyStepsResponse { study_name: parsed.study_name, timed, steps }
+}
+
+// ---- GET /studies -----------------------------------------------------------
+
+/// How a study's steps came out, counted rather than listed.
+///
+/// A tally, not a list, because this is the *listing* route: a caller
+/// choosing which study to open needs "7 steps, 1 failed", and gets the
+/// steps themselves from `GET /study/{id}/steps` once it has chosen.
+///
+/// `unknown` is not a rounding bin. It counts steps whose `outcome` this
+/// build does not recognise as one of the three — the same posture
+/// [`outcome_name_and_reason`] takes, where a shape we do not know is news
+/// rather than a `Fail`. A non-zero `unknown` means the reader is older than
+/// the record, and saying so is the whole point of the field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StudyStepTally {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub timed_out: usize,
+    pub unknown: usize,
+}
+
+/// One declared tap, as `GET /studies` summarises it — the same four
+/// provenance facts [`StreamIndexEntryResponse`] carries, minus the file
+/// bookkeeping, so a row can say "this study has a trace and two consoles"
+/// without a second request per study.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyTapSummary {
+    pub name: String,
+    pub encoding: StreamEncoding,
+    pub rendered: bool,
+    /// The four facts `GET /study/{id}/streams` reports, carried with their
+    /// `Option` intact: each is `None` for a tap the question does not apply
+    /// to (`named`/`timed`/`self_excluded` outside an outpost trace,
+    /// `source_deferred` outside a deferred source), and flattening that to
+    /// `false` would turn "not applicable" into "no".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_excluded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_deferred: Option<bool>,
+}
+
+/// One study as `GET /studies` reports it.
+///
+/// **`steps` and `taps` are absent, not empty, when they could not be
+/// read.** A study whose `events.json` this build cannot parse must not
+/// render as a study that ran no steps — the two are opposite facts, and a
+/// zeroed tally would be this route asserting the second one. `note` says
+/// what went wrong in prose; the absence is what a caller branches on.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudySummaryResponse {
+    pub study_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub study_name: Option<String>,
+    /// `"pending"` / `"running"` — from the live job registry;
+    /// `"completed"` — a finalized `events.json` on disk;
+    /// `"failed"` — the registry said so, and is still here to say it;
+    /// `"interrupted"` — an `events.json.partial` with no job behind it;
+    /// `"unknown"` — a results directory with neither file.
+    ///
+    /// See [`study_status_from_disk`] for why `interrupted` is never
+    /// reported as either of its neighbours.
+    pub status: String,
+    /// The first start and the last end this study's own steps recorded.
+    /// Absent for a study run before 2026-08-27, when Core recorded neither
+    /// — the same caveat `GET /study/{id}/steps` already carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_utc_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_utc_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<StudyStepTally>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taps: Option<Vec<StudyTapSummary>>,
+    /// Why something above is missing. Prose, for a person; set only when
+    /// there is something to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StudiesResponse {
+    pub studies: Vec<StudySummaryResponse>,
+    /// The retention count in force (`EMBARCH_STUDY_RESULTS_KEEP`), so a
+    /// caller showing this list can say what it is a list *of* rather than
+    /// implying it is every study ever run. `0` means retention is off and
+    /// this is genuinely everything on disk.
+    pub keep: usize,
+}
+
+/// Which of the two events files a results directory has — the fact the
+/// whole `completed`/`interrupted` distinction turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventsFileState {
+    /// `events.json` — finalized, i.e. [`EventsJsonWriter::finish`] renamed it.
+    Finalized,
+    /// `events.json.partial` — the writer never got to rename it.
+    Partial,
+    /// Neither. A directory that was created and then never written to.
+    Missing,
+}
+
+/// Everything about one study that comes off disk, i.e. everything that is
+/// cacheable. Its `status` is deliberately *not* in here: status depends on
+/// the in-memory job registry, which changes without any file changing.
+#[derive(Debug, Clone)]
+struct StudyDiskSummary {
+    events: EventsFileState,
+    study_name: Option<String>,
+    started_utc_ms: Option<u64>,
+    ended_utc_ms: Option<u64>,
+    steps: Option<StudyStepTally>,
+    taps: Option<Vec<StudyTapSummary>>,
+    note: Option<String>,
+}
+
+/// What makes a cached [`StudyDiskSummary`] still true: the identity, mtime
+/// and length of the two files it was built from. Both are append-then-
+/// rename or append-only, so a change to either moves one of these three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StudyDiskFingerprint {
+    events: Option<(EventsFileState, std::time::SystemTime, u64)>,
+    index: Option<(std::time::SystemTime, u64)>,
+}
+
+/// The listing's cache, keyed by results directory.
+///
+/// A study's records are immutable once it ends, and the newest 50 of them
+/// are ~1.3 MB each by type — re-parsing all of them on every listing is
+/// what this exists to avoid. A repeated listing costs two `stat`s per
+/// directory.
+///
+/// Keyed by full path rather than by study id so the map can never conflate
+/// two roots — [`read_studies`] takes both the root and the cache as
+/// arguments, which is what makes it testable against a temporary directory
+/// without the process-wide map in the middle.
+type StudiesCache = StdMutex<HashMap<PathBuf, (StudyDiskFingerprint, StudyDiskSummary)>>;
+
+/// Process-wide rather than on `AppState` for the same reason the binary
+/// hash's `OnceLock` in `api.rs` is: it is a memo of something already
+/// durable, not shared state anything else reads.
+fn studies_cache() -> &'static StudiesCache {
+    static CACHE: std::sync::OnceLock<StudiesCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn file_stamp(path: &FsPath) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len()))
+}
+
+fn fingerprint_study_dir(dir: &FsPath) -> StudyDiskFingerprint {
+    // `events.json` first: a directory briefly has both mid-rename, and the
+    // finalized one is the one that wins.
+    let events = file_stamp(&dir.join("events.json"))
+        .map(|(m, l)| (EventsFileState::Finalized, m, l))
+        .or_else(|| {
+            file_stamp(&dir.join("events.json.partial"))
+                .map(|(m, l)| (EventsFileState::Partial, m, l))
+        });
+    let index = file_stamp(&dir.join(stream_store::STREAMS_DIR).join(stream_store::INDEX_FILE));
+    StudyDiskFingerprint { events, index }
+}
+
+/// Reads one results directory into its cacheable half. Blocking; called
+/// from `spawn_blocking`, the same way [`study_steps_handler`]'s read is.
+fn read_study_disk_summary(dir: &FsPath, fingerprint: &StudyDiskFingerprint) -> StudyDiskSummary {
+    let mut notes: Vec<String> = Vec::new();
+
+    let events = fingerprint.events.map(|(state, _, _)| state).unwrap_or(EventsFileState::Missing);
+    let file = match events {
+        EventsFileState::Finalized => Some(dir.join("events.json")),
+        EventsFileState::Partial => Some(dir.join("events.json.partial")),
+        EventsFileState::Missing => None,
+    };
+
+    let mut study_name = None;
+    let mut started_utc_ms = None;
+    let mut ended_utc_ms = None;
+    let mut steps = None;
+
+    match file {
+        None => notes.push(
+            "this study has no events.json and no events.json.partial — it never wrote one"
+                .to_string(),
+        ),
+        Some(path) => match std::fs::read_to_string(&path) {
+            Err(e) => notes.push(format!("its events file could not be read: {e}")),
+            // A `.partial` is a *truncated* JSON document as often as not —
+            // the process died mid-write — so a parse failure here is the
+            // expected case for an interrupted study, not a corrupt one.
+            // Either way it is reported, never rendered as zero steps.
+            Ok(text) => match serde_json::from_str::<EventsFileForSteps>(&text) {
+                Err(e) => notes.push(format!("this build cannot read its events file: {e}")),
+                Ok(parsed) => {
+                    study_name = parsed.study_name;
+                    // The first start and the last end actually recorded,
+                    // rather than the first and last step's — a study whose
+                    // edges are half-stamped still places on a timeline.
+                    started_utc_ms = parsed.steps.iter().find_map(|s| s.started_utc_ms);
+                    ended_utc_ms = parsed.steps.iter().rev().find_map(|s| s.ended_utc_ms);
+                    let mut tally = StudyStepTally { total: parsed.steps.len(), ..Default::default() };
+                    for step in &parsed.steps {
+                        match outcome_name_and_reason(&step.outcome).0.as_str() {
+                            "Pass" => tally.passed += 1,
+                            "Fail" => tally.failed += 1,
+                            "TimedOut" => tally.timed_out += 1,
+                            _ => tally.unknown += 1,
+                        }
+                    }
+                    steps = Some(tally);
+                }
+            },
+        },
+    }
+
+    let taps = if fingerprint.index.is_none() {
+        notes.push(
+            "it captured no streams (it may predate streams/, or never have started)".to_string(),
+        );
+        None
+    } else {
+        let streams_dir = dir.join(stream_store::STREAMS_DIR);
+        match stream_store::read_index(&streams_dir) {
+            Ok(Some(index)) => Some(
+                index
+                    .streams
+                    .into_iter()
+                    .map(|e| StudyTapSummary {
+                        name: e.name,
+                        encoding: e.encoding,
+                        rendered: e.rendered_file.is_some(),
+                        named: e.named,
+                        timed: e.timed,
+                        self_excluded: e.self_excluded,
+                        source_deferred: e.source_deferred,
+                    })
+                    .collect(),
+            ),
+            Ok(None) | Err(_) => {
+                notes.push("this build cannot read its streams/index.json".to_string());
+                None
+            }
+        }
+    };
+
+    StudyDiskSummary {
+        events,
+        study_name,
+        started_utc_ms,
+        ended_utc_ms,
+        steps,
+        taps,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    }
+}
+
+/// The status of a study **the job registry has nothing to say about** — it
+/// ran under a Core that has since restarted, or never was in the registry.
+///
+/// The `Partial` arm is the one that matters and it is an invariant, not a
+/// detail:
+///
+/// - never `completed`, because it is not — the writer never finalized;
+/// - never `failed`, because nobody said it failed. A failure's `reason`
+///   lived in the registry, which does not survive a restart, and a failed
+///   run leaves exactly the same `.partial` on disk as a run whose Core was
+///   killed mid-study. From disk alone the two are indistinguishable, so
+///   this reports the fact it has — the run stopped without finishing —
+///   rather than inventing the one it does not.
+fn study_status_from_disk(events: EventsFileState) -> &'static str {
+    match events {
+        EventsFileState::Finalized => "completed",
+        EventsFileState::Partial => "interrupted",
+        EventsFileState::Missing => "unknown",
+    }
+}
+
+/// Every study still on disk, newest first, bounded by the retention count
+/// already in force — so this lists exactly what the sweep keeps, never a
+/// row that is about to vanish or a study the sweep would have spared.
+///
+/// A results directory is the durable record and outlives the process that
+/// wrote it, so the disk is the source of truth for *what ran* and the job
+/// registry only for *what is running now*. That split is why a restart
+/// turns a row's status from `running` into `interrupted` and never loses
+/// the row.
+// route: GET /studies
+pub async fn studies_handler(
+    State(state): State<AppState>,
+) -> Result<Json<StudiesResponse>, (StatusCode, String)> {
+    let root = study_results_root().map_err(internal_err)?;
+    let keep = stream_store::study_results_keep();
+
+    let disk: Vec<(String, StudyDiskSummary)> =
+        tokio::task::spawn_blocking(move || read_studies(&root, keep, studies_cache()))
+            .await
+            .map_err(internal_err)?
+            .map_err(internal_err)?;
+
+    // The registry is consulted once, after all the disk work — holding a
+    // std mutex across a blocking read would be the one way to make a
+    // listing cost a study.
+    let jobs = state.study_jobs.lock().unwrap();
+    let studies = disk
+        .into_iter()
+        .map(|(study_id, d)| {
+            let job = jobs.get(&study_id);
+            StudySummaryResponse {
+                status: match job {
+                    Some(job) => job.status.clone(),
+                    None => study_status_from_disk(d.events).to_string(),
+                },
+                study_id,
+                study_name: d.study_name,
+                started_utc_ms: d.started_utc_ms,
+                ended_utc_ms: d.ended_utc_ms,
+                steps: d.steps,
+                taps: d.taps,
+                note: d.note,
+            }
+        })
+        .collect();
+
+    Ok(Json(StudiesResponse { studies, keep }))
+}
+
+/// [`studies_handler`]'s blocking half: enumerate, fingerprint, and parse
+/// only what changed.
+fn read_studies(
+    root: &FsPath,
+    keep: usize,
+    cache: &StudiesCache,
+) -> anyhow::Result<Vec<(String, StudyDiskSummary)>> {
+    let mut dirs = stream_store::study_result_dirs(root)?;
+    if keep > 0 {
+        dirs.truncate(keep);
+    }
+
+    let mut out = Vec::with_capacity(dirs.len());
+    let mut cache = cache.lock().unwrap();
+    let mut live: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for (_, path) in &dirs {
+        let Some(study_id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let fingerprint = fingerprint_study_dir(path);
+        let summary = match cache.get(path) {
+            Some((cached, summary)) if *cached == fingerprint => summary.clone(),
+            _ => {
+                let summary = read_study_disk_summary(path, &fingerprint);
+                cache.insert(path.clone(), (fingerprint, summary.clone()));
+                summary
+            }
+        };
+        live.insert(path.clone());
+        out.push((study_id.to_string(), summary));
+    }
+
+    // A swept study's entry would otherwise sit here forever. Only entries
+    // under *this* root are candidates — another root's are not this
+    // listing's to evict.
+    cache.retain(|path, _| !path.starts_with(root) || live.contains(path));
+
+    Ok(out)
 }
 
 // ---- GET /study/{study_id}/stream/{name}, and the three routes it replaces --
@@ -4289,6 +4699,207 @@ mod tests {
         assert!(!steps_response(parsed).timed);
     }
 
+    // ---- GET /studies ------------------------------------------------------
+
+    /// Writes one results directory under `root` and returns its id.
+    /// `events` is `None` for a study that wrote neither file.
+    fn fake_study_dir(root: &FsPath, nth: u8, events: Option<(&str, &str)>) -> String {
+        // A 32-hex name, because that is what `study_result_dirs` will
+        // consider — a fixture with a friendlier name would be skipped.
+        let study_id: String = (0..16).map(|i| format!("{:02x}", nth.wrapping_add(i))).collect();
+        let dir = root.join(&study_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some((file, body)) = events {
+            std::fs::write(dir.join(file), body).unwrap();
+        }
+        study_id
+    }
+
+    const TWO_STEPS: &str = r#"{"study_name":"nightly","steps":[
+        {"step_name":"a","outcome":"Pass","started_utc_ms":10,"ended_utc_ms":20},
+        {"step_name":"b","outcome":{"Fail":{"reason":"HCI 0x08"}},"started_utc_ms":20,"ended_utc_ms":45}]}"#;
+
+    #[test]
+    fn the_listing_tallies_outcomes_and_takes_its_edges_from_the_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        fake_study_dir(root.path(), 1, Some(("events.json", TWO_STEPS)));
+
+        let out = read_studies(root.path(), 50, &cache).unwrap();
+        assert_eq!(out.len(), 1);
+        let s = &out[0].1;
+        assert_eq!(s.study_name.as_deref(), Some("nightly"));
+        let tally = s.steps.clone().expect("a readable events.json has a tally");
+        assert_eq!(tally, StudyStepTally { total: 2, passed: 1, failed: 1, ..Default::default() });
+        assert_eq!(s.started_utc_ms, Some(10));
+        assert_eq!(s.ended_utc_ms, Some(45));
+    }
+
+    #[test]
+    fn a_partial_events_file_with_no_job_behind_it_is_interrupted_and_never_completed_or_failed() {
+        // The invariant this route exists to hold. A `.partial` means the
+        // writer never finalized — which a failed study and a Core that was
+        // killed mid-run leave behind identically, so the status says the
+        // one thing disk actually knows.
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        fake_study_dir(root.path(), 2, Some(("events.json.partial", TWO_STEPS)));
+
+        let out = read_studies(root.path(), 50, &cache).unwrap();
+        assert_eq!(out[0].1.events, EventsFileState::Partial);
+        assert_eq!(study_status_from_disk(out[0].1.events), "interrupted");
+        // And the steps it did record are still counted — an interrupted
+        // study is a diagnostic artifact, not a blank.
+        assert_eq!(out[0].1.steps.clone().unwrap().total, 2);
+    }
+
+    #[test]
+    fn a_finalized_events_file_wins_over_a_partial_left_beside_it() {
+        // Mid-rename, and after a rename on a filesystem that left the old
+        // name behind, a directory has both. The finalized one is the study.
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        let id = fake_study_dir(root.path(), 3, Some(("events.json", TWO_STEPS)));
+        std::fs::write(root.path().join(&id).join("events.json.partial"), "{").unwrap();
+
+        let out = read_studies(root.path(), 50, &cache).unwrap();
+        assert_eq!(out[0].1.events, EventsFileState::Finalized);
+        assert_eq!(study_status_from_disk(out[0].1.events), "completed");
+        assert!(out[0].1.steps.is_some(), "it parsed the finalized file, not the truncated one");
+    }
+
+    #[test]
+    fn a_study_this_build_cannot_parse_says_so_rather_than_reading_as_an_empty_study() {
+        // "Ran no steps" and "we could not read its steps" are opposite
+        // facts. `steps: None` is the one a caller branches on; the note is
+        // for the person.
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        fake_study_dir(root.path(), 4, Some(("events.json", r#"{"steps":[{"step_"#)));
+
+        let out = read_studies(root.path(), 50, &cache).unwrap();
+        assert!(out[0].1.steps.is_none());
+        assert!(
+            out[0].1.note.as_deref().unwrap().contains("cannot read its events file"),
+            "note was {:?}",
+            out[0].1.note
+        );
+    }
+
+    #[test]
+    fn a_directory_with_neither_events_file_is_unknown_not_completed() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        fake_study_dir(root.path(), 5, None);
+
+        let out = read_studies(root.path(), 50, &cache).unwrap();
+        assert_eq!(study_status_from_disk(out[0].1.events), "unknown");
+        assert!(out[0].1.steps.is_none());
+        assert!(out[0].1.taps.is_none(), "no streams/index.json means no tap list, not zero taps");
+    }
+
+    #[test]
+    fn the_listing_is_newest_first_and_bounded_by_the_retention_count() {
+        // Bounded by `keep` so the listing shows exactly what the sweep
+        // keeps — a row that is about to be deleted is worse than no row.
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        let mut ids = Vec::new();
+        for n in 0..4u8 {
+            let id = fake_study_dir(root.path(), n * 7 + 1, Some(("events.json", TWO_STEPS)));
+            // Distinct mtimes, set explicitly: four directories created in
+            // the same millisecond would order on the tie-break instead and
+            // this test would pin nothing.
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + u64::from(n));
+            filetime_set(&root.path().join(&id), t);
+            ids.push(id);
+        }
+
+        let all = read_studies(root.path(), 0, &cache).unwrap();
+        assert_eq!(all.len(), 4, "keep == 0 is retention off, so the listing is unbounded too");
+        let got: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+        let want: Vec<&str> = ids.iter().rev().map(|s| s.as_str()).collect();
+        assert_eq!(got, want, "newest first");
+
+        let two = read_studies(root.path(), 2, &cache).unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].0, ids[3], "and the bound takes the newest, not the first found");
+    }
+
+    /// Sets a directory's mtime without pulling in a crate for it — the two
+    /// `utimensat` call sites in this test file are the only ones in Core.
+    #[cfg(unix)]
+    fn filetime_set(path: &FsPath, t: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let times = [
+            libc::timespec { tv_sec: secs, tv_nsec: 0 },
+            libc::timespec { tv_sec: secs, tv_nsec: 0 },
+        ];
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a NUL-terminated path that outlives the call, and
+        // `times` is a two-element array, which is what utimensat reads.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat failed for {}", path.display());
+    }
+
+    #[cfg(not(unix))]
+    fn filetime_set(_path: &FsPath, _t: std::time::SystemTime) {
+        // Windows has no libc utimensat; the ordering test still runs there
+        // against creation order, which is the same order on this fixture.
+    }
+
+    /// Unix-only because it turns on setting an mtime by hand, and
+    /// `filetime_set` is a no-op elsewhere. What it pins is
+    /// platform-independent; the way it pins it is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_listing_reuses_the_cache_and_a_changed_file_invalidates_it() {
+        // The whole point of the cache: 50 studies at ~1.3 MB each is not a
+        // per-listing parse. Observed through the result rather than a
+        // counter — the cached summary is stale by construction here, so
+        // seeing the old name proves it was not re-read.
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        let id = fake_study_dir(root.path(), 9, Some(("events.json", TWO_STEPS)));
+        let path = root.path().join(&id).join("events.json");
+        let pinned = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        filetime_set(&path, pinned);
+        assert_eq!(read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
+
+        // Same length, same name, same mtime — a rewrite the fingerprint
+        // genuinely cannot see. It reads back cached, which is the only way
+        // to observe from outside that nothing was re-parsed.
+        std::fs::write(&path, TWO_STEPS.replace("nightly", "renamed")).unwrap();
+        filetime_set(&path, pinned);
+        assert_eq!(read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
+
+        // A change that moves the length is seen.
+        std::fs::write(&path, TWO_STEPS.replace("nightly", "renamed for real")).unwrap();
+        assert_eq!(
+            read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(),
+            Some("renamed for real")
+        );
+    }
+
+    #[test]
+    fn a_swept_study_drops_out_of_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = StudiesCache::default();
+        let id = fake_study_dir(root.path(), 11, Some(("events.json", TWO_STEPS)));
+        read_studies(root.path(), 50, &cache).unwrap();
+        assert!(cache.lock().unwrap().contains_key(&root.path().join(&id)));
+
+        std::fs::remove_dir_all(root.path().join(&id)).unwrap();
+        assert!(read_studies(root.path(), 50, &cache).unwrap().is_empty());
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "a swept study's entry would otherwise sit in the cache forever"
+        );
+    }
+
     fn test_step_result(name: &str) -> StepResult {
         StepResult {
             step_name: heapless::String::try_from(name).unwrap(),
@@ -4702,6 +5313,118 @@ mod tests {
         assert_eq!(std::fs::read(streams.join("trace.bin")).unwrap(), b"hello");
         assert!(!streams.join("trace.csv").exists());
         assert!(!streams.join("trace.txt").exists());
+    }
+
+    // ---- StreamText: the live half of a `Text` tap -------------------------
+
+    #[test]
+    fn a_text_tap_pushes_its_chunk_live_and_keeps_writing_the_same_bytes_to_disk() {
+        // The event is *beside* the raw write, not instead of it: a console
+        // that only existed live would be a console the run could not be
+        // read back from.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(
+                0,
+                "shell",
+                StreamSource::Signal { name: heapless::String::try_from("nus").unwrap() },
+                StreamEncoding::Text,
+            )],
+        );
+        let capture = test_capture(dir.path(), study);
+        let mut rx = capture.events_tx.subscribe();
+        capture.open_step_index.store(2, Ordering::Relaxed);
+
+        let record =
+            StreamRecord { rx_utc_ms: 55, bytes: heapless::Vec::from_slice(b"uart:~$ ").unwrap() };
+        write_stream_record(&capture, &capture.study.streams[0].clone(), &record);
+
+        // `.txt` rather than `.bin`, because for `Text` the raw file *is*
+        // the rendering — and it is still written.
+        assert_eq!(std::fs::read(dir.path().join("streams").join("shell.txt")).unwrap(), b"uart:~$ ");
+
+        match rx.try_recv().unwrap() {
+            StudyEvent::StreamText { stream_id, stream_name, step_index, rx_utc_ms, text, .. } => {
+                assert_eq!(stream_id, 0);
+                assert_eq!(stream_name, "shell");
+                // Whichever step was open when the bytes arrived — the same
+                // rule every other per-record writer here follows.
+                assert_eq!(step_index, 2);
+                assert_eq!(rx_utc_ms, 55);
+                // Verbatim: no trailing newline invented, no prompt trimmed.
+                assert_eq!(text, "uart:~$ ");
+            }
+            other => panic!("expected StreamText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_text_chunk_that_splits_a_line_or_a_character_is_carried_as_it_arrived() {
+        // Core frames nothing. Two chunks that together make one line stay
+        // two chunks, and a UTF-8 character split across the boundary costs
+        // a replacement character rather than the chunk — assembling either
+        // is the consumer's job (`StudyEvent::StreamText`).
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(0, "console", StreamSource::DevBenchLog, StreamEncoding::Text)],
+        );
+        let capture = test_capture(dir.path(), study);
+        let mut rx = capture.events_tx.subscribe();
+        let tap0 = capture.study.streams[0].clone();
+
+        // "é" is 0xc3 0xa9, split across the two records.
+        for bytes in [b"half a lin".to_vec(), vec![0xc3], vec![0xa9, b'\n']] {
+            write_stream_record(
+                &capture,
+                &tap0,
+                &StreamRecord { rx_utc_ms: 1, bytes: heapless::Vec::from_slice(&bytes).unwrap() },
+            );
+        }
+
+        let texts: Vec<String> = (0..3)
+            .map(|_| match rx.try_recv().unwrap() {
+                StudyEvent::StreamText { text, .. } => text,
+                other => panic!("expected StreamText, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts[0], "half a lin");
+        assert_eq!(texts[1], "\u{fffd}");
+        assert_eq!(texts[2], "\u{fffd}\n");
+        // The file, meanwhile, has the character intact — the lossy decode
+        // is the event's, never the capture's.
+        assert_eq!(
+            std::fs::read(dir.path().join("streams").join("console.txt")).unwrap(),
+            "half a liné\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_raw_tap_pushes_no_event_at_all() {
+        // Deliberate, not forgotten: a console of hex is noise. Pinned so
+        // that adding one later is a decision someone takes, not a test
+        // nobody had to change.
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_taps(
+            &[1_000],
+            &[tap(
+                0,
+                "blob",
+                StreamSource::Signal { name: heapless::String::try_from("outpost").unwrap() },
+                StreamEncoding::Raw,
+            )],
+        );
+        let capture = test_capture(dir.path(), study);
+        let mut rx = capture.events_tx.subscribe();
+
+        write_stream_record(
+            &capture,
+            &capture.study.streams[0].clone(),
+            &StreamRecord { rx_utc_ms: 1, bytes: heapless::Vec::from_slice(b"hello").unwrap() },
+        );
+
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     #[test]
