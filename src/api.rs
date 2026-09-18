@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
 use crate::{chip_resolve, hardware, logs, serial, study};
@@ -270,6 +270,33 @@ struct StatusResponse {
     /// skew, unchanged. There is deliberately no separate hand-bumped
     /// `contract_version` beside this; decision 13's amendment has why.
     core_version: &'static str,
+    /// SHA-256 of this process's own executable bytes, lowercase hex —
+    /// decision 67's content identity, closing the gap `core_version`
+    /// leaves for a same-version rebuild whose deploy silently didn't land
+    /// (`embarch-umbrella` doctor check 15). `None` if the executable's own
+    /// path couldn't be read back (permissions, a deleted/replaced binary);
+    /// `/status` still serves everything else in that case (decision 68).
+    binary_sha256: Option<String>,
+}
+
+/// Hashes `std::env::current_exe()`'s bytes once and caches the result —
+/// the running process's own bytes cannot change under it mid-run, so
+/// re-hashing per `/status` call would only cost a full-binary read for no
+/// new information (decision 67, decision 68).
+fn binary_sha256() -> Option<String> {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
+    HASH.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let path = std::env::current_exe().ok()?;
+        let bytes = std::fs::read(path).ok()?;
+        // `sha2` 0.11's `Digest::digest` returns a `hybrid-array` `Array`,
+        // which (unlike 0.10's `GenericArray`) does not implement
+        // `LowerHex` — hex-encode byte-by-byte instead of formatting the
+        // digest directly.
+        let digest = Sha256::digest(&bytes);
+        Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+    })
+    .clone()
 }
 
 // route: GET /status
@@ -284,6 +311,7 @@ async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> 
         probes,
         study_designer_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
         core_version: env!("CARGO_PKG_VERSION"),
+        binary_sha256: binary_sha256(),
     }))
 }
 
@@ -1896,6 +1924,7 @@ mod tests {
             probes: Vec::new(),
             study_designer_schema_version: 7,
             core_version: "9.9.9",
+            binary_sha256: Some("a".repeat(64)),
         })
         .unwrap();
 
@@ -1909,6 +1938,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "binary_sha256",
                 "core_version",
                 "probes",
                 "status",
@@ -1944,6 +1974,37 @@ mod tests {
             "no hand-bumped contract_version is served (decision 13, amended \
              2026-09-03); if one is added, say so in interfaces.md"
         );
+    }
+
+    /// `binary_sha256` matches an independent SHA-256 of the same
+    /// `std::env::current_exe()` bytes this test binary is running from —
+    /// the property that makes the field worth trusting as "what bytes are
+    /// running" (decision 67, decision 68).
+    #[tokio::test]
+    async fn status_serves_a_self_hash_of_its_own_binary() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        use sha2::{Digest, Sha256};
+        let exe = std::env::current_exe().expect("test binary has a resolvable exe path");
+        let bytes = std::fs::read(exe).expect("test binary's own exe is readable");
+        let expected: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        assert_eq!(body["binary_sha256"], expected);
     }
 
     // ---- pinning `embarch_topology::hardware::{EnrolledBoard, Alert}` against

@@ -714,6 +714,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "service-manager",
+ "sha2",
  "tempfile",
  "time",
  "tokio",

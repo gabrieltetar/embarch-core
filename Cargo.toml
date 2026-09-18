@@ -46,6 +46,15 @@ probe-rs = "0.31"
 rand = "0.10.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# `GET /status`'s `binary_sha256` (decision 68, `api.rs`) — hashes this
+# process's own executable bytes. Not a new hashing crate: `probe-rs` (via
+# `espflash`) already pulls in `sha2 v0.11.0` transitively (`cargo tree -i
+# sha2`), so this is a direct dependency on a crate already compiled into
+# this binary, not a second one. Pinned to "0.11" to match that resolved
+# version rather than "0.10" (what `embarch-umbrella` uses, a separate
+# workspace with its own lockfile) — 0.x semver treats a minor bump as
+# breaking, so "0.10" here would resolve a second copy alongside it.
+sha2 = "0.11"
 # `usbportinfo-interface` surfaces UsbPortInfo::interface, which
 # `embarch-topology`'s port detection (the code that used to be this
 # crate's own dev_bench.rs, before it moved wholesale) needs to tell two
