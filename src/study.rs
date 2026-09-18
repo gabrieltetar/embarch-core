@@ -3924,13 +3924,32 @@ pub async fn stream_arrivals_handler(
         )
     })?;
     let Some(file) = entry.arrival_file.clone() else {
+        // **Two opposite reasons, said apart.** An encoding that renders rows
+        // carries `core_rx_utc_ms` on every one of them and wants no sidecar;
+        // an encoding that *should* have one and has none is a study captured
+        // before Core kept it, and no later read can invent those times. A
+        // caller told the first when the second is true would go looking for a
+        // column that is not there.
+        let expected = matches!(
+            entry.encoding,
+            StreamEncoding::Text | StreamEncoding::OutpostTrace
+        );
         return Err((
             StatusCode::NOT_FOUND,
-            format!(
-                "tap '{name}' keeps no arrival sidecar — its encoding is {:?}, whose rendered rows \
-                 carry embarch-core's own core_rx_utc_ms themselves",
-                entry.encoding
-            ),
+            if expected {
+                format!(
+                    "tap '{name}' has no arrival sidecar, and its encoding is {:?} — which keeps \
+                     one. This study was captured before embarch-core did, so its bytes carry no \
+                     arrival times and no later read can supply them.",
+                    entry.encoding
+                )
+            } else {
+                format!(
+                    "tap '{name}' keeps no arrival sidecar — its encoding is {:?}, whose rendered \
+                     rows carry embarch-core's own core_rx_utc_ms themselves",
+                    entry.encoding
+                )
+            },
         ));
     };
 
