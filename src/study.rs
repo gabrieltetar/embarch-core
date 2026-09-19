@@ -323,6 +323,18 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // thing and is not done here (Milestone 7 Phase B's version gate).
     study.requires.validate().map_err(|e| e.to_string())?;
 
+    // The one requirement rule that needs a field outside `requires`: a
+    // declared outpost trace mode is read from the header frame of an
+    // outpost capture, so a study declaring one without opening that tap
+    // has stated something with no subject. Computed by the crate for the
+    // same reason `validate_taps` above is — Core holds no second copy of
+    // the rule.
+    embarch_study_designer::study::outpost_requirement_is_satisfiable(
+        &study.requires,
+        &study.streams,
+    )
+    .map_err(|e| e.to_string())?;
+
     let recomputed = steps_crc(&study.steps)
         .map_err(|_| "failed to recompute steps_crc (a step's encoding is unexpectedly large)".to_string())?;
     if recomputed != study.steps_crc {
@@ -1100,6 +1112,103 @@ pub async fn hello_handler(
     Ok(Json(info))
 }
 
+/// Reads the DUT's outpost header and refuses the study when it does not
+/// satisfy the declared mode (`embarch-study-designer`'s
+/// `Requirements.outpost`).
+///
+/// **The hardware lock is held across the whole thing, listen included, and
+/// that is a correctness argument rather than convenience.** The reset
+/// branch obviously needs it. So does the listen: without it a `POST /flash`
+/// could land a different image between the header this reads and the study
+/// that starts on the strength of it, and the check would have verified
+/// firmware that is no longer on the board — the exact outcome the check
+/// exists to prevent.
+///
+/// The reset itself goes through [`crate::hardware::reset`] directly rather
+/// than through `POST /reset`, because that route takes the same lock this
+/// already holds.
+async fn run_outpost_preflight(
+    state: &AppState,
+    study: &Study,
+    requirement: embarch_study_designer::study::OutpostModeRequirement,
+) -> Result<(), (StatusCode, String)> {
+    // `validate_study` already refused a requirement with no trace tap, so
+    // this is present; treated as a refusal rather than an `expect` because
+    // an invariant that fails should say so, not abort the process.
+    let signal_name = crate::outpost_preflight::trace_signal_name(&study.streams)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "this study requires an outpost mode but declares no outpost trace tap on a signal"
+                .to_string(),
+        ))?
+        .to_string();
+
+    // Which board to reset, if it comes to that: the signal's own declared
+    // origin role, not a hardcoded `"dut"`. A bench with two DUTs has two
+    // roles, and the signal is the thing that knows which one this trace
+    // leaves.
+    let origin_role = {
+        let name = signal_name.clone();
+        tokio::task::spawn_blocking(move || embarch_topology::hardware::find_signal(&name))
+            .await
+            .map_err(internal_err)?
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("couldn't read the declared route for '{signal_name}': {e:?}"),
+                )
+            })?
+            .map(|link| link.origin_role)
+    };
+
+    let _guard = crate::api::acquire_hw_lock(state, "POST /study outpost pre-flight").await?;
+
+    let name_for_read = signal_name.clone();
+    let reading = tokio::task::spawn_blocking(move || {
+        crate::outpost_preflight::read_header(&name_for_read, || {
+            let Some(role) = origin_role else {
+                return Err(format!(
+                    "signal '{name_for_read}' has no declared route, so there is no board to                      reset"
+                ));
+            };
+            let board = embarch_topology::hardware::find_enrolled_by_role(&role)
+                .map_err(|e| format!("couldn't read the enrollment for role '{role}': {e:?}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "signal '{name_for_read}' comes out of role '{role}', which is not                          enrolled — so the board carrying this study's outpost cannot be reset                          to get its power-on header (enrol it with POST /probes/enroll)"
+                    )
+                })?;
+            crate::hardware::reset(&board.chip, Some(&board.probe_serial))
+                .map_err(|e| format!("resetting '{role}' to get a power-on header failed: {e:?}"))
+        })
+    })
+    .await
+    .map_err(internal_err)?;
+
+    let reading = reading.map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
+
+    tracing::info!(
+        signal = reading.signal_name,
+        port = reading.port_name,
+        flags = format!("{:#04x}", reading.flags),
+        named = crate::outpost_preflight::describe_flags(reading.flags),
+        build_id = reading.build_id,
+        outpost_version = reading.outpost_version,
+        record_layout_version = reading.record_layout_version,
+        after_reset = reading.after_reset,
+        "outpost pre-flight read the DUT's header"
+    );
+
+    if requirement.satisfied_by(reading.flags) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::PRECONDITION_FAILED,
+            crate::outpost_preflight::describe_mismatch(&requirement, &reading),
+        ))
+    }
+}
+
 // ---- POST /study -----------------------------------------------------------
 
 /// `embarch-study-designer` spec.md §5.1: validate, take the study lock, open dev-bench and hand it
@@ -1175,6 +1284,30 @@ pub async fn post_study_handler(
             return Err((StatusCode::BAD_GATEWAY, msg));
         }
     };
+
+    // ---- the outpost mode pre-flight --------------------------------------
+    //
+    // **Before the gate, which is before `StudyStart`.** The version gate's
+    // own comment states the property this has to share: it runs before
+    // dev-bench is told to do anything, so a refusal leaves a bench that
+    // never started a step. A mode check landing after step 0 had begun
+    // would be a study that ran against the wrong firmware and then said
+    // so.
+    //
+    // It needs no reordering of the taps, and that is a fact about the
+    // firmware rather than a shortcut: the outpost repeats its header every
+    // `CONFIG_EMBARCH_OUTPOST_HEADER_INTERVAL_MS`, so this opens the trace
+    // signal's own port for a few seconds, reads one, and closes it again.
+    // See `outpost_preflight`'s doc comment for the `=0` build that is the
+    // one case needing a reset.
+    if let Some(requirement) = study.requires.outpost.filter(|r| !r.is_empty()) {
+        if let Err((status, msg)) =
+            run_outpost_preflight(&state, &study, requirement).await
+        {
+            release_lock();
+            return Err((status, msg));
+        }
+    }
 
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
@@ -4488,6 +4621,63 @@ mod tests {
         assert!(err.contains("steps_crc mismatch"), "{err}");
     }
 
+    /// A declared outpost mode is read from an outpost capture's header
+    /// frame. A study declaring one without opening that tap could never be
+    /// checked, so it is refused at submit rather than run unverified — and
+    /// refused *here*, before the live pre-flight opens a port, because
+    /// nothing about it needs hardware to decide.
+    #[test]
+    fn validate_study_rejects_an_outpost_mode_with_no_trace_tap() {
+        use embarch_study_designer::outpost::HeaderFlags;
+        use embarch_study_designer::study::OutpostModeRequirement;
+
+        let mut study = study_with_steps(&[1_000]);
+        study.requires.outpost = Some(OutpostModeRequirement {
+            required_set: HeaderFlags::TRACE_MARKERS,
+            required_clear: 0,
+        });
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("outpost trace tap"), "{err}");
+
+        // With the tap, the declaration is checkable and this function has
+        // nothing more to say about it — the mode itself is the live
+        // pre-flight's question, not this one's.
+        study.streams
+            .push(StreamTap {
+                id: 0,
+                name: heapless::String::try_from("trace").unwrap(),
+                source: StreamSource::Signal {
+                    name: heapless::String::try_from("outpost").unwrap(),
+                },
+                encoding: StreamEncoding::OutpostTrace,
+                scope: embarch_study_designer::streams::StreamScope::WholeStudy,
+            })
+            .unwrap();
+        study.streams_crc = streams_crc(&study.streams).unwrap();
+        assert!(validate_study(&study).is_ok(), "{:?}", validate_study(&study));
+    }
+
+    /// A build spec is a declaration, and its blank-field rules live in
+    /// `embarch-study-designer`. What this pins is that Core runs them at
+    /// all — a study whose spec could never resolve must not be accepted
+    /// and then fail after a reflash.
+    #[test]
+    fn validate_study_runs_the_build_specs_own_rules() {
+        use embarch_study_designer::study::BuildSpec;
+
+        let mut study = study_with_steps(&[1_000]);
+        study.requires.build = Some(BuildSpec {
+            board: Some(heapless::String::try_from("  ").unwrap()),
+            variant: None,
+            revision: None,
+            app: None,
+            snippets: Default::default(),
+            extra_args: Default::default(),
+        });
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("blank"), "{err}");
+    }
+
 
 
 
@@ -5926,16 +6116,19 @@ mod tests {
     // ---- decision 31: the POST /study version gate ------------------------
 
     fn requires(dev_bench: &str) -> Requirements {
-        Requirements {
-            dev_bench_version: heapless::String::try_from(dev_bench).unwrap(),
-            firmware_version: heapless::String::try_from("any").unwrap(),
-        }
+        requires_pair(dev_bench, "any")
     }
 
     fn requires_pair(dev_bench: &str, firmware: &str) -> Requirements {
         Requirements {
             dev_bench_version: heapless::String::try_from(dev_bench).unwrap(),
             firmware_version: heapless::String::try_from(firmware).unwrap(),
+            // The version gate is the subject of every test below it and
+            // neither of these two is part of it: a build spec is resolved
+            // by whoever submits, and the outpost mode is checked live in
+            // `run_outpost_preflight`, which needs a serial port.
+            build: None,
+            outpost: None,
         }
     }
 

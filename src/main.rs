@@ -10,6 +10,7 @@ mod serial;
 mod service;
 mod outpost_load;
 mod outpost_manifest;
+mod outpost_preflight;
 mod stream_store;
 mod study;
 mod token_store;
