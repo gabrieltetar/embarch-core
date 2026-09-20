@@ -854,7 +854,14 @@ async fn open_and_handshake(
     port_name: String,
     enrolled: &embarch_topology::hardware::EnrolledBoard,
 ) -> Result<(DevBenchLink, HelloAckInfo), String> {
+    // **`None` is "never read through a probe", not "does not match".** A
+    // role can hold a board type with no probe bound (`embarch-ui` decision
+    // 45), and the cross-check below then has nothing on its JTAG side. It
+    // reports *unavailable* rather than comparing against an empty string,
+    // which would read as a mismatch on every healthy bench.
     let probe_hardware_id = enrolled.hardware_id.clone();
+    let probe_hardware_id_text =
+        probe_hardware_id.clone().unwrap_or_else(|| "(never read through a probe)".to_string());
     let chip = enrolled.chip.clone();
     tokio::task::spawn_blocking(move || {
         let port_for_note = port_name.clone();
@@ -909,18 +916,24 @@ async fn open_and_handshake(
                 firmware_version,
                 hardware_id,
             })) => {
-                let identity = embarch_topology::hardware::compare_self_reported(
-                    &chip,
-                    &probe_hardware_id,
-                    &hardware_id,
-                );
+                let identity = match probe_hardware_id.as_deref() {
+                    Some(probe_id) => embarch_topology::hardware::compare_self_reported(
+                        &chip,
+                        probe_id,
+                        &hardware_id,
+                    ),
+                    // No probe half on this role: the question cannot be
+                    // asked, which is the same answer `NotReported` already
+                    // carries for a bench that sends no ID.
+                    None => embarch_topology::hardware::SelfReportedIdentity::NotReported,
+                };
                 tracing::info!(
                     dev_bench_schema_version = schema_version,
                     core_schema_version = DEV_BENCH_WIRE_SCHEMA_VERSION,
                     %firmware_version,
                     compatible,
                     bench_hardware_id = %hardware_id,
-                    %probe_hardware_id,
+                    probe_hardware_id = %probe_hardware_id_text,
                     link_identity = describe_identity(identity),
                     "dev-bench Hello/HelloAck handshake complete"
                 );
@@ -938,7 +951,7 @@ async fn open_and_handshake(
                 if identity == embarch_topology::hardware::SelfReportedIdentity::Mismatch {
                     return Err(format!(
                         "dev-bench topology mismatch: the board on the serial link reports chip ID \
-                         '{hardware_id}', but the enrolled probe just verified '{probe_hardware_id}' \
+                         '{hardware_id}', but the enrolled probe just verified '{probe_hardware_id_text}' \
                          over JTAG — these are different boards"
                     ));
                 }
@@ -948,7 +961,7 @@ async fn open_and_handshake(
                     firmware_version: firmware_version.to_string(),
                     self_reported_hardware_id: hardware_id.to_string(),
                     link_identity: describe_identity(identity).to_string(),
-                    probe_hardware_id: probe_hardware_id.clone(),
+                    probe_hardware_id: probe_hardware_id_text.clone(),
                 };
                 // The debug file's own boundary marker (§3 decision 37).
                 // Without it, a bench that reset between two studies produces
@@ -1178,7 +1191,16 @@ async fn run_outpost_preflight(
                         "signal '{name_for_read}' comes out of role '{role}', which is not                          enrolled — so the board carrying this study's outpost cannot be reset                          to get its power-on header (enrol it with POST /probes/enroll)"
                     )
                 })?;
-            crate::hardware::reset(&board.chip, Some(&board.probe_serial))
+            // A role can name a board type and hold no probe (`embarch-ui`
+            // decision 45); resetting needs the probe, so the absence is
+            // named rather than falling through to "no probe attached".
+            let probe_serial = board.probe_serial.as_deref().ok_or_else(|| {
+                format!(
+                    "signal '{name_for_read}' comes out of role '{role}', which holds no probe \
+                     — bind one before a reset can reach that board"
+                )
+            })?;
+            crate::hardware::reset(&board.chip, Some(probe_serial))
                 .map_err(|e| format!("resetting '{role}' to get a power-on header failed: {e:?}"))
         })
     })

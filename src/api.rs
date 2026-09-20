@@ -3,7 +3,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enroll", post(enroll_probe_handler))
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/probes/enrolled/{role}", delete(unenroll_probe_handler))
+        .route("/probes/enrolled/{role}/board", put(set_role_board_handler))
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
@@ -797,13 +798,18 @@ async fn enroll_probe_handler(
         .map_err(internal_err)?
         .map_err(internal_err)?;
 
+    // Both halves are `Option` on the row since `embarch-ui` decision 45 —
+    // a role can hold a board type with no probe — but *this* route is the
+    // one that writes the probe half, so a row it just produced always has
+    // both. The response shape stays flat rather than growing two nullable
+    // fields nothing could ever see as null.
     Ok(Json(EnrollProbeResponse {
-        probe_serial: board.probe_serial,
+        probe_serial: board.probe_serial.unwrap_or_default(),
         role: board.role,
         name: board.name,
         chip: board.chip,
-        hardware_id: board.hardware_id,
-        confirmed_at_utc_ms: board.confirmed_at_utc_ms,
+        hardware_id: board.hardware_id.unwrap_or_default(),
+        confirmed_at_utc_ms: board.confirmed_at_utc_ms.unwrap_or_default(),
     }))
 }
 
@@ -821,6 +827,73 @@ async fn list_enrolled_probes_handler() -> Result<Json<Vec<embarch_topology::har
         .map_err(internal_err)?
         .map_err(internal_err)
         .map(Json)
+}
+
+// ---- PUT /probes/enrolled/{role}/board --------------------------------------
+
+#[derive(Deserialize)]
+struct SetRoleBoardRequest {
+    /// The **board type** in this role — a shape a firmware repo builds
+    /// for (`nrf54l15dk`), not a piece of hardware.
+    board: String,
+    /// The probe-rs target that board type attaches as. Recorded now and
+    /// used by every later attach on this role, which is why it travels
+    /// with the board rather than being asked for at flash time.
+    chip: String,
+}
+
+/// Declares which board type is in a role, **without opening a probe**
+/// (`embarch-ui` decision 45).
+///
+/// **The half of a role that carries no identity claim.** Which probe
+/// serves a role and which board is in it are two independent facts: a
+/// probe gets moved between boards, and a board type is a shape rather than
+/// a unit of hardware. Saying which shape is in a role is a statement about
+/// the bench — it needs no attach, and it must work with nothing plugged
+/// in, because that is when a bench is usually being described.
+/// `POST /probes/enroll` remains the only route that reads an identity.
+///
+/// Takes `hw_lock` as an enrollment-file writer, like `/dev-bench/link` and
+/// `/signals`, and for the same reason: it races those writes, not any
+/// hardware. The role vocabulary is closed here too (decision 75).
+///
+/// **It deliberately leaves a stale `hardware_id` in place.** Changing the
+/// board type in a role usually means different silicon is on that probe
+/// now, and the recorded ID is what `POST /validate` compares against to
+/// *say so*. Clearing it here would turn a detectable disagreement into a
+/// clean-looking row that has simply never been checked.
+// route: PUT /probes/enrolled/{role}/board
+async fn set_role_board_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(role): axum::extract::Path<String>,
+    Json(req): Json<SetRoleBoardRequest>,
+) -> Result<Json<embarch_topology::hardware::EnrolledBoard>, (StatusCode, String)> {
+    let _guard = acquire_hw_lock(&state, "PUT /probes/enrolled/{role}/board").await?;
+
+    if !embarch_topology::hardware::is_canonical_role(&role) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{role}' is not a role — the roles are {}",
+                embarch_topology::hardware::CANONICAL_ROLES.join(" and ")
+            ),
+        ));
+    }
+    if req.board.trim().is_empty() || req.chip.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a role's board needs both a board type and the chip it attaches as".to_string(),
+        ));
+    }
+
+    let row = tokio::task::spawn_blocking(move || {
+        embarch_topology::hardware::set_role_board(&role, req.board.trim(), req.chip.trim())
+    })
+    .await
+    .map_err(internal_err)?
+    .map_err(internal_err)?;
+
+    Ok(Json(row))
 }
 
 // ---- DELETE /probes/enrolled/{role} -----------------------------------------
@@ -1201,13 +1274,16 @@ async fn validate_handler(
             let board = validation.board;
             Ok((
                 StatusCode::OK,
+                // Same reasoning as `/probes/enroll` above: a validation
+                // that *passed* read an identity through a probe, so both
+                // halves are present on the row it returns.
                 Json(ValidateOkResponse {
                     ok: true,
                     role: board.role,
-                    probe_serial: board.probe_serial,
+                    probe_serial: board.probe_serial.unwrap_or_default(),
                     chip: board.chip,
-                    hardware_id: board.hardware_id,
-                    confirmed_at_utc_ms: board.confirmed_at_utc_ms,
+                    hardware_id: board.hardware_id.unwrap_or_default(),
+                    confirmed_at_utc_ms: board.confirmed_at_utc_ms.unwrap_or_default(),
                     validated_at_utc_ms: validation.validated_at_utc_ms,
                 }),
             )
@@ -1246,6 +1322,19 @@ async fn validate_handler(
             // failure — `404`, matching `/dev-bench/port`'s own "unplugged
             // bench" posture.
             if e.downcast_ref::<embarch_topology::hardware::NotEnrolled>().is_some() {
+                let msg = format!("{e:?}");
+                tracing::info!("{msg}");
+                return Err((StatusCode::NOT_FOUND, msg));
+            }
+            // The role names a board type but holds no probe (`embarch-ui`
+            // decision 45), so there is nothing to read an identity
+            // through. **Also a `404`, and deliberately not a `503`**: the
+            // absent thing here is a *declaration*, not a cable, so
+            // retrying changes nothing until a human binds a probe — which
+            // is the same shape as the not-enrolled case above and a
+            // different one from `not_attached`, where the declaration
+            // exists and the hardware is missing.
+            if e.downcast_ref::<embarch_topology::hardware::NoProbeBound>().is_some() {
                 let msg = format!("{e:?}");
                 tracing::info!("{msg}");
                 return Err((StatusCode::NOT_FOUND, msg));
@@ -1658,6 +1747,7 @@ mod tests {
         ("POST", "/probes/enroll", "/probes/enroll"),
         ("GET", "/probes/enrolled", "/probes/enrolled"),
         ("DELETE", "/probes/enrolled/{role}", "/probes/enrolled/dut"),
+        ("PUT", "/probes/enrolled/{role}/board", "/probes/enrolled/dut/board"),
         ("POST", "/dev-bench/link", "/dev-bench/link"),
         ("POST", "/signals", "/signals"),
         ("GET", "/signals", "/signals"),
@@ -1706,7 +1796,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 27;
+    const DOCUMENTED_ROUTE_COUNT: usize = 28;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -2107,12 +2197,12 @@ mod tests {
 
     fn sample_enrolled_board() -> embarch_topology::hardware::EnrolledBoard {
         embarch_topology::hardware::EnrolledBoard {
-            probe_serial: "ABC123".to_string(),
+            probe_serial: Some("ABC123".to_string()),
             role: "dev-bench".to_string(),
             name: "bench-nrf54l15dk".to_string(),
             chip: "nrf54l15".to_string(),
-            hardware_id: "AAAA".to_string(),
-            confirmed_at_utc_ms: 1725000000000,
+            hardware_id: Some("AAAA".to_string()),
+            confirmed_at_utc_ms: Some(1725000000000),
             link_port_serial: Some("D607104".to_string()),
             link_port_interface: Some(2),
         }
