@@ -291,6 +291,37 @@ pub enum StudyEvent {
         header_seen: bool,
         rows: Vec<String>,
     },
+    /// One [`embarch_study_designer::decoder::StructLayout::chart_field`]
+    /// value, pushed the instant Core decodes the row that produced it — the
+    /// same [`write_struct_rows`] pass that appends the row to the tap's
+    /// rendered CSV, not held back until the step or study ends. The same
+    /// "decode and push live, alongside the post-hoc render that stays
+    /// authoritative" posture [`StudyEvent::OutpostRows`] already takes.
+    ///
+    /// **Never sent for a row `write_struct_rows` couldn't decode**, and
+    /// never sent at all when the layout declares no `chart_field` — a
+    /// layout opts into a live chart for exactly one of its declared
+    /// fields, not every numeric column charted at once
+    /// (`embarch-study-designer` decision 52's own `chart_field` doc).
+    ///
+    /// **Deliberately its own variant, not a `Sample`/`SampleBatch`.**
+    /// `Sample` carries a `Unit` and a `channel_id` that mean something
+    /// specific to a power/waveform tap and don't apply to a named struct
+    /// field — the same reasoning that gave [`StudyEvent::OutpostRows`] its
+    /// own shape instead of being folded into an existing variant.
+    ///
+    /// `stream_id`/`stream_name` identify the tap exactly as
+    /// [`StudyEvent::SampleBatch`]'s do; `core_rx_utc_ms` is the same
+    /// receipt-time value `write_stream_record` computes once for the record
+    /// this value was decoded from, not a second, later clock read.
+    StructChartValue {
+        study_id: String,
+        stream_id: u8,
+        stream_name: String,
+        field_name: String,
+        value: f64,
+        core_rx_utc_ms: u64,
+    },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
 }
@@ -2753,7 +2784,15 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             // declared (`embarch-study-designer` decision 52) —
             // for a `GattNotify` tap, exactly one notification's raw ATT
             // value, with nothing wrapped around it.
-            write_struct_rows(capture, tap.id, open_step_index, decoder, record);
+            write_struct_rows(
+                capture,
+                tap.id,
+                tap.name.as_str(),
+                open_step_index,
+                decoder,
+                record,
+                core_rx_utc_ms,
+            );
         }
         StreamEncoding::Raw => {
             // Nothing declared, so nothing rendered. `Raw` is the honest
@@ -2770,12 +2809,24 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
 /// reason — never a dropped record and never a forced decode. The raw `.bin`
 /// is already on disk before this runs either way, so a wrong layout costs a
 /// rendering that can be redone, not a capture that cannot.
+///
+/// **Also pushes [`StudyEvent::StructChartValue`], purely additively.** For
+/// every row this function successfully decodes, if the layout declares a
+/// `chart_field`, its value for that row is pushed live alongside the CSV
+/// append — never in place of it, and never for a row that failed to decode
+/// (the `Err` arm below produces a row with empty columns, not a decoded row
+/// a chart value could come from). `core_rx_utc_ms` is
+/// `write_stream_record`'s own receipt-time stamp for this record, threaded
+/// through rather than re-read, so a chart value lands on the same clock as
+/// every other event this record produced.
 fn write_struct_rows(
     capture: &Capture,
     tap_id: u8,
+    tap_name: &str,
     step_index: u32,
     decoder: u8,
     record: &StreamRecord,
+    core_rx_utc_ms: u64,
 ) {
     let payload = record.bytes.as_slice();
     let Some(layout) = capture.study.decoders.get(usize::from(decoder)) else {
@@ -2806,11 +2857,36 @@ fn write_struct_rows(
     // once, below.
     let prefix = format!("{},{step_index},{step_name},", record.rx_utc_ms);
 
+    let chart_field_name = layout.chart_field.as_ref().map(|f| f.as_str().to_string());
+
     let rows: Vec<String> = match layout.row_count(payload) {
-        Ok(count) => (0..count)
-            .filter_map(|i| layout.row(payload, i).ok())
-            .map(|columns| format!("{prefix}{columns},,"))
-            .collect(),
+        Ok(count) => {
+            let mut rows = Vec::with_capacity(count);
+            for i in 0..count {
+                let Ok(columns) = layout.row(payload, i) else {
+                    // Same posture as the old `filter_map`: a row this
+                    // specific index can't render (unreachable in practice,
+                    // since `i < count` is exactly `row`'s own precondition)
+                    // costs that row, not the rest of the record.
+                    continue;
+                };
+                rows.push(format!("{prefix}{columns},,"));
+
+                if let Some(field_name) = &chart_field_name {
+                    if let Some(value) = layout.chart_value(payload, i) {
+                        let _ = capture.events_tx.send(StudyEvent::StructChartValue {
+                            study_id: capture.study_id.clone(),
+                            stream_id: tap_id,
+                            stream_name: tap_name.to_string(),
+                            field_name: field_name.clone(),
+                            value,
+                            core_rx_utc_ms,
+                        });
+                    }
+                }
+            }
+            rows
+        }
         Err(e) => {
             // One row, so the record is visibly present and visibly
             // undecoded, rather than absent and indistinguishable from a
@@ -3340,6 +3416,7 @@ fn event_study_id(event: &StudyEvent) -> &str {
         | StudyEvent::GattTranscript { study_id, .. }
         | StudyEvent::StreamText { study_id, .. }
         | StudyEvent::OutpostRows { study_id, .. }
+        | StudyEvent::StructChartValue { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -4413,7 +4490,7 @@ mod tests {
     /// `ppg_packet`: a two-field header then a repeating pair — the shape a
     /// real sensor notification actually has, and the whole reason
     /// `StreamEncoding::Samples` was not enough.
-    fn ppg_layout() -> embarch_study_designer::StructLayout {
+    fn ppg_layout(chart_field: Option<&str>) -> embarch_study_designer::StructLayout {
         use embarch_study_designer::{ScalarType, StructField, StructLayout};
         let field = |name: &str, ty| StructField {
             name: heapless::String::try_from(name).unwrap(),
@@ -4431,10 +4508,19 @@ mod tests {
                 field("red", ScalarType::I16Le),
             ])
             .unwrap(),
+            chart_field: chart_field.map(|f| heapless::String::try_from(f).unwrap()),
         }
     }
 
     fn study_with_struct_tap() -> Study {
+        study_with_struct_tap_charting(None)
+    }
+
+    /// Same shape as [`study_with_struct_tap`], with the `ppg_packet`
+    /// decoder's `chart_field` set to `chart_field` — for the
+    /// `StudyEvent::StructChartValue` tests, which need a layout that
+    /// actually declares one.
+    fn study_with_struct_tap_charting(chart_field: Option<&str>) -> Study {
         use embarch_study_designer::Uuid;
         let mut study = study_with_taps(
             &[1_000, 2_000],
@@ -4449,7 +4535,7 @@ mod tests {
                 StreamEncoding::Struct { decoder: 0 },
             )],
         );
-        study.decoders.push(ppg_layout()).unwrap();
+        study.decoders.push(ppg_layout(chart_field)).unwrap();
         study
     }
 
@@ -4546,6 +4632,71 @@ mod tests {
         // "nothing arrived".
         let raw = std::fs::read(dir.path().join("streams").join("ppg.bin")).unwrap();
         assert_eq!(raw.len(), 6);
+    }
+
+    #[test]
+    fn a_declared_chart_field_pushes_one_struct_chart_value_event_per_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let study = study_with_struct_tap_charting(Some("green"));
+        let capture = test_capture(dir.path(), study);
+        let mut rx = capture.events_tx.subscribe();
+        let tap = capture.study.streams[0].clone();
+
+        // seq = 41, timestamp = 90146, then two (green, red) pairs: (1, 2)
+        // and (-1, -2) -- the same payload `a_struct_encoded_record_renders_
+        // one_row_per_repetition` uses, so the chart values are the same
+        // `green` column that test already pins in the CSV.
+        let mut payload = vec![0x29, 0x00, 0x22, 0x60, 0x01, 0x00];
+        payload.extend_from_slice(&[0x01, 0x00, 0x02, 0x00]);
+        payload.extend_from_slice(&[0xff, 0xff, 0xfe, 0xff]);
+        write_stream_record(&capture, &tap, &struct_record(4_242, &payload));
+
+        for expected in [1.0, -1.0] {
+            match rx.try_recv().unwrap() {
+                StudyEvent::StructChartValue {
+                    stream_id, stream_name, field_name, value, ..
+                } => {
+                    assert_eq!(stream_id, 0);
+                    assert_eq!(stream_name, "ppg");
+                    assert_eq!(field_name, "green");
+                    assert_eq!(value, expected);
+                }
+                other => panic!("expected StructChartValue, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "exactly one chart value per decoded row, no more"
+        );
+    }
+
+    #[test]
+    fn no_chart_field_declared_pushes_no_struct_chart_value_event() {
+        // The ordinary case: most layouts don't opt into a live chart, and
+        // `write_struct_rows` must not invent one.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), study_with_struct_tap());
+        let mut rx = capture.events_tx.subscribe();
+        let tap = capture.study.streams[0].clone();
+
+        write_stream_record(&capture, &tap, &struct_record(1, &[0x29, 0x00, 0x22, 0x60, 0x01, 0x00]));
+
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_row_that_fails_to_decode_pushes_no_struct_chart_value_event() {
+        // A payload too short to fit the layout still gets a CSV row (its
+        // decoded columns empty) but produces no row `chart_value` could
+        // ever read -- so no chart event, either.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), study_with_struct_tap_charting(Some("green")));
+        let mut rx = capture.events_tx.subscribe();
+        let tap = capture.study.streams[0].clone();
+
+        write_stream_record(&capture, &tap, &struct_record(7, &[0x01, 0x02, 0x03]));
+
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     // ---- write_transcript_entry (`embarch-study-designer` decision 14) ----
