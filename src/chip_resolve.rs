@@ -61,7 +61,7 @@ const SOC_TO_CHIP: &[(&str, &str)] = &[
     //
     // What the loss does and does not cost was measured against probe-rs's
     // own registry rather than reasoned about, because the first repo to need
-    // this row (client) builds for two different G0B1 packages through
+    // this row (a client repo) builds for two different G0B1 packages through
     // this one key — its custom `client_core` board (STM32G0B1**VE**, per
     // its `board.cmake` J-Link `--device`) and upstream Zephyr's
     // `nucleo_g0b1re` bring-up board (STM32G0B1**RE**). Dumping
