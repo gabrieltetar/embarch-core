@@ -1709,7 +1709,7 @@ mod tests {
     // twelve of the twenty-six registered paths had a test and fourteen —
     // including every `/study*` route, the newest surface — had none. So the
     // list is derived from `build_router`'s own source instead
-    // (`embarch-doc/embarch-core/decisions/auth.md` decision 42).
+    // (`embarch-doc/embarch-core/decisions/route-sweep.md` decision 42).
     // `every_registered_route_has_an_auth_case` fails when a
     // registered path has no row in `AUTH_CASES`, and the two sweeps below
     // drive every row through the real router with no token and with a wrong
