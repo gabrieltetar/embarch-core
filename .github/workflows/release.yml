@@ -114,6 +114,12 @@ jobs:
         with:
           repository: gabrieltetar/embarch-topology
           path: embarch-topology
+      # `embarch-smp`, the third sibling path dependency (`POST /bootload`,
+      # decision 77), checked out the same way.
+      - uses: actions/checkout@v4
+        with:
+          repository: gabrieltetar/embarch-smp
+          path: embarch-smp
 
       - uses: dtolnay/rust-toolchain@stable
         with:

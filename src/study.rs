@@ -77,6 +77,45 @@ pub type JobRegistry = Arc<StdMutex<HashMap<String, StudyJob>>>;
 /// is in flight.
 pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
+/// The serial ports a study's `Route::Direct` taps hold open right now, by
+/// name (`AppState::tap_ports`, decision 77).
+///
+/// Those taps take no lock (see [`Capture`]), and Windows lets one process
+/// open a COM port once, so `POST /bootload` reading a port a tap already
+/// holds would fail with an opaque open error mid-study. This is what lets
+/// it refuse by name instead. A list, not a set: two taps on one port is a
+/// study that fails at its second open, and the first must still count.
+#[derive(Clone, Default)]
+pub struct TapPorts(Arc<StdMutex<Vec<String>>>);
+
+impl TapPorts {
+    /// Held until the returned claim drops, which is when the tap's reader
+    /// has stopped and its port is closed.
+    pub(crate) fn claim(&self, port: &str) -> TapPortClaim {
+        self.0.lock().unwrap().push(port.to_string());
+        TapPortClaim { ports: self.clone(), port: port.to_string() }
+    }
+
+    /// Whether a tap holds `port`. Case-blind, because Windows port names are.
+    pub fn holds(&self, port: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|p| p.eq_ignore_ascii_case(port))
+    }
+}
+
+pub(crate) struct TapPortClaim {
+    ports: TapPorts,
+    port: String,
+}
+
+impl Drop for TapPortClaim {
+    fn drop(&mut self) {
+        let mut ports = self.ports.0.lock().unwrap();
+        if let Some(i) = ports.iter().position(|p| *p == self.port) {
+            ports.remove(i);
+        }
+    }
+}
+
 /// Live-progress state kept in the job registry. **Never holds a full
 /// `StudyResult`** — measured at ~1.3 MB purely from `embarch-study-
 /// designer`'s no_std worst-case capacity fields (`heapless::Vec<StepResult,
@@ -1453,6 +1492,7 @@ pub async fn post_study_handler(
     let study_lock = state.study_lock.clone();
     let events_tx = state.study_events.clone();
     let manifest_slot = state.outpost_manifest.clone();
+    let tap_ports = state.tap_ports.clone();
     let study_id_for_task = study_id.clone();
 
     tokio::spawn(async move {
@@ -1469,6 +1509,7 @@ pub async fn post_study_handler(
                 events_tx,
                 provenance,
                 manifest_slot,
+                tap_ports,
                 study_start_utc_ms,
             )
         })
@@ -1502,6 +1543,9 @@ pub async fn post_study_handler(
 /// `/flash` on it would invent contention that does not exist.
 struct Capture {
     study: Study,
+    /// Where this study's `Route::Direct` taps register the ports they hold
+    /// (`AppState::tap_ports`).
+    tap_ports: TapPorts,
     /// Every tap this study actually has a file for: the ones it declared,
     /// plus the synthesized reserved `dev-bench` log tap appended last
     /// (`embarch-study-designer`'s `dev_bench_log_tap`).
@@ -1585,6 +1629,7 @@ fn run_study_to_completion(
     events_tx: broadcast::Sender<StudyEvent>,
     provenance: Provenance,
     manifest_slot: crate::outpost_manifest::ManifestSlot,
+    tap_ports: TapPorts,
     study_start_utc_ms: u64,
 ) {
     let results_dir = match study_results_dir(&study_id) {
@@ -1700,6 +1745,7 @@ fn run_study_to_completion(
 
     let capture = Arc::new(Capture {
         study,
+        tap_ports,
         taps,
         study_id: study_id.clone(),
         events_tx: events_tx.clone(),
@@ -2385,6 +2431,9 @@ struct SignalTapReader {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     port_name: String,
+    /// Dropped after the reader thread has joined, so `POST /bootload` never
+    /// sees the port as free while the thread still has it open.
+    _claim: TapPortClaim,
 }
 
 impl SignalTapReader {
@@ -2584,7 +2633,8 @@ fn start_signal_tap(
             .map_err(|e| format!("failed to start a reader thread for signal '{signal_name}': {e:?}"))?
     };
 
-    Ok(Some(SignalTapReader { stop, handle: Some(handle), port_name: port.port_name }))
+    let _claim = capture.tap_ports.claim(&port.port_name);
+    Ok(Some(SignalTapReader { stop, handle: Some(handle), port_name: port.port_name, _claim }))
 }
 
 /// Reads a signal port until the tap's scope ends or the study does, and
@@ -4424,6 +4474,7 @@ mod tests {
             .collect();
         Capture {
             study,
+            tap_ports: TapPorts::default(),
             taps,
             study_id: "test-study-id".to_string(),
             events_tx,

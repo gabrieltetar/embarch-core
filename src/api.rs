@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{chip_resolve, hardware, logs, serial, study};
+use crate::{bootload, chip_resolve, hardware, logs, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -48,6 +48,9 @@ pub struct AppState {
     /// the board delivered it (`embarch-outpost` decision 9,
     /// decision 30(c)). Empty until a `POST /flash` carries one.
     pub outpost_manifest: crate::outpost_manifest::ManifestSlot,
+    /// Serial ports a study's direct-route taps hold open, so
+    /// `POST /bootload` can refuse one by name (decision 77).
+    pub tap_ports: study::TapPorts,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
         Self {
             token,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
+            tap_ports: study::TapPorts::default(),
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock: Arc::new(StdMutex::new(None)),
@@ -135,6 +139,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status_handler))
         .route("/flash", post(flash_handler))
         .route("/reset", post(reset_handler))
+        .route("/bootload", post(bootload_handler))
+        .route("/bootload/ports", put(declare_bootload_ports_handler).get(get_bootload_ports_handler).delete(clear_bootload_ports_handler))
         .route("/serial-log", get(serial_log_handler))
         .route("/dev-bench/port", get(dev_bench_port_handler))
         .route("/dev-bench/hello", get(study::hello_handler))
@@ -621,6 +627,172 @@ async fn reset_handler(
         .map_err(describe_topology_error)?;
 
     Ok(Json(ResetResponse { reset: true }))
+}
+
+// ---- POST /bootload ---------------------------------------------------------
+
+/// A signed image into the DUT's MCUboot serial-recovery bootloader over its
+/// USB CDC ACM port (decision 77; the flow is `bootload.rs`).
+///
+/// **The image is checked before `hw_lock` is even taken**: serial recovery
+/// writes over the running application, so something that is not an MCUboot
+/// image is a `400` here rather than an erased DUT. Multipart only — a
+/// signed image is small, and one body shape is one less to keep in step.
+///
+/// Takes `hw_lock` like `/flash`: it is the DUT's one physical connection
+/// being written. Refuses a port a running study's direct-route tap holds,
+/// since those take no lock.
+// route: POST /bootload
+async fn bootload_handler(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<bootload::BootloadResult>, (StatusCode, String)> {
+    let plan = bootload_plan_from_multipart(multipart).await?;
+    bootload::check_image(&plan.image).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let _guard = acquire_hw_lock(&state, "POST /bootload").await?;
+    let taps = state.tap_ports.clone();
+    let manifests = state.outpost_manifest.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let dut = embarch_topology::hardware::DUT_ROLE;
+        let ports = embarch_topology::hardware::bootload::get(dut)
+            .map_err(internal_err)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "no bootload ports are declared for the DUT; declare them with PUT /bootload/ports".to_string(),
+                )
+            })?;
+        // The outpost manifest is keyed by chip (`ManifestSlot`), and an
+        // enrolled DUT row is the only thing that says which chip this is.
+        // With none, no flash of this DUT could have bound one either.
+        let dut_chip = embarch_topology::hardware::find_enrolled_by_role(dut)
+            .map_err(internal_err)?
+            .map(|row| row.chip);
+        bootload::run(&mut bootload::UsbBench, &ports, &plan, &taps, &bootload::PLACEHOLDER_TIMEOUTS, || {
+            // The same rule `/flash` follows for an image with no manifest:
+            // the one stored describes firmware that is about to be gone.
+            if let Some(chip) = &dut_chip {
+                manifests.clear_for_chip(chip);
+            }
+        })
+    })
+    .await
+    .map_err(internal_err)?
+    .map(Json)
+}
+
+/// Fields: `image` (the file, required), `entry_command`,
+/// `entry_line_ending` (`lf`/`cr`/`crlf`, default `lf`), `image_index`
+/// (default 0) and `buffer_size` (the DUT's
+/// `CONFIG_BOOT_SERIAL_MAX_RECEIVE_SIZE`; omitted, the conservative default,
+/// `embarch-smp` decision 7). A blank text field counts as omitted.
+async fn bootload_plan_from_multipart(mut multipart: Multipart) -> Result<bootload::Plan, (StatusCode, String)> {
+    let mut image: Option<Vec<u8>> = None;
+    let mut entry_command: Option<String> = None;
+    let mut line_ending = bootload::LineEnding::default();
+    let mut image_index = 0u32;
+    let mut fragmentation = embarch_smp::Fragmentation::default();
+
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, msg);
+    while let Some(field) = multipart.next_field().await.map_err(bad_multipart_field)? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "image" {
+            image = Some(field.bytes().await.map_err(bad_multipart_field)?.to_vec());
+            continue;
+        }
+        let text = field.text().await.map_err(bad_multipart_field)?;
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "entry_command" => entry_command = Some(text.to_string()),
+            "entry_line_ending" => line_ending = bootload::LineEnding::parse(text).map_err(bad)?,
+            "image_index" => {
+                image_index = text.parse().map_err(|_| bad(format!("invalid image_index '{text}'")))?
+            }
+            "buffer_size" => {
+                let size: usize = text.parse().map_err(|_| bad(format!("invalid buffer_size '{text}'")))?;
+                fragmentation = embarch_smp::Fragmentation::buffer_size(size);
+                fragmentation.validate().map_err(|e| bad(format!("buffer_size {size}: {e}")))?;
+            }
+            _ => {} // ignore unrecognized fields, as /flash does
+        }
+    }
+
+    let image = image.ok_or_else(|| bad("multipart body missing 'image' file part".to_string()))?;
+    Ok(bootload::Plan { image, image_index, entry_command, line_ending, fragmentation })
+}
+
+// ---- PUT/GET/DELETE /bootload/ports --------------------------------------------
+
+/// The DUT's two USB identities for bootloading
+/// (`embarch-topology` decision 36): its application's shell port, where
+/// the entry command goes, and its bootloader's, where SMP goes. The role
+/// is always the DUT's — dev-bench firmware goes on by probe — so it is not
+/// in the path.
+#[derive(Deserialize)]
+struct DeclareBootloadPortsRequest {
+    #[serde(default)]
+    app: Option<embarch_topology::hardware::UsbPortId>,
+    bootloader: embarch_topology::hardware::UsbPortId,
+}
+
+/// Declares (or replaces) them. A pair one port could match both of is a
+/// `400`: nothing could then tell which one is running. Takes `hw_lock` as
+/// an enrollment-file writer, like `POST /signals`.
+// route: PUT /bootload/ports
+async fn declare_bootload_ports_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DeclareBootloadPortsRequest>,
+) -> Result<Json<embarch_topology::hardware::BootloadPorts>, (StatusCode, String)> {
+    let ports = embarch_topology::hardware::BootloadPorts {
+        role: embarch_topology::hardware::DUT_ROLE.to_string(),
+        app: req.app,
+        bootloader: req.bootloader,
+    };
+    ports.check().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let _guard = acquire_hw_lock(&state, "PUT /bootload/ports").await?;
+    let stored = ports.clone();
+    tokio::task::spawn_blocking(move || embarch_topology::hardware::bootload::declare(stored))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+    Ok(Json(ports))
+}
+
+/// What is declared, or `404` when nothing is. A plain file read.
+// route: GET /bootload/ports
+async fn get_bootload_ports_handler(
+) -> Result<Json<embarch_topology::hardware::BootloadPorts>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(|| embarch_topology::hardware::bootload::get(embarch_topology::hardware::DUT_ROLE))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?
+        .map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no bootload ports are declared for the DUT".to_string()))
+}
+
+/// Retracts the declaration: `204`, or `404` when there was none — the same
+/// distinction `DELETE /signals/{name}` draws.
+// route: DELETE /bootload/ports
+async fn clear_bootload_ports_handler(
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = acquire_hw_lock(&state, "DELETE /bootload/ports").await?;
+    let removed =
+        tokio::task::spawn_blocking(|| embarch_topology::hardware::bootload::clear(embarch_topology::hardware::DUT_ROLE))
+            .await
+            .map_err(internal_err)?
+            .map_err(internal_err)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no bootload ports are declared for the DUT".to_string()))
+    }
 }
 
 // ---- GET /serial-log --------------------------------------------------------
@@ -1645,6 +1817,87 @@ mod tests {
         assert!(err.1.contains("firmware"));
     }
 
+    /// A `POST /bootload` body: `fields` as text parts, then the `image` part.
+    fn bootload_request(fields: &[(&str, &str)], image: &[u8]) -> HttpRequest<Body> {
+        const BOUNDARY: &str = "b";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"image\"; filename=\"zephyr.signed.bin\"\r\n\r\n",
+        );
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/bootload")
+            .header(CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
+            .header("authorization", "Bearer t")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bootload_fields_parse_and_a_blank_one_counts_as_omitted() {
+        let request = bootload_request(
+            &[("entry_command", "mcuboot"), ("entry_line_ending", "crlf"), ("image_index", "1"), ("buffer_size", "1024")],
+            b"img",
+        );
+        let plan = bootload_plan_from_multipart(Multipart::from_request(request, &()).await.unwrap()).await.unwrap();
+        assert_eq!(plan.image, b"img");
+        assert_eq!(plan.entry_command.as_deref(), Some("mcuboot"));
+        assert_eq!(plan.line_ending, bootload::LineEnding::CrLf);
+        assert_eq!(plan.image_index, 1);
+        assert_eq!(plan.fragmentation, embarch_smp::Fragmentation::buffer_size(1024));
+
+        let request = bootload_request(&[("entry_command", " "), ("buffer_size", "")], b"img");
+        let plan = bootload_plan_from_multipart(Multipart::from_request(request, &()).await.unwrap()).await.unwrap();
+        assert_eq!(plan.entry_command, None);
+        assert_eq!(plan.fragmentation, embarch_smp::Fragmentation::default());
+
+        for (field, value) in [("entry_line_ending", "nl"), ("buffer_size", "4"), ("image_index", "-1")] {
+            let request = bootload_request(&[(field, value)], b"img");
+            let err = bootload_plan_from_multipart(Multipart::from_request(request, &()).await.unwrap())
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{field}={value}");
+        }
+    }
+
+    /// Refused before `hw_lock`, before the declared ports are read, and so
+    /// before anything could reach a device.
+    #[tokio::test]
+    async fn an_unsigned_image_is_refused_before_anything_is_touched() {
+        use tower::ServiceExt as _;
+        let state = AppState::new("t".to_string());
+        let _held = state.hw_lock.clone().try_lock_owned().unwrap();
+        let response = build_router(state).oneshot(bootload_request(&[], &[0u8; 512])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("zephyr.signed.bin"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_bootload_port_pair_one_port_could_match_both_of_is_a_bad_request() {
+        use tower::ServiceExt as _;
+        let state = AppState::new("t".to_string());
+        let _held = state.hw_lock.clone().try_lock_owned().unwrap();
+        let body = r#"{"app":{"vid":12259,"pid":4},"bootloader":{"vid":12259,"pid":4}}"#;
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bootload/ports")
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", "Bearer t")
+            .body(Body::from(body))
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     // base_address (decision 18): only meaningful for format = "bin", but parsed
     // the same way regardless of which format accompanies it — parsing is a
     // pure string→u64 concern, independent of hardware.rs's own decision to
@@ -1740,6 +1993,10 @@ mod tests {
         ("GET", "/status", "/status"),
         ("POST", "/flash", "/flash"),
         ("POST", "/reset", "/reset"),
+        ("POST", "/bootload", "/bootload"),
+        ("PUT", "/bootload/ports", "/bootload/ports"),
+        ("GET", "/bootload/ports", "/bootload/ports"),
+        ("DELETE", "/bootload/ports", "/bootload/ports"),
         ("GET", "/serial-log", "/serial-log"),
         ("GET", "/dev-bench/port", "/dev-bench/port"),
         ("GET", "/dev-bench/hello", "/dev-bench/hello"),
@@ -1796,7 +2053,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 28;
+    const DOCUMENTED_ROUTE_COUNT: usize = 30;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {

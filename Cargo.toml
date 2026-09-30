@@ -37,6 +37,11 @@ heapless = "0.8"
 # (found via `cargo tree` while wiring this in; `embarch-dev-workflow.md`
 # §4 already flags this exact class of risk for a different crate).
 embarch-topology = { path = "../embarch-topology", default-features = false, features = ["hardware"] }
+# `POST /bootload` (`bootload.rs`, decision 77): SMP over MCUboot serial
+# recovery. The crate never opens a port (its decision 2) — Core opens the
+# DUT's CDC ACM port and hands it in. Core's third path dependency, so
+# `embarch-dev-workflow.md` §4a's sync list carries it too.
+embarch-smp = { path = "../embarch-smp" }
 # `use-std` is what actually gets `to_stdvec_cobs`/`from_bytes_cobs` — the
 # `Vec<u8>`-returning COBS helpers `dev_bench_link.rs` uses, rather than the
 # `no_std` slice-only API. postcard depends on `cobs` internally and exposes
@@ -111,3 +116,6 @@ libc = "0.2"
 # `http::Request` through the router and reading back a status code, rather
 # than only unit-testing individual handler functions in isolation.
 tower = { version = "0.5", features = ["util"] }
+# The simulated serial-recovery bootloader, so `bootload.rs`'s tests drive
+# the whole flow through the same `Read + Write` seam a COM port takes.
+embarch-smp = { path = "../embarch-smp", features = ["sim"] }
