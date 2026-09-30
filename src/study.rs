@@ -4210,8 +4210,7 @@ pub async fn stream_arrivals_handler(
 /// One outpost tap's load repartition — per-subject shares and the coverage
 /// line — computed once here from the rendered CSV [`stream_data_handler`]
 /// would otherwise only serve as bytes for someone else to compute
-/// (`embarch-core` decision, `decisions/streams.md`; suite decision 4,
-/// `../../embarch-doc/suite/decisions.md`).
+/// (decision 62; suite decision 4).
 ///
 /// Only meaningful for a `StreamEncoding::OutpostTrace` tap — a `400` names
 /// the tap's real encoding rather than a caller guessing why the numbers
