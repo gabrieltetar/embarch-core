@@ -355,6 +355,18 @@ fn install_hint(tool: &str) -> String {
     }
 }
 
+/// The `--options` value for `nrfutil device program`. ERASE_RANGES_TOUCHED_BY_FIRMWARE
+/// is nRF Util's own name for what `--erase` should mean; ERASE_NONE still programs the
+/// covered range, it just leaves everything else alone. Never ERASE_ALL — see this
+/// module's header.
+fn nrfutil_erase_options(erase: bool) -> &'static str {
+    if erase {
+        "chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE"
+    } else {
+        "chip_erase_mode=ERASE_NONE"
+    }
+}
+
 /// Runs an external backend. `erase` maps to each tool's own
 /// erase-what-the-image-touches mode — deliberately never a full chip erase,
 /// for the reason in this module's header.
@@ -386,14 +398,7 @@ pub fn run(
         Backend::NrfUtil { exe } => {
             let mut c = Command::new(exe);
             c.args(["device", "program", "--firmware"]).arg(firmware_path);
-            // ERASE_RANGES_TOUCHED_BY_FIRMWARE is nRF Util's own name for what
-            // `--erase` should mean; ERASE_NONE still programs the covered
-            // range, it just leaves everything else alone.
-            c.arg("--options").arg(if erase {
-                "chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE"
-            } else {
-                "chip_erase_mode=ERASE_NONE"
-            });
+            c.arg("--options").arg(nrfutil_erase_options(erase));
             if let Some(sn) = probe_serial {
                 c.arg("--serial-number").arg(sn);
             }
@@ -663,6 +668,16 @@ mod tests {
         // And with erase off, nothing erases at all.
         let no_erase = jlink_script(Path::new("/tmp/x.hex"), "hex", None, false).unwrap();
         assert!(!no_erase.contains("\nerase\n"));
+    }
+
+    #[test]
+    fn nrfutil_options_never_request_a_full_chip_erase() {
+        assert_eq!(
+            nrfutil_erase_options(true),
+            "chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE"
+        );
+        assert_eq!(nrfutil_erase_options(false), "chip_erase_mode=ERASE_NONE");
+        assert!(!nrfutil_erase_options(true).contains("ERASE_ALL"));
     }
 
     /// A Windows Core launched from WSL2 sees WSL's PATH; a Linux binary
