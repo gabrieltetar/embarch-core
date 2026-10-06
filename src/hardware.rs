@@ -202,8 +202,9 @@ pub fn flash(
     let mut probe = open_probe(probe_serial, "flash")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
 
-    let mut session = probe
-        .attach(chip, Permissions::default())
+    // Guarded attach (decision 80): probe-rs's own ARMv6 STM32 sequence would
+    // read-modify-write a running target's RCC through reads that can come back as garbage.
+    let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
         .with_context(|| format!("failed to attach to target '{chip}'"))?;
 
     if erase {
@@ -342,8 +343,9 @@ pub fn reset(chip: &str, probe_serial: Option<&str>) -> Result<()> {
         ),
     }
 
-    let mut session = probe
-        .attach(chip, Permissions::default())
+    // Guarded attach (decision 80): probe-rs's own ARMv6 STM32 sequence would
+    // read-modify-write a running target's RCC through reads that can come back as garbage.
+    let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
         .with_context(|| format!("failed to attach to target '{chip}'"))?;
 
     let mut core = session.core(0).context("failed to select core 0")?;
