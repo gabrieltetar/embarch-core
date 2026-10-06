@@ -152,6 +152,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
+        .route("/signals/{name}/exchange", post(signal_exchange_handler))
         .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
@@ -1259,6 +1260,53 @@ async fn remove_signal_handler(
     }
 }
 
+// ---- POST /signals/{name}/exchange ----------------------------------------
+
+/// Writes text to a declared signal and returns what came back (decision 79):
+/// a DUT shell command and its output. See [`crate::exchange`].
+///
+/// `400` for a request [`crate::exchange::check`] refuses, before `hw_lock`;
+/// `404` when nothing is declared under `name`; `409` when the signal is
+/// declared but Core may not write it (a `dut-to-host` signal, or a
+/// `via-dev-bench` route) or its port is not enumerable now. Takes `hw_lock`:
+/// it opens a physical connection, like `/serial-log`.
+// route: POST /signals/{name}/exchange
+async fn signal_exchange_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<crate::exchange::ExchangeRequest>,
+) -> Result<Json<crate::exchange::ExchangeResponse>, (StatusCode, String)> {
+    crate::exchange::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let _guard = acquire_hw_lock(&state, "POST /signals/{name}/exchange").await?;
+
+    tokio::task::spawn_blocking(move || {
+        let link = embarch_topology::hardware::find_signal(&name)
+            .map_err(internal_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
+        if !link.host_can_write() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "signal '{name}' is declared {:?} on a {} route; Core writes only a direct \
+                     host-to-dut or bidirectional signal (embarch-topology decision 37)",
+                    link.direction,
+                    match link.route {
+                        embarch_topology::hardware::Route::Direct { .. } => "direct",
+                        embarch_topology::hardware::Route::ViaDevBench { .. } => "via-dev-bench",
+                    }
+                ),
+            ));
+        }
+        let port = embarch_topology::hardware::resolve_signal_port(&name)
+            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        let baud = crate::stream_store::signal_baud_for(&link);
+        crate::exchange::run(&name, &port.port_name, baud, &req).map_err(internal_err)
+    })
+    .await
+    .map_err(internal_err)?
+    .map(Json)
+}
+
 // ---- GET /serial-ports ------------------------------------------------------
 
 /// Every USB serial port this machine currently enumerates, unnarrowed —
@@ -2009,6 +2057,7 @@ mod tests {
         ("POST", "/signals", "/signals"),
         ("GET", "/signals", "/signals"),
         ("DELETE", "/signals/{name}", "/signals/outpost"),
+        ("POST", "/signals/{name}/exchange", "/signals/console/exchange"),
         ("GET", "/serial-ports", "/serial-ports"),
         ("POST", "/validate", "/validate"),
         ("GET", "/alerts", "/alerts"),
@@ -2053,7 +2102,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 30;
+    const DOCUMENTED_ROUTE_COUNT: usize = 31;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {

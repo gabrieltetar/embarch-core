@@ -4,6 +4,7 @@ mod chip_resolve;
 mod dev_bench_link;
 mod dev_bench_log;
 mod elevate;
+mod exchange;
 mod flash_backend;
 mod hardware;
 mod logs;

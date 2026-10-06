@@ -113,6 +113,12 @@ pub fn study_results_keep() -> usize {
     }
 }
 
+/// The rate to open one declared signal at: its own `baud` when it declares
+/// one (`embarch-topology` decision 37), else [`signal_baud`].
+pub fn signal_baud_for(link: &embarch_topology::hardware::SignalLink) -> u32 {
+    link.baud.unwrap_or_else(signal_baud)
+}
+
 /// `EMBARCH_SIGNAL_BAUD`, or [`DEFAULT_SIGNAL_BAUD`].
 pub fn signal_baud() -> u32 {
     match std::env::var(SIGNAL_BAUD_ENV) {

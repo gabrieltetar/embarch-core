@@ -2588,7 +2588,7 @@ fn start_signal_tap(
     let port = embarch_topology::hardware::resolve_signal_port(signal_name)
         .map_err(|e| format!("couldn't resolve a carrier for signal '{signal_name}': {e:?}"))?;
 
-    let baud = stream_store::signal_baud();
+    let baud = stream_store::signal_baud_for(&link);
     let serial = serialport::new(&port.port_name, baud)
         .timeout(Duration::from_millis(200))
         .open()
