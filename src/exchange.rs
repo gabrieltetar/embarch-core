@@ -56,6 +56,12 @@ pub struct ExchangeRequest {
     /// this command's and not the tail of an earlier log line. On by default.
     #[serde(default = "default_true")]
     pub discard_pending: bool,
+    /// Look for `until` only after the echo of what was written. On by
+    /// default: a Zephyr shell prints a fresh prompt the moment the port is
+    /// opened (DTR), before the command's own output, and that prompt would
+    /// otherwise end the read early. Off for a console that does not echo.
+    #[serde(default = "default_true")]
+    pub match_after_echo: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -119,6 +125,7 @@ pub fn exchange<P: Read + Write>(
     port: &mut P,
     write: &[u8],
     until: Option<&str>,
+    match_after_echo: bool,
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<Exchanged> {
@@ -126,6 +133,15 @@ pub fn exchange<P: Read + Write>(
     port.flush().context("error flushing the signal's port")?;
     let deadline = Instant::now() + timeout;
     let needle = until.map(str::as_bytes);
+    // The written line without its line ending: what a shell echoes back.
+    let echo = {
+        let mut e = write;
+        while let [rest @ .., b'\r' | b'\n'] = e {
+            e = rest;
+        }
+        e
+    };
+    let mut search_from: Option<usize> = if match_after_echo && !echo.is_empty() { None } else { Some(0) };
     let mut buf = [0u8; 1024];
     let mut got: Vec<u8> = Vec::new();
     while Instant::now() < deadline {
@@ -133,10 +149,12 @@ pub fn exchange<P: Read + Write>(
             Ok(0) => std::thread::sleep(IDLE_SLEEP),
             Ok(n) => {
                 let take = n.min(max_bytes - got.len());
-                let from = got.len().saturating_sub(needle.map_or(0, |x| x.len()));
                 got.extend_from_slice(&buf[..take]);
-                if let Some(x) = needle {
-                    if got[from..].windows(x.len()).any(|w| w == x) {
+                if search_from.is_none() {
+                    search_from = find(&got, echo, 0).map(|i| i + echo.len());
+                }
+                if let (Some(x), Some(start)) = (needle, search_from) {
+                    if find(&got, x, start).is_some() {
                         return Ok(Exchanged { bytes: got, until_seen: true, truncated: false });
                     }
                 }
@@ -149,6 +167,14 @@ pub fn exchange<P: Read + Write>(
         }
     }
     Ok(Exchanged { bytes: got, until_seen: false, truncated: false })
+}
+
+/// The first index at or after `from` where `needle` starts in `hay`.
+fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() {
+        return None;
+    }
+    hay[from..].windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
 
 /// Opens `port_name` at `baud`, asserts DTR (a Zephyr CDC ACM shell may wait
@@ -170,6 +196,7 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
         &mut port,
         req.write.as_bytes(),
         req.until.as_deref(),
+        req.match_after_echo,
         Duration::from_millis(req.timeout_ms),
         MAX_READ_BYTES,
     )?;
@@ -226,13 +253,19 @@ mod tests {
     }
 
     fn req(write: &str) -> ExchangeRequest {
-        ExchangeRequest { write: write.to_string(), until: None, timeout_ms: 100, discard_pending: true }
+        ExchangeRequest {
+            write: write.to_string(),
+            until: None,
+            timeout_ms: 100,
+            discard_pending: true,
+            match_after_echo: true,
+        }
     }
 
     #[test]
     fn writes_then_stops_at_the_marker_even_split_across_reads() {
         let mut p = Fake::new(vec![Ok(b"kernel uptime\r\nUptime: 42 ms\r\nuart:~".to_vec()), Ok(b"$ ".to_vec())]);
-        let got = exchange(&mut p, b"kernel uptime\n", Some("uart:~$ "), Duration::from_secs(5), 1024).unwrap();
+        let got = exchange(&mut p, b"kernel uptime\n", Some("uart:~$ "), true, Duration::from_secs(5), 1024).unwrap();
         assert_eq!(p.written, b"kernel uptime\n");
         assert!(got.until_seen && !got.truncated);
         assert!(String::from_utf8_lossy(&got.bytes).contains("Uptime: 42 ms"));
@@ -242,16 +275,34 @@ mod tests {
     fn without_a_marker_it_reads_to_the_deadline() {
         let mut p = Fake::new(vec![Ok(b"line\r\n".to_vec())]);
         let t = Instant::now();
-        let got = exchange(&mut p, b"x\n", None, Duration::from_millis(60), 1024).unwrap();
+        let got = exchange(&mut p, b"x\n", None, true, Duration::from_millis(60), 1024).unwrap();
         assert!(t.elapsed() >= Duration::from_millis(60));
         assert_eq!(got.bytes, b"line\r\n");
         assert!(!got.until_seen && !got.truncated);
     }
 
     #[test]
+    fn the_prompt_a_shell_prints_on_open_does_not_end_the_read() {
+        // What a Zephyr CDC ACM shell sent on 2026-10-06: a prompt the
+        // moment DTR rose, then the echo, the output, and the prompt again.
+        let mut p = Fake::new(vec![
+            Ok(b"\n\x1b[1;32muart:~$ \x1b[m".to_vec()),
+            Ok(b"kernel uptime\r\nUptime: 17774 ms\r\n".to_vec()),
+            Ok(b"\x1b[1;32muart:~$ \x1b[m".to_vec()),
+        ]);
+        let got = exchange(&mut p, b"kernel uptime\n", Some("uart:~$ "), true, Duration::from_secs(5), 1024).unwrap();
+        assert!(got.until_seen);
+        assert!(String::from_utf8_lossy(&got.bytes).contains("Uptime: 17774 ms"));
+        // Without the echo rule the early prompt ends it, which is the bug.
+        let mut q = Fake::new(vec![Ok(b"uart:~$ ".to_vec()), Ok(b"kernel uptime\r\nUptime: 1 ms\r\n".to_vec())]);
+        let early = exchange(&mut q, b"kernel uptime\n", Some("uart:~$ "), false, Duration::from_secs(5), 1024).unwrap();
+        assert!(early.until_seen && !String::from_utf8_lossy(&early.bytes).contains("Uptime"));
+    }
+
+    #[test]
     fn a_console_that_never_stops_is_cut_at_the_byte_cap() {
         let mut p = Fake::new((0..100).map(|_| Ok(vec![b'a'; 64])).collect());
-        let got = exchange(&mut p, b"x\n", Some("never"), Duration::from_secs(5), 100).unwrap();
+        let got = exchange(&mut p, b"x\n", Some("never"), true, Duration::from_secs(5), 100).unwrap();
         assert_eq!(got.bytes.len(), 100);
         assert!(got.truncated && !got.until_seen);
     }
@@ -259,7 +310,7 @@ mod tests {
     #[test]
     fn a_read_error_is_an_error_not_a_short_reply() {
         let mut p = Fake::new(vec![Err(std::io::ErrorKind::BrokenPipe.into())]);
-        assert!(exchange(&mut p, b"x\n", None, Duration::from_secs(1), 100).is_err());
+        assert!(exchange(&mut p, b"x\n", None, true, Duration::from_secs(1), 100).is_err());
     }
 
     #[test]
@@ -276,6 +327,6 @@ mod tests {
     fn a_request_body_needs_only_write() {
         let r: ExchangeRequest = serde_json::from_str(r#"{"write":"help\n"}"#).unwrap();
         assert_eq!(r.timeout_ms, DEFAULT_TIMEOUT_MS);
-        assert!(r.discard_pending && r.until.is_none());
+        assert!(r.discard_pending && r.match_after_echo && r.until.is_none());
     }
 }
