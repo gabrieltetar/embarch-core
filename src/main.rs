@@ -7,6 +7,7 @@ mod elevate;
 mod exchange;
 mod flash_backend;
 mod hardware;
+mod live;
 mod logs;
 mod serial;
 mod service;

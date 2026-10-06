@@ -153,6 +153,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
         .route("/signals/{name}/exchange", post(signal_exchange_handler))
+        .route("/live/mem-read", post(live_mem_read_handler))
         .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
@@ -1307,6 +1308,41 @@ async fn signal_exchange_handler(
     .map(Json)
 }
 
+// ---- POST /live/mem-read --------------------------------------------------
+
+/// Reads words of a role's target memory over its enrolled probe, halting a
+/// running core for the read and letting it run again (decision 81). See
+/// [`crate::live`].
+///
+/// `400` for a request [`crate::live::check`] refuses, before `hw_lock`;
+/// `404` when nothing is enrolled under the role; `409` when the role's board
+/// was enrolled without a probe. A refused identity gate maps the way
+/// `/reset`'s does. Takes `hw_lock`: it opens the probe, like `/reset`.
+// route: POST /live/mem-read
+async fn live_mem_read_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::live::MemReadRequest>,
+) -> Result<Json<crate::live::MemReadResponse>, (StatusCode, String)> {
+    crate::live::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let _guard = acquire_hw_lock(&state, "POST /live/mem-read").await?;
+
+    tokio::task::spawn_blocking(move || {
+        let board = embarch_topology::hardware::find_enrolled_by_role(&req.role)
+            .map_err(internal_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("nothing is enrolled under the role '{}'", req.role)))?;
+        let probe_serial = board.probe_serial.clone().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!("the role '{}' has a board type but no enrolled probe to read through", req.role),
+            )
+        })?;
+        crate::live::run(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
+    })
+    .await
+    .map_err(internal_err)?
+    .map(Json)
+}
+
 // ---- GET /serial-ports ------------------------------------------------------
 
 /// Every USB serial port this machine currently enumerates, unnarrowed —
@@ -2058,6 +2094,7 @@ mod tests {
         ("GET", "/signals", "/signals"),
         ("DELETE", "/signals/{name}", "/signals/outpost"),
         ("POST", "/signals/{name}/exchange", "/signals/console/exchange"),
+        ("POST", "/live/mem-read", "/live/mem-read"),
         ("GET", "/serial-ports", "/serial-ports"),
         ("POST", "/validate", "/validate"),
         ("GET", "/alerts", "/alerts"),
@@ -2102,7 +2139,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 31;
+    const DOCUMENTED_ROUTE_COUNT: usize = 32;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
