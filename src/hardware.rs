@@ -132,6 +132,8 @@ fn resolved_serial(probe_serial: Option<&str>, action: &str) -> Result<String> {
 }
 
 /// Flash a firmware image onto the given chip using the first attached probe.
+/// On the probe-rs path the core is reset after the download, so the target
+/// is left running the new image (decision 82).
 ///
 /// `chip` must match a probe-rs target name (e.g. "STM32F407VG", "nRF52840_xxAA",
 /// "esp32c5"). `firmware_path` is a path Core can read locally — the caller is
@@ -256,6 +258,14 @@ pub fn flash(
     }
 
     flashing::download_file(&mut session, firmware_path, format).context("flashing failed")?;
+
+    // A flash ends with the board running its new image (decision 82). probe-rs's
+    // flasher reset-halts the core to run its flash algorithm and never resumes
+    // it, and an ARMv6 STM32's debug sequence (probe-rs's own and the guarded
+    // one) overrides `debug_core_stop` without clearing DHCSR.C_DEBUGEN, so the
+    // session ending left the core halted in the algorithm until a reset.
+    let mut core = session.core(0).context("failed to select core 0 after flashing")?;
+    core.reset().context("reset after flashing failed")?;
 
     Ok(())
 }
