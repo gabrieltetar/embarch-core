@@ -62,7 +62,16 @@ pub struct ExchangeRequest {
     /// otherwise end the read early. Off for a console that does not echo.
     #[serde(default = "default_true")]
     pub match_after_echo: bool,
+    /// How long to wait for the signal's port to be enumerable before giving up, polling every
+    /// [`PORT_POLL_MS`]. 0 (the default) answers at once. A USB CDC ACM console is gone while its
+    /// device resets, so a caller that just flashed or reset the DUT waits here instead of
+    /// sleeping and retrying (decision 79, amended).
+    #[serde(default)]
+    pub port_wait_ms: u64,
 }
+
+/// How often a port wait looks for the port again.
+pub const PORT_POLL_MS: u64 = 250;
 
 fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
@@ -115,7 +124,29 @@ pub fn check(req: &ExchangeRequest) -> Result<(), String> {
     if req.until.as_deref() == Some("") {
         return Err("`until` is empty: leave it out to read until the timeout".to_string());
     }
+    if req.port_wait_ms > MAX_TIMEOUT_MS {
+        return Err(format!("port_wait_ms={} is above {MAX_TIMEOUT_MS}", req.port_wait_ms));
+    }
     Ok(())
+}
+
+/// The signal's port, waiting up to `wait_ms` for it to be enumerable: only a declared direct
+/// port that is not there now is waited for; any other failure answers at once.
+pub fn resolve_port_waiting(name: &str, wait_ms: u64) -> anyhow::Result<embarch_topology::hardware::DetectedPort> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    loop {
+        match embarch_topology::hardware::resolve_signal_port(name) {
+            Ok(port) => return Ok(port),
+            Err(e)
+                if e.downcast_ref::<embarch_topology::hardware::SignalMismatch>()
+                    .is_some_and(|m| m.declared_port_serial.is_some())
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(PORT_POLL_MS));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Writes `write`, then reads until `until` appears in what was read, the
@@ -259,6 +290,7 @@ mod tests {
             timeout_ms: 100,
             discard_pending: true,
             match_after_echo: true,
+            port_wait_ms: 0,
         }
     }
 
@@ -320,6 +352,8 @@ mod tests {
         assert!(check(&ExchangeRequest { timeout_ms: MAX_TIMEOUT_MS + 1, ..req("x") }).is_err());
         assert!(check(&ExchangeRequest { timeout_ms: 0, ..req("x") }).is_err());
         assert!(check(&ExchangeRequest { until: Some(String::new()), ..req("x") }).is_err());
+        assert!(check(&ExchangeRequest { port_wait_ms: MAX_TIMEOUT_MS, ..req("x") }).is_ok());
+        assert!(check(&ExchangeRequest { port_wait_ms: MAX_TIMEOUT_MS + 1, ..req("x") }).is_err());
         assert!(check(&req(&"x".repeat(MAX_WRITE_BYTES + 1))).unwrap_err().contains("at most"));
     }
 

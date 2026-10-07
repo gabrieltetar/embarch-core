@@ -1298,7 +1298,7 @@ async fn signal_exchange_handler(
                 ),
             ));
         }
-        let port = embarch_topology::hardware::resolve_signal_port(&name)
+        let port = crate::exchange::resolve_port_waiting(&name, req.port_wait_ms)
             .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
         let baud = crate::stream_store::signal_baud_for(&link);
         crate::exchange::run(&name, &port.port_name, baud, &req).map_err(internal_err)
