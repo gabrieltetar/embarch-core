@@ -149,6 +149,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/probes/enrolled", get(list_enrolled_probes_handler))
         .route("/probes/enrolled/{role}", delete(unenroll_probe_handler))
         .route("/probes/enrolled/{role}/board", put(set_role_board_handler))
+        .route("/probes/by-serial/{serial}", delete(unenroll_by_probe_handler))
         .route("/dev-bench/link", post(set_dev_bench_link_handler))
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
@@ -906,7 +907,12 @@ async fn resolve_chip_handler(
 /// shouldn't be allowed to race either of them.
 #[derive(Deserialize)]
 struct EnrollProbeRequest {
-    role: String,
+    /// `dut`, `dev-bench`, or absent for a **bench board** (decision 83,
+    /// `embarch-topology` decision 41): a board that is flashed and
+    /// identity-checked by its probe serial but holds no role, such as a USB
+    /// PD partner. Absent and `""` are the same request.
+    #[serde(default)]
+    role: Option<String>,
     chip: String,
     /// Picks which currently-attached probe to enroll when more than one
     /// is present, so a human can enroll two visibly-different boards
@@ -943,10 +949,23 @@ async fn enroll_probe_handler(
 ) -> Result<Json<EnrollProbeResponse>, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /probes/enroll").await?;
 
-    let role = req.role;
+    let role = req.role.unwrap_or_default();
     let chip = req.chip;
     let probe_serial = req.probe_serial;
     let name = req.name.unwrap_or_default();
+
+    // **A bench board is named or it is nothing** (decision 83). It holds
+    // no role, so its name is the only thing a human reads to tell it from
+    // the roles' boards and from the other bench boards.
+    if role == embarch_topology::hardware::NO_ROLE && name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a board enrolled with no role is a bench board, and needs a `name` to be told                  apart — or give it a role: {}",
+                embarch_topology::hardware::CANONICAL_ROLES.join(" or ")
+            ),
+        ));
+    }
 
     // **The role vocabulary is closed on the write path** (`embarch-ui`
     // decision 44, `embarch_topology::hardware::CANONICAL_ROLES`). Refusing
@@ -955,7 +974,9 @@ async fn enroll_probe_handler(
     // as `client-nucleo`. Nothing re-checks a row already on disk, so
     // such a row still lists and is cleared through
     // `DELETE /probes/enrolled/{role}` below.
-    if !embarch_topology::hardware::is_canonical_role(&role) {
+    if role != embarch_topology::hardware::NO_ROLE
+        && !embarch_topology::hardware::is_canonical_role(&role)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
@@ -1105,6 +1126,32 @@ async fn unenroll_probe_handler(
     match removed {
         Some(_) => Ok(StatusCode::NO_CONTENT),
         None => Err((StatusCode::NOT_FOUND, "no board enrolled under that role".to_string())),
+    }
+}
+
+// ---- DELETE /probes/by-serial/{serial} --------------------------------------
+
+/// Retracts the board enrolled through probe `serial`, whatever role it
+/// holds. **The only retraction a bench board has** (decision 83): it holds
+/// no role, so `DELETE /probes/enrolled/{role}` cannot name it. Same posture
+/// as that route otherwise: `hw_lock` as an enrollment-file writer, no probe
+/// opened, `204` on a removal and `404` when no row names that probe.
+// route: DELETE /probes/by-serial/{serial}
+async fn unenroll_by_probe_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(serial): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = acquire_hw_lock(&state, "DELETE /probes/by-serial/{serial}").await?;
+
+    let removed =
+        tokio::task::spawn_blocking(move || embarch_topology::hardware::unenroll_probe(&serial))
+            .await
+            .map_err(internal_err)?
+            .map_err(internal_err)?;
+
+    match removed {
+        Some(_) => Ok(StatusCode::NO_CONTENT),
+        None => Err((StatusCode::NOT_FOUND, "no board enrolled through that probe".to_string())),
     }
 }
 
@@ -2088,6 +2135,7 @@ mod tests {
         ("POST", "/probes/enroll", "/probes/enroll"),
         ("GET", "/probes/enrolled", "/probes/enrolled"),
         ("DELETE", "/probes/enrolled/{role}", "/probes/enrolled/dut"),
+        ("DELETE", "/probes/by-serial/{serial}", "/probes/by-serial/066DFF574885524867182407"),
         ("PUT", "/probes/enrolled/{role}/board", "/probes/enrolled/dut/board"),
         ("POST", "/dev-bench/link", "/dev-bench/link"),
         ("POST", "/signals", "/signals"),
@@ -2139,7 +2187,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 32;
+    const DOCUMENTED_ROUTE_COUNT: usize = 33;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -2577,6 +2625,30 @@ mod tests {
         assert!(body.contains("client-nucleo"), "{body}");
         assert!(body.contains("dut"), "the refusal names the roles that do exist: {body}");
         assert!(body.contains("name"), "and says where a board name goes: {body}");
+    }
+
+    /// Decision 83: no role is a bench board, and a bench board must be
+    /// named. Refused before `enroll`, so no hardware is needed to reach it.
+    #[tokio::test]
+    async fn enrolling_a_bench_board_without_a_name_is_refused() {
+        for body in [r#"{"chip":"STM32G0B1VE"}"#, r#"{"role":"","chip":"STM32G0B1VE","name":" "}"#] {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/probes/enroll")
+                        .header("authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let text = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let text = String::from_utf8(text.to_vec()).unwrap();
+            assert!(text.contains("bench board") && text.contains("name"), "{text}");
+        }
     }
 
     /// Pins `embarch_topology::hardware::EnrolledBoard` against the same
