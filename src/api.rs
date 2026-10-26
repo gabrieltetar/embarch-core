@@ -2930,9 +2930,28 @@ mod tests {
         assert_eq!(link.direction, embarch_topology::hardware::SignalDirection::DutToHost);
         assert_eq!(
             link.route,
-            embarch_topology::hardware::Route::Direct { port_serial: "ABC123".to_string() }
+            embarch_topology::hardware::Route::Direct { port_serial: "ABC123".to_string(), interface: None }
         );
         assert_eq!(serde_json::to_string(&link).unwrap(), SIGNAL_LINK_JSON);
+    }
+
+    /// `embarch-topology` decision 46, amended by `suite/052`: a direct route may declare the
+    /// interface carrying it, inside the route and only when declared, so the literal above is
+    /// unchanged. `embarch-core-client`'s `a_declared_interface_rides_inside_the_direct_route`
+    /// pins the same string from the client side.
+    #[test]
+    fn a_declared_interface_is_part_of_the_direct_route_on_the_wire() {
+        const WITH_INTERFACE: &str = concat!(
+            r#"{"name":"outpost","origin_role":"dut","direction":"dut-to-host","#,
+            r#""route":{"kind":"direct","port_serial":"ABC123","interface":2}}"#
+        );
+        let link: embarch_topology::hardware::SignalLink =
+            serde_json::from_str(WITH_INTERFACE).expect("a client's POST /signals body parses");
+        assert_eq!(
+            link.route,
+            embarch_topology::hardware::Route::Direct { port_serial: "ABC123".to_string(), interface: Some(2) }
+        );
+        assert_eq!(serde_json::to_string(&link).unwrap(), WITH_INTERFACE);
     }
 
     #[tokio::test]
