@@ -159,10 +159,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
         .route("/signals/{name}/exchange", post(signal_exchange_handler))
-        .route(
-            "/signals/{name}/capture",
-            post(start_capture_handler).get(read_capture_handler).delete(stop_capture_handler),
-        )
+        .route("/signals/{name}/capture", post(start_capture_handler).get(read_capture_handler).delete(stop_capture_handler))
         .route("/live/mem-read", post(live_mem_read_handler))
         .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
@@ -2454,6 +2451,9 @@ mod tests {
         ("GET", "/signals", "/signals"),
         ("DELETE", "/signals/{name}", "/signals/outpost"),
         ("POST", "/signals/{name}/exchange", "/signals/console/exchange"),
+        ("POST", "/signals/{name}/capture", "/signals/console/capture"),
+        ("GET", "/signals/{name}/capture", "/signals/console/capture"),
+        ("DELETE", "/signals/{name}/capture", "/signals/console/capture"),
         ("POST", "/live/mem-read", "/live/mem-read"),
         ("GET", "/serial-ports", "/serial-ports"),
         ("POST", "/validate", "/validate"),
@@ -2474,6 +2474,17 @@ mod tests {
     /// source. Reading the text is the only way in: axum exposes no route
     /// iterator, so a built `Router` cannot be asked what it serves.
     fn registered_route_paths() -> Vec<String> {
+        let bare: Vec<usize> = include_str!("api.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == ".route(")
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "`.route(` at the end of a line (api.rs line(s) {bare:?}) is a registration \
+             the scan cannot read: put the path on the same line (decision 42)."
+        );
         include_str!("api.rs")
             .lines()
             .map(str::trim)
@@ -2498,7 +2509,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 32;
+    const DOCUMENTED_ROUTE_COUNT: usize = 33;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
