@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 /// so Core never holds `hw_lock` for a reply nobody is still waiting for.
 pub const MAX_TIMEOUT_MS: u64 = crate::serial::MAX_DURATION_MS;
 
+/// The read poll: the port's per-call timeout while reading.
+const READ_POLL: Duration = Duration::from_millis(50);
+
 /// `timeout_ms` when the caller gives none: long enough for a shell command
 /// on a slow console, short enough to keep `hw_lock` free.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2_000;
@@ -161,16 +164,23 @@ pub fn exchange<P: Read + Write>(
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<Exchanged> {
-    exchange_with(port, write, until, match_after_echo, timeout, max_bytes, |_| {})
+    exchange_with(port, write, until, match_after_echo, timeout, max_bytes, |_, _| {})
 }
 
 /// Writes all of `write` within `deadline`: a `TimedOut`, `WouldBlock`, `Interrupted` or
 /// zero-length write is a throttled device, not a failure, and is retried from the byte
 /// count the port reported. Past the deadline it fails with the count of bytes written.
-fn write_with_deadline<P: Write>(port: &mut P, write: &[u8], deadline: Instant) -> Result<()> {
+fn write_with_deadline<P: Write>(
+    port: &mut P,
+    write: &[u8],
+    deadline: Instant,
+    mut set_timeout: impl FnMut(&mut P, Duration),
+) -> Result<()> {
     use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     let mut sent = 0;
     while sent < write.len() {
+        // A blocking write must not outlast the deadline: hand the port what remains.
+        set_timeout(port, deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
         let stalled = match port.write(&write[sent..]) {
             Ok(0) => true,
             Ok(n) => {
@@ -197,8 +207,9 @@ fn write_with_deadline<P: Write>(port: &mut P, write: &[u8], deadline: Instant) 
     Ok(())
 }
 
-/// [`exchange`] with `before_read` run once the line is written (the real port
-/// swaps its long write timeout for the short read poll there).
+/// [`exchange`] with `set_timeout` called with the port's per-call timeout: what remains of
+/// the write deadline before each write, then the short read poll. One `timeout` covers the
+/// write and the read together, so an exchange ends within `timeout` plus one read poll.
 fn exchange_with<P: Read + Write>(
     port: &mut P,
     write: &[u8],
@@ -206,12 +217,12 @@ fn exchange_with<P: Read + Write>(
     match_after_echo: bool,
     timeout: Duration,
     max_bytes: usize,
-    before_read: impl FnOnce(&mut P),
+    mut set_timeout: impl FnMut(&mut P, Duration),
 ) -> Result<Exchanged> {
-    write_with_deadline(port, write, Instant::now() + timeout)?;
-    port.flush().context("error flushing the signal's port")?;
-    before_read(port);
     let deadline = Instant::now() + timeout;
+    write_with_deadline(port, write, deadline, &mut set_timeout)?;
+    port.flush().context("error flushing the signal's port")?;
+    set_timeout(port, READ_POLL);
     let needle = until.map(str::as_bytes);
     // The written line without its line ending: what a shell echoes back.
     let echo = {
@@ -224,7 +235,8 @@ fn exchange_with<P: Read + Write>(
     let mut search_from: Option<usize> = if match_after_echo && !echo.is_empty() { None } else { Some(0) };
     let mut buf = [0u8; 1024];
     let mut got: Vec<u8> = Vec::new();
-    while Instant::now() < deadline {
+    // At least one read pass, even when the write used the whole budget.
+    loop {
         match port.read(&mut buf) {
             Ok(0) => std::thread::sleep(IDLE_SLEEP),
             Ok(n) => {
@@ -245,6 +257,9 @@ fn exchange_with<P: Read + Write>(
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(e).context("error reading the signal's port"),
         }
+        if Instant::now() >= deadline {
+            break;
+        }
     }
     Ok(Exchanged { bytes: got, until_seen: false, truncated: false })
 }
@@ -263,7 +278,7 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> Result<ExchangeResponse> {
     let started = Instant::now();
     let mut port = serialport::new(port_name, baud)
-        .timeout(Duration::from_millis(50))
+        .timeout(READ_POLL)
         .open()
         .with_context(|| format!("failed to open signal '{signal}' on {port_name} at {baud} baud"))?;
     // Best effort: a plain UART bridge may not support the control line, and
@@ -272,9 +287,8 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
     if req.discard_pending {
         let _ = port.clear(serialport::ClearBuffer::Input);
     }
-    // The write gets the exchange's whole timeout: serialport uses one timeout for both
-    // directions and a 50 ms write cut short loses bytes on Windows (decision 79).
-    let _ = serialport::SerialPort::set_timeout(&mut *port, Duration::from_millis(req.timeout_ms));
+    // serialport uses one timeout for both directions and a 50 ms write cut short loses bytes
+    // on Windows, so the write gets what remains of `timeout_ms` (decision 79).
     let got = exchange_with(
         &mut port,
         req.write.as_bytes(),
@@ -282,8 +296,8 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
         req.match_after_echo,
         Duration::from_millis(req.timeout_ms),
         MAX_READ_BYTES,
-        |p| {
-            let _ = p.set_timeout(Duration::from_millis(50));
+        |p, d| {
+            let _ = p.set_timeout(d);
         },
     )?;
     Ok(ExchangeResponse {
@@ -411,6 +425,22 @@ mod tests {
         let e = exchange(&mut o, b"0123456789", None, true, Duration::from_millis(150), 1024).unwrap_err();
         assert!(format!("{e:#}").contains("only 4 of 10 bytes"), "{e:#}");
         assert!(t.elapsed() >= Duration::from_millis(150) && t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_line_taken_just_inside_the_deadline_leaves_the_read_what_remains_not_a_fresh_timeout() {
+        // Stalls 60 ms per call, so the 4 bytes arrive ~300 ms in; no marker ever comes.
+        let p = Throttled { inner: Fake::new(vec![]), cap: 1, stall_every_call: true, accept: true, stalled: false };
+        let mut p = p;
+        let timeout = Duration::from_millis(400);
+        let t = Instant::now();
+        let got = exchange(&mut p, b"abcd", Some("never"), false, timeout, 1024).unwrap();
+        assert!(!got.until_seen);
+        assert_eq!(p.inner.written, b"abcd");
+        let took = t.elapsed();
+        assert!(took >= timeout, "{took:?}");
+        // The bound: timeout_ms plus one read poll, not twice timeout_ms.
+        assert!(took < timeout + Duration::from_millis(250), "{took:?}");
     }
 
     fn req(write: &str) -> ExchangeRequest {
