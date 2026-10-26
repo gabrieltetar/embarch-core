@@ -3,6 +3,8 @@ use crate::flash_backend;
 use probe_rs::flashing::{self, BinOptions, Format};
 use probe_rs::probe::list::Lister;
 use probe_rs::Permissions;
+use probe_rs::config::NvmRegion;
+use std::ops::Range;
 use std::path::Path;
 
 /// One attached debug probe, as reported by probe-rs.
@@ -173,7 +175,7 @@ pub fn flash(
     base_address: Option<u64>,
     probe_serial: Option<&str>,
     erase: bool,
-) -> Result<()> {
+) -> Result<Vec<Range<u64>>> {
     let gated_serial = resolved_serial(probe_serial, "flash")?;
     embarch_topology::hardware::validate_serial(&gated_serial)
         .context("board-identity gate refused this flash")?;
@@ -197,7 +199,9 @@ pub fn flash(
             let mut probe = open_probe(probe_serial, "flash")?;
             embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
         }
-        return flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase);
+        // The vendor tool's own non-chip-erase mode runs; Core does not know its ranges.
+        flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase)?;
+        return Ok(Vec::new());
     }
 
     let format = parse_format(format, base_address)?;
@@ -209,6 +213,7 @@ pub fn flash(
     let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
         .with_context(|| format!("failed to attach to target '{chip}'"))?;
 
+    let mut erased: Vec<Range<u64>> = Vec::new();
     if erase {
         // Deliberately NOT `DownloadOptions::do_chip_erase` (nor
         // `flashing::erase_all`, which routes to the same place): both invoke
@@ -232,29 +237,37 @@ pub fn flash(
         // and provisioning) is gone — without going near `pc_erase_all`.
         // Ranges are collected first because `session` has to be borrowed
         // mutably to erase.
-        let nvm_ranges: Vec<(u64, u64)> = session
+        let regions: Vec<NvmRegion> = session
             .target()
             .memory_map
             .iter()
             .filter_map(|region| match region {
-                probe_rs::config::MemoryRegion::Nvm(nvm) => Some((nvm.range.start, nvm.range.end)),
+                probe_rs::config::MemoryRegion::Nvm(nvm) => Some(nvm.clone()),
                 _ => None,
             })
             .collect();
+        let algos: Vec<AlgoInfo> = session
+            .target()
+            .flash_algorithms
+            .iter()
+            .map(|a| AlgoInfo {
+                range: a.flash_properties.address_range.clone(),
+                cores: a.cores.clone(),
+                default: a.default,
+            })
+            .collect();
 
-        if nvm_ranges.is_empty() {
-            anyhow::bail!(
-                "erase requested but target '{chip}' declares no NVM region to erase —                  refusing to fall back to a chip erase, which is what bricks some targets"
-            );
-        }
+        // Every range is filtered and checked before the first erase (decision 84).
+        let nvm_ranges = plan_erase(&regions, &algos, chip)?;
 
-        for (start, end) in nvm_ranges {
+        for range in &nvm_ranges {
             let mut progress = flashing::FlashProgress::empty();
 
-            flashing::erase(&mut session, &mut progress, start, end, false).with_context(|| {
-                format!("erasing {start:#010x}..{end:#010x} on '{chip}' failed")
+            flashing::erase(&mut session, &mut progress, range.start, range.end, false).with_context(|| {
+                format!("erasing {:#010x}..{:#010x} on '{chip}' failed", range.start, range.end)
             })?;
         }
+        erased = nvm_ranges;
     }
 
     flashing::download_file(&mut session, firmware_path, format).context("flashing failed")?;
@@ -267,7 +280,64 @@ pub fn flash(
     let mut core = session.core(0).context("failed to select core 0 after flashing")?;
     core.reset().context("reset after flashing failed")?;
 
-    Ok(())
+    Ok(erased)
+}
+
+/// What `erase` needs to know of a flash algorithm (a mirror of the fields probe-rs's
+/// `get_flash_algorithm_for_region` reads, which is crate-private).
+#[derive(Debug, Clone)]
+pub(crate) struct AlgoInfo {
+    pub range: Range<u64>,
+    pub cores: Vec<String>,
+    pub default: bool,
+}
+
+/// The regions `erase: true` may touch: NVM that is not an alias and that the image could be
+/// written to (`access` absent or `write: true`). Option bytes (an STM32's `is_alias`,
+/// no-access region) are never what `erase` means, and a wrong write there can lock the part.
+pub(crate) fn erasable_regions(regions: &[NvmRegion]) -> Vec<&NvmRegion> {
+    regions.iter().filter(|r| !r.is_alias && r.is_writable()).collect()
+}
+
+/// Filter, then check every kept region has exactly one usable flash algorithm, *before* any
+/// erase runs: a region Core cannot erase fails the request with nothing erased. Never falls
+/// back to a chip erase.
+pub(crate) fn plan_erase(regions: &[NvmRegion], algos: &[AlgoInfo], chip: &str) -> Result<Vec<Range<u64>>> {
+    let kept = erasable_regions(regions);
+    if kept.is_empty() {
+        anyhow::bail!(
+            "erase requested but target '{chip}' declares no erasable NVM region (aliases and \
+             non-writable regions such as option bytes are skipped) - refusing to fall back to a \
+             chip erase, which is what bricks some targets"
+        );
+    }
+    let mut out = Vec::new();
+    for r in kept {
+        let core = r.cores.first();
+        let fits: Vec<&AlgoInfo> = algos
+            .iter()
+            .filter(|a| {
+                a.range.start <= r.range.start
+                    && r.range.end <= a.range.end
+                    && (a.cores.is_empty() || core.is_some_and(|c| a.cores.contains(c)))
+            })
+            .collect();
+        let ok = match fits.len() {
+            0 => false,
+            1 => true,
+            _ => fits.iter().filter(|a| a.default).count() == 1,
+        };
+        if core.is_none() || !ok {
+            anyhow::bail!(
+                "cannot erase {:#010x}..{:#010x} on '{chip}': no single flash algorithm applies to it; \
+                 nothing was erased",
+                r.range.start,
+                r.range.end
+            );
+        }
+        out.push(r.range.clone());
+    }
+    Ok(out)
 }
 
 /// Reset the target chip via the attached probe (`probe_serial` disambiguates
@@ -389,4 +459,64 @@ fn reset_via_assert_deassert(
     probe.target_reset_assert()?;
     std::thread::sleep(std::time::Duration::from_millis(RESET_PULSE_MS));
     probe.target_reset_deassert()
+}
+
+#[cfg(test)]
+mod erase_plan_tests {
+    use super::*;
+    use probe_rs::config::MemoryAccess;
+
+    fn nvm(range: Range<u64>, alias: bool, access: Option<MemoryAccess>) -> NvmRegion {
+        NvmRegion { name: None, range, cores: vec!["main".into()], is_alias: alias, access }
+    }
+    fn algo(range: Range<u64>) -> AlgoInfo {
+        AlgoInfo { range, cores: vec![], default: false }
+    }
+    fn no_access() -> Option<MemoryAccess> {
+        Some(MemoryAccess { read: false, write: false, execute: false, boot: false })
+    }
+
+    #[test]
+    fn stm32g0b1ve_keeps_main_flash_drops_option_bytes() {
+        let map = vec![
+            nvm(0x0800_0000..0x0808_0000, false, None),
+            nvm(0x1fff_7800..0x1fff_7820, true, no_access()),
+        ];
+        let kept = erasable_regions(&map);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].range, 0x0800_0000..0x0808_0000);
+        // Two algorithms, neither default, cover the option bytes only: irrelevant now.
+        let algos = vec![algo(0x0800_0000..0x0808_0000), algo(0x1fff_7800..0x1fff_7820), algo(0x1fff_7800..0x1fff_7820)];
+        assert_eq!(plan_erase(&map, &algos, "STM32G0B1VE").unwrap(), vec![0x0800_0000..0x0808_0000]);
+    }
+
+    #[test]
+    fn any_alias_or_non_writable_region_is_dropped() {
+        let ro = Some(MemoryAccess { read: true, write: false, execute: true, boot: false });
+        let map = vec![
+            nvm(0..0x100, true, None),
+            nvm(0x100..0x200, false, ro),
+            nvm(0x200..0x300, false, Some(MemoryAccess { read: true, write: true, execute: true, boot: false })),
+        ];
+        let kept = erasable_regions(&map);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].range, 0x200..0x300);
+    }
+
+    #[test]
+    fn nothing_left_is_refused() {
+        let map = vec![nvm(0..0x100, true, None)];
+        assert!(plan_erase(&map, &[algo(0..0x100)], "X").is_err());
+    }
+
+    #[test]
+    fn unerasable_region_fails_the_plan_before_any_erase() {
+        let map = vec![nvm(0..0x100, false, None), nvm(0x1000..0x2000, false, None)];
+        // Second region has no algorithm: the whole plan fails, so nothing erases.
+        let err = plan_erase(&map, &[algo(0..0x100)], "X").unwrap_err().to_string();
+        assert!(err.contains("nothing was erased"), "{err}");
+        // Ambiguous without a default also fails.
+        let dup = [algo(0..0x100), algo(0..0x100)];
+        assert!(plan_erase(&map[..1], &dup, "X").is_err());
+    }
 }

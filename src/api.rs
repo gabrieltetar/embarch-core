@@ -393,6 +393,9 @@ fn parse_base_address(s: &str) -> Result<u64, (StatusCode, String)> {
 struct FlashResponse {
     flashed: bool,
     chip: String,
+    /// Ranges `erase: true` sector-erased, as `0xSTART..0xEND`; empty without `erase`
+    /// or when a vendor tool did the flashing.
+    erased: Vec<String>,
 }
 
 /// A path Core can open directly, or a temp file holding an uploaded
@@ -491,7 +494,7 @@ async fn flash_handler(
         None => None,
     };
 
-    tokio::task::spawn_blocking(move || {
+    let erased = tokio::task::spawn_blocking(move || {
         let result =
             hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref(), erase);
         drop(_uploaded); // outlives the flash call; dropped (deleted) here, not before
@@ -516,6 +519,7 @@ async fn flash_handler(
     Ok(Json(FlashResponse {
         flashed: true,
         chip: chip_for_response,
+        erased: erased.iter().map(|r| format!("{:#010x}..{:#010x}", r.start, r.end)).collect(),
     }))
 }
 
