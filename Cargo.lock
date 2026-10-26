@@ -785,6 +785,7 @@ dependencies = [
  "crc",
  "heapless 0.8.0",
  "postcard",
+ "regex",
  "serde",
 ]
 
