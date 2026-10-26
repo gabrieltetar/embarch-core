@@ -20,9 +20,11 @@ use crate::{bootload, chip_resolve, hardware, logs, serial, study};
 /// can't collide on the same USB device at the same time.
 ///
 /// `study_lock`/`study_jobs` are `/study*`'s own state (`study.rs`).
-/// `study_lock` is explicitly separate from `hw_lock` — a different physical
-/// connection (decision 15) — so an in-flight
-/// study and a `/flash`/`/reset` call never contend on the same guard.
+/// `study_lock` guards the dev-bench link (decision 15) and is a different
+/// guard from `hw_lock`, so an in-flight study and a `/flash`/`/reset` call
+/// never contend on the same one. The dev-bench routes (`POST /study`,
+/// `GET /dev-bench/hello`) take both, in one fixed order: `study_lock`, then
+/// `hw_lock`; `hw_lock` never waits on `study_lock` (`decisions/platform.md`).
 #[derive(Clone)]
 pub struct AppState {
     pub token: String,

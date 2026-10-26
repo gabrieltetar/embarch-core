@@ -1185,6 +1185,18 @@ fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity)
 pub async fn hello_handler(
     State(state): State<AppState>,
 ) -> Result<Json<HelloAckInfo>, (StatusCode, String)> {
+    hello_with(state, embarch_topology::hardware::resolve_dev_bench_port).await
+}
+
+/// `hello_handler` with the port resolver injected, so a test can stop the
+/// handshake before it reaches real USB enumeration, a probe or a port.
+async fn hello_with<R>(
+    state: AppState,
+    resolve: R,
+) -> Result<Json<HelloAckInfo>, (StatusCode, String)>
+where
+    R: FnOnce() -> anyhow::Result<embarch_topology::hardware::DevBenchPort> + Send + 'static,
+{
     // Held (as `study_lock`) until this returns, the way `POST /study` holds
     // it, so nothing else opens the dev-bench port during the handshake.
     let _hold = {
@@ -1199,7 +1211,7 @@ pub async fn hello_handler(
         HelloHold(state.study_lock.clone())
     };
 
-    let port = match tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port).await {
+    let port = match tokio::task::spawn_blocking(resolve).await {
         Ok(Ok(port)) => port,
         Ok(Err(e)) if e.downcast_ref::<embarch_topology::hardware::DevBenchNotFound>().is_some() => {
             return Err((StatusCode::NOT_FOUND, format!("{e:?}")));
@@ -7020,14 +7032,27 @@ mod tests {
     async fn hello_is_refused_409_while_the_link_is_held_and_releases_its_own_hold() {
         let state = AppState::new("t".to_string());
         *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
-        let Err(err) = hello_handler(State(state.clone())).await else { panic!("must be refused") };
+        let never = || -> anyhow::Result<embarch_topology::hardware::DevBenchPort> {
+            panic!("a refused hello must not resolve a port")
+        };
+        let Err(err) = hello_with(state.clone(), never).await else { panic!("must be refused") };
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("study-abc"), "got: {}", err.1);
         *state.study_lock.lock().unwrap() = None;
 
-        // Free link: hello takes the hold, then fails later (no bench here);
-        // whatever it returns, the hold must be gone afterwards.
-        let _ = hello_handler(State(state.clone())).await;
+        // Free link: hello takes the hold, then the injected resolver reports
+        // no dev-bench, so nothing reaches a port or a probe. The hold must be
+        // gone afterwards, on the error path.
+        let seen = Arc::new(StdMutex::new(None));
+        let seen2 = seen.clone();
+        let lock = state.study_lock.clone();
+        let none = move || -> anyhow::Result<embarch_topology::hardware::DevBenchPort> {
+            *seen2.lock().unwrap() = lock.lock().unwrap().clone();
+            Err(anyhow::anyhow!("no dev-bench (test resolver)"))
+        };
+        let Err(err) = hello_with(state.clone(), none).await else { panic!("no bench") };
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(HELLO_HOLDER));
         assert!(state.study_lock.lock().unwrap().is_none());
     }
 }
