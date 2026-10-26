@@ -427,6 +427,61 @@ pub fn read_capture(streams_dir: &Path, file_name: &str, csv: bool) -> std::io::
     Ok(found.then_some(out))
 }
 
+/// Bytes [`read_capture`] would serve for one capture, from file sizes alone.
+pub fn capture_len(streams_dir: &Path, file_name: &str) -> std::io::Result<u64> {
+    let mut total = 0;
+    for name in [previous_segment_name(file_name), file_name.to_string()] {
+        match fs::metadata(streams_dir.join(name)) {
+            Ok(m) => total += m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
+/// Rebases a `Text` tap's byte-offset sidecar onto the bytes the raw capture
+/// still holds, so every `byte_offset` served points into what
+/// `GET .../stream/{name}` serves *now*.
+///
+/// The sidecar is never rotated and the raw file is, so once the raw file's
+/// oldest segment is deleted the sidecar's offsets (from the start of the
+/// capture) are shifted by the deleted bytes. The sidecar's last row says how
+/// long the capture was (`byte_offset + bytes`), and `raw_len` says how much of
+/// it survives; the difference is the deleted head. Rows wholly inside it are
+/// dropped, a row straddling its end is clamped to start at 0, and the rest
+/// shift down. Returns the rebased CSV and the head length (0 when nothing was
+/// deleted, in which case the input is returned unchanged).
+pub fn rebase_byte_arrivals(csv: &[u8], raw_len: u64) -> (Vec<u8>, u64) {
+    let text = String::from_utf8_lossy(csv);
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or("");
+    let rows: Vec<(u64, &str, u64)> = lines
+        .filter_map(|l| {
+            let mut it = l.splitn(3, ',');
+            let off = it.next()?.parse().ok()?;
+            let ms = it.next()?;
+            let len = it.next()?.parse().ok()?;
+            Some((off, ms, len))
+        })
+        .collect();
+    let captured = rows.iter().map(|(o, _, l)| o + l).max().unwrap_or(0);
+    let deleted = captured.saturating_sub(raw_len);
+    if deleted == 0 {
+        return (csv.to_vec(), 0);
+    }
+    let mut out = format!("{header}\n");
+    for (off, ms, len) in rows {
+        let end = off + len;
+        if end <= deleted {
+            continue;
+        }
+        let start = off.saturating_sub(deleted);
+        out.push_str(&format!("{start},{ms},{}\n", end - deleted - start));
+    }
+    (out.into_bytes(), deleted)
+}
+
 /// `text/csv` for a rendered CSV, `text/plain` for a `Text` tap's own file,
 /// `application/octet-stream` for raw bytes — declared by the file the index
 /// named, never sniffed from the content.
@@ -452,6 +507,16 @@ struct TapFiles {
     /// through the same `StreamRef.truncated` flag because a reader's
     /// question is the same either way: is this capture complete?
     lost_at_source: bool,
+    /// An append to the raw or the rendered file failed (disk full, a file
+    /// another process holds), so this capture is missing bytes or rows that
+    /// the source delivered. Reaches `StreamRef.truncated` for the same reason
+    /// `lost_at_source` does: a reader asking "is this complete?" gets one
+    /// answer whatever the cause.
+    write_failed: bool,
+    /// Whether the most recent [`StreamStore::write_raw`] landed. The arrival
+    /// sidecar is keyed by what the raw file *holds*, so a record the raw
+    /// file did not take must not get a row (`note_arrival`).
+    last_raw_ok: bool,
 }
 
 /// Core's receipt time for each frame of an outpost capture, kept beside the
@@ -634,6 +699,8 @@ impl StreamStore {
                     offset: 0,
                 }),
                 lost_at_source: false,
+                write_failed: false,
+                last_raw_ok: true,
             });
 
             // Core states this, it does not measure it: the front end this
@@ -688,7 +755,10 @@ impl StreamStore {
         let Some(tap) = self.taps.get_mut(usize::from(id)) else {
             return;
         };
+        tap.last_raw_ok = true;
         if let Err(e) = tap.raw.write(bytes) {
+            tap.write_failed = true;
+            tap.last_raw_ok = false;
             tracing::error!(
                 name = tap.name.as_str(),
                 "failed to append raw bytes to {}: {e:?}",
@@ -707,6 +777,7 @@ impl StreamStore {
             return;
         };
         if let Err(e) = rendered.write(format!("{row}\n").as_bytes()) {
+            tap.write_failed = true;
             tracing::error!(
                 name = tap.name.as_str(),
                 "failed to append a row to {}: {e:?}",
@@ -730,18 +801,23 @@ impl StreamStore {
         let Some(arrival) = tap.arrival.as_mut() else {
             return;
         };
-        // **The two kinds record two different clocks, on purpose.** A frame
-        // sidecar records the record's own `rx_utc_ms`, which on the signal-tap
-        // path an outpost capture arrives by *is* `current_utc_ms()` — changing
-        // it would move every existing trace's stamps by a few microseconds for
-        // no gain. A byte sidecar records Core's own receipt time explicitly,
-        // because a `Text` tap can arrive mediated by dev-bench, whose
-        // `rx_utc_ms` is that board's uptime and is comparable with nothing
-        // outside its own capture (suite decision 3).
-        let stamp = match arrival.kind {
-            ArrivalKind::Frames => rx_utc_ms,
-            ArrivalKind::Bytes => core_rx_utc_ms,
-        };
+        // **A record the raw file did not take gets no row.** The sidecar is
+        // keyed by what the raw file holds (a byte offset, a frame index), so
+        // a row for bytes that are not there would put every later key out of
+        // step with the file it describes. The missing row is a hole, which
+        // the frame join keeps only the prefix before and the byte offsets
+        // simply skip; either way those reads go untimed, never mis-timed.
+        if !tap.last_raw_ok {
+            return;
+        }
+        // **Both kinds stamp Core's own receipt time**, never the record's
+        // `rx_utc_ms`. That field is Core's clock only on a direct signal tap;
+        // a record that arrived mediated by dev-bench carries that board's
+        // uptime, comparable with nothing outside its own capture (suite
+        // decision 3), and an `OutpostTrace` tap accepts any source. The live
+        // preview of the same frames already uses `core_rx_utc_ms`.
+        let _ = rx_utc_ms;
+        let stamp = core_rx_utc_ms;
         let Some(rows) = arrival.note(bytes, stamp) else {
             return;
         };
@@ -779,6 +855,7 @@ impl StreamStore {
                     .unwrap_or_default(),
                 bytes_written: tap.raw.total_written,
                 truncated: tap.lost_at_source
+                    || tap.write_failed
                     || tap.raw.truncated
                     || tap.rendered.as_ref().is_some_and(|r| r.truncated),
                 // Filled in after the capture closes, by
@@ -1276,6 +1353,101 @@ mod tests {
         let mut store = StreamStore::create(dir.path(), &taps, &[], 4).unwrap();
         store.write_raw(0, b"0123456789");
         assert_eq!(fs::read(store.dir().join("raw.bin")).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn a_failed_raw_append_marks_the_tap_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![tap(0, "raw", StreamSource::DevBenchLog, StreamEncoding::Raw)];
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 4).unwrap();
+        store.write_raw(0, b"aaaa");
+        assert!(!store.refs()[0].truncated);
+        // A directory where the rotation wants to rename to: the append fails
+        // mid-capture, the way a locked or full disk would.
+        fs::create_dir(store.dir().join("raw.1.bin")).unwrap();
+        store.write_raw(0, b"bbbb");
+        assert!(store.refs()[0].truncated, "a failed append must read as lost data");
+        assert_eq!(store.refs()[0].bytes_written, 4, "the failed bytes were not written");
+    }
+
+    #[test]
+    fn a_failed_rendered_append_marks_the_tap_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![tap(0, "power", StreamSource::PowerFrontEnd { sample_hz: 1000 }, samples())];
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 0).unwrap();
+        fs::create_dir(store.dir().join("power.csv")).unwrap();
+        store.write_rendered_row(0, "1,2,3");
+        assert!(store.refs()[0].truncated);
+    }
+
+    #[test]
+    fn a_failed_arrival_append_leaves_frames_untimed_and_is_not_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = outpost_store(dir.path());
+        fs::create_dir(store.dir().join("outpost.arrival.csv")).unwrap();
+        store.write_raw(0, b"\x01\xaa\x00");
+        store.note_arrival(0, b"\x01\xaa\x00", 1, 1);
+        assert!(!store.refs()[0].truncated, "the frames are all there; only their time is lost");
+        assert!(store.dir().join("outpost.arrival.csv").is_dir(), "no sidecar rows were written");
+    }
+
+    #[test]
+    fn a_record_the_raw_file_refused_gets_no_arrival_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![tap(0, "console", StreamSource::DevBenchLog, StreamEncoding::Text)];
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 4).unwrap();
+        store.write_raw(0, b"aaaa");
+        store.note_arrival(0, b"aaaa", 1, 10);
+        fs::create_dir(store.dir().join("console.1.txt")).unwrap();
+        store.write_raw(0, b"bbbb");
+        store.note_arrival(0, b"bbbb", 2, 20);
+        fs::remove_dir(store.dir().join("console.1.txt")).unwrap();
+        store.write_raw(0, b"cccc");
+        store.note_arrival(0, b"cccc", 3, 30);
+        let log = fs::read_to_string(store.dir().join("console.arrival.csv")).unwrap();
+        // "cccc" sits at offset 4 in the raw file (after "aaaa"), and the
+        // sidecar says so rather than 8.
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["byte_offset,core_rx_utc_ms,bytes", "0,10,4", "4,30,4"]);
+    }
+
+    #[test]
+    fn a_text_taps_arrival_offsets_are_rebased_after_the_head_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = vec![tap(0, "console", StreamSource::DevBenchLog, StreamEncoding::Text)];
+        let mut store = StreamStore::create(dir.path(), &taps, &[], 8).unwrap();
+        // Records of 4 bytes, cap 8: three rotations delete the first segments.
+        let recs: [&[u8]; 6] = [b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee", b"ffff"];
+        for (i, r) in recs.iter().enumerate() {
+            store.write_raw(0, r);
+            store.note_arrival(0, r, 0, 100 + i as u64);
+        }
+        assert!(store.refs()[0].truncated);
+        let sidecar = fs::read(store.dir().join("console.arrival.csv")).unwrap();
+        let raw = read_capture(store.dir(), "console.txt", false).unwrap().unwrap();
+        let raw_len = capture_len(store.dir(), "console.txt").unwrap();
+        assert_eq!(raw_len as usize, raw.len());
+        let (csv, deleted) = rebase_byte_arrivals(&sidecar, raw_len);
+        assert!(deleted > 0);
+        let text = String::from_utf8(csv).unwrap();
+        for row in text.lines().skip(1) {
+            let f: Vec<u64> = row.split(',').map(|c| c.parse().unwrap()).collect();
+            let (off, ms, len) = (f[0] as usize, f[1], f[2] as usize);
+            let want = recs[(ms - 100) as usize];
+            assert_eq!(&raw[off..off + len], want, "row {row} must point at its own bytes");
+        }
+        // And an untouched capture is passed through unchanged.
+        let (same, d0) = rebase_byte_arrivals(&sidecar, 24);
+        assert_eq!((same, d0), (sidecar.clone(), 0));
+    }
+
+    #[test]
+    fn an_outpost_sidecar_stamps_core_time_not_the_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = outpost_store(dir.path());
+        // A record stamped with a bench's uptime (5), received at Core time 1_700.
+        store.note_arrival(0, b"\x02\xaa\xbb\x00", 5, 1_700);
+        let log = fs::read_to_string(store.dir().join("outpost.arrival.csv")).unwrap();
+        assert_eq!(log.lines().nth(1), Some("0,1700,3"));
     }
 
     #[test]

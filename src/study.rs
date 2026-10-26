@@ -4288,9 +4288,34 @@ pub async fn stream_arrivals_handler(
     .map_err(internal_err)?
     .map_err(internal_err)?;
 
+    // A `Text` tap's sidecar is keyed by byte offset into a raw file that
+    // rotates while the sidecar does not, so rebase it onto what survives
+    // (`rebase_byte_arrivals`) and say how much head is gone.
+    let mut head_deleted = 0u64;
+    let read = if let (Some(bytes), StreamEncoding::Text) = (&read, &entry.encoding) {
+        let dir = streams_dir.to_path_buf();
+        let raw_file = entry.raw_file.clone();
+        let raw_len = tokio::task::spawn_blocking(move || stream_store::capture_len(&dir, &raw_file))
+            .await
+            .map_err(internal_err)?
+            .map_err(internal_err)?;
+        let (rebased, deleted) = stream_store::rebase_byte_arrivals(bytes, raw_len);
+        head_deleted = deleted;
+        Some(rebased)
+    } else {
+        read
+    };
+
     match read {
         Some(bytes) => {
-            Ok(([(CONTENT_TYPE, stream_store::content_type_for(&file))], bytes).into_response())
+            let mut resp =
+                ([(CONTENT_TYPE, stream_store::content_type_for(&file))], bytes).into_response();
+            if head_deleted > 0 {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&head_deleted.to_string()) {
+                    resp.headers_mut().insert("x-arrivals-head-deleted", v);
+                }
+            }
+            Ok(resp)
         }
         // The sidecar is created with the study and written to as bytes
         // arrive, so an absent one means nothing ever arrived on this tap.
