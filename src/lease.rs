@@ -245,6 +245,7 @@ pub const LEASE_GATED: &[(&str, &str)] = &[
     ("POST", "/signals/{name}/capture"),
     ("DELETE", "/signals/{name}/capture"),
     ("POST", "/live/mem-read"),
+    ("POST", "/live/core-state"),
     ("POST", "/validate"),
     ("POST", "/study"),
     ("POST", "/host-studies"),

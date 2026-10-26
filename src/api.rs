@@ -171,6 +171,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/signals/{name}/exchange", post(signal_exchange_handler))
         .route("/signals/{name}/capture", post(start_capture_handler).get(read_capture_handler).delete(stop_capture_handler))
         .route("/live/mem-read", post(live_mem_read_handler))
+        .route("/live/core-state", post(live_core_state_handler))
         .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
         .route("/alerts", get(alerts_handler))
@@ -1765,6 +1766,36 @@ async fn live_mem_read_handler(
     .map(Json)
 }
 
+// ---- POST /live/core-state -------------------------------------------------
+
+/// Where a role's core is, read-only: `DHCSR` and `DWT_PCSR` samples without halting, or with
+/// `halt=true` one halt for the registers and `SCB_ICSR` (decision 97). `400` before `hw_lock`
+/// for a request [`crate::live::check_core_state`] refuses; the rest as `/live/mem-read`.
+// route: POST /live/core-state
+async fn live_core_state_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::live::CoreStateRequest>,
+) -> Result<Json<crate::live::CoreStateResponse>, (StatusCode, String)> {
+    crate::live::check_core_state(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let _guard = acquire_hw_lock(&state, "POST /live/core-state").await?;
+
+    tokio::task::spawn_blocking(move || {
+        let board = embarch_topology::hardware::find_enrolled_by_role(&req.role)
+            .map_err(internal_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("nothing is enrolled under the role '{}'", req.role)))?;
+        let probe_serial = board.probe_serial.clone().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!("the role '{}' has a board type but no enrolled probe to read through", req.role),
+            )
+        })?;
+        crate::live::run_core_state(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
+    })
+    .await
+    .map_err(internal_err)?
+    .map(Json)
+}
+
 // ---- GET /serial-ports ------------------------------------------------------
 
 /// Every USB serial port this machine currently enumerates, unnarrowed —
@@ -2614,6 +2645,7 @@ mod tests {
         ("GET", "/signals/{name}/capture", "/signals/console/capture"),
         ("DELETE", "/signals/{name}/capture", "/signals/console/capture"),
         ("POST", "/live/mem-read", "/live/mem-read"),
+        ("POST", "/live/core-state", "/live/core-state"),
         ("GET", "/serial-ports", "/serial-ports"),
         ("POST", "/validate", "/validate"),
         ("GET", "/alerts", "/alerts"),
@@ -2670,7 +2702,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 36;
+    const DOCUMENTED_ROUTE_COUNT: usize = 37;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3390,6 +3422,7 @@ mod tests {
             ("POST", "/flash"),
             ("GET", "/serial-log"),
             ("POST", "/live/mem-read"),
+            ("POST", "/live/core-state"),
             ("POST", "/validate"),
             ("POST", "/study"),
             ("POST", "/probes/enroll"),
