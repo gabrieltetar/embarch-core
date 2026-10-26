@@ -45,6 +45,11 @@ pub const MAX_READ_BYTES: usize = 256 * 1024;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
 
+/// After `until` matches mid-line, how long the port must be quiet before the read ends there
+/// (decision 98): a prompt has nothing after it and returns at once; a verdict word follows a
+/// marker such as `pd: ` within one UART frame burst.
+pub const QUIET_GAP: Duration = Duration::from_millis(40);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeRequest {
     /// Written as given: a shell command needs its own line ending.
@@ -96,6 +101,113 @@ pub struct ExchangeResponse {
     /// The read hit [`MAX_READ_BYTES`] before `until` or the deadline.
     pub truncated: bool,
     pub elapsed_ms: u64,
+    /// How many bytes came back after the write (decision 98). `0` is a console that said nothing.
+    pub bytes_read: usize,
+    /// The echo of the written line (without its line ending) was seen in the reply: the
+    /// console's shell is alive and reading. `false` with a non-empty reply is a console that
+    /// talks but does not echo, or one that is not the shell.
+    pub echo_seen: bool,
+    /// `write_all` and `flush` both succeeded, so the line went out. Always `true` in an
+    /// answer: a write that fails is an error, which says nothing was written.
+    pub written: bool,
+    /// The port disappeared mid-read (a command that drops a USB CDC ACM device, a cable pull).
+    /// `text` holds what was read before the loss; the command did run.
+    pub port_lost: bool,
+    /// The port's USB identity, added when nothing came back at all, so a USB-UART bridge is
+    /// told from the DUT's own USB device (decision 98).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_identity: Option<PortIdentity>,
+    /// The DUT core's run state from `DHCSR`, added when nothing came back and the signal's
+    /// role has an enrolled probe. Never halts the core (decision 98).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_state: Option<CoreState>,
+}
+
+/// What a USB serial port says it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PortIdentity {
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+    pub product: Option<String>,
+    pub serial_number: Option<String>,
+}
+
+impl PortIdentity {
+    pub fn of(port: &embarch_topology::hardware::DetectedPort) -> Self {
+        PortIdentity {
+            vendor_id: port.vendor_id,
+            product_id: port.product_id,
+            product: port.product.clone(),
+            serial_number: port.serial_number.clone(),
+        }
+    }
+}
+
+/// The DUT core as `DHCSR` shows it (decision 98), or why that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoreState {
+    /// The raw register, when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcsr: Option<u32>,
+    pub s_halt: Option<bool>,
+    pub s_sleep: Option<bool>,
+    pub s_lockup: Option<bool>,
+    pub s_reset_st: Option<bool>,
+    /// An instruction retired between the two reads: the core is executing, not stuck.
+    pub s_retire_st: Option<bool>,
+    /// Why there is no register: the role has no probe, or the probe could not be used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+impl CoreState {
+    pub fn unavailable(why: impl Into<String>) -> Self {
+        CoreState {
+            dhcsr: None,
+            s_halt: None,
+            s_sleep: None,
+            s_lockup: None,
+            s_reset_st: None,
+            s_retire_st: None,
+            unavailable: Some(why.into()),
+        }
+    }
+
+    /// Decodes a `DHCSR` read (ARMv6-M/v7-M/v8-M all place these bits alike).
+    pub fn from_dhcsr(v: u32) -> Self {
+        let bit = |n: u32| Some(v & (1 << n) != 0);
+        CoreState {
+            dhcsr: Some(v),
+            s_halt: bit(17),
+            s_sleep: bit(18),
+            s_lockup: bit(19),
+            s_retire_st: bit(24),
+            s_reset_st: bit(25),
+            unavailable: None,
+        }
+    }
+}
+
+/// The run state of the core behind `role`: looks up the role's probe with `lookup`, then
+/// reads `DHCSR` with `read`. Two seams so the no-probe and probe-absent branches are
+/// testable with no probe (decision 98).
+pub fn core_state_for(
+    role: &str,
+    lookup: impl FnOnce(&str) -> Result<Option<(String, String)>>,
+    read: impl FnOnce(&str, &str) -> Result<u32>,
+) -> CoreState {
+    match lookup(role) {
+        Err(e) => CoreState::unavailable(format!("enrollment could not be read: {e:#}")),
+        Ok(None) => CoreState::unavailable(format!("nothing is enrolled under the role '{role}'")),
+        Ok(Some((chip, probe))) if probe.is_empty() => {
+            let _ = chip;
+            CoreState::unavailable(format!("the role '{role}' has no enrolled probe"))
+        }
+        Ok(Some((chip, probe))) => match read(&chip, &probe) {
+            Ok(v) => CoreState::from_dhcsr(v),
+            Err(e) => CoreState::unavailable(format!("the probe could not read the core: {e:#}")),
+        },
+    }
 }
 
 /// What one exchange read back.
@@ -104,6 +216,8 @@ pub struct Exchanged {
     pub bytes: Vec<u8>,
     pub until_seen: bool,
     pub truncated: bool,
+    pub echo_seen: bool,
+    pub port_lost: bool,
 }
 
 /// Checks a request before `hw_lock` is taken: a caller error is a `400`,
@@ -190,15 +304,20 @@ fn write_with_deadline<P: Write>(
             Err(e) if matches!(e.kind(), TimedOut | WouldBlock | Interrupted) => true,
             Err(e) => {
                 return Err(e).with_context(|| {
-                    format!("error writing to the signal's port after {sent} of {} bytes", write.len())
+                    if sent == 0 {
+                        "error writing to the signal's port: nothing was written".to_string()
+                    } else {
+                        format!("error writing to the signal's port after {sent} of {} bytes", write.len())
+                    }
                 })
             }
         };
         if stalled {
             if Instant::now() >= deadline {
                 anyhow::bail!(
-                    "the signal's port took only {sent} of {} bytes before the write deadline",
-                    write.len()
+                    "the signal's port took only {sent} of {} bytes before the write deadline{}",
+                    write.len(),
+                    if sent == 0 { " (nothing was written)" } else { "" }
                 );
             }
             std::thread::sleep(IDLE_SLEEP);
@@ -221,7 +340,7 @@ fn exchange_with<P: Read + Write>(
 ) -> Result<Exchanged> {
     let deadline = Instant::now() + timeout;
     write_with_deadline(port, write, deadline, &mut set_timeout)?;
-    port.flush().context("error flushing the signal's port")?;
+    port.flush().context("error flushing the signal's port (the line was written, so it may have gone out)")?;
     set_timeout(port, READ_POLL);
     let needle = until.map(str::as_bytes);
     // The written line without its line ending: what a shell echoes back.
@@ -235,6 +354,13 @@ fn exchange_with<P: Read + Write>(
     let mut search_from: Option<usize> = if match_after_echo && !echo.is_empty() { None } else { Some(0) };
     let mut buf = [0u8; 1024];
     let mut got: Vec<u8> = Vec::new();
+    // Where the first `until` match ends, and when the last byte after it arrived.
+    let mut matched_end: Option<usize> = None;
+    let mut last_data = Instant::now();
+    let done = |got: Vec<u8>, until_seen: bool, truncated: bool, port_lost: bool| {
+        let echo_seen = !echo.is_empty() && find(&got, echo, 0).is_some();
+        Ok(Exchanged { bytes: got, until_seen, truncated, echo_seen, port_lost })
+    };
     // At least one read pass, even when the write used the whole budget.
     loop {
         match port.read(&mut buf) {
@@ -242,26 +368,34 @@ fn exchange_with<P: Read + Write>(
             Ok(n) => {
                 let take = n.min(max_bytes - got.len());
                 got.extend_from_slice(&buf[..take]);
+                last_data = Instant::now();
                 if search_from.is_none() {
                     search_from = find(&got, echo, 0).map(|i| i + echo.len());
                 }
-                if let (Some(x), Some(start)) = (needle, search_from) {
-                    if find(&got, x, start).is_some() {
-                        return Ok(Exchanged { bytes: got, until_seen: true, truncated: false });
-                    }
+                if let (Some(x), Some(start), None) = (needle, search_from, matched_end) {
+                    matched_end = find(&got, x, start).map(|i| i + x.len());
                 }
                 if got.len() >= max_bytes {
-                    return Ok(Exchanged { bytes: got, until_seen: false, truncated: true });
+                    return done(got, matched_end.is_some(), true, false);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e).context("error reading the signal's port"),
+            // The port went away after the line was written: the command ran, and what was read
+            // is the answer so far.
+            Err(_) => return done(got.clone(), matched_end.is_some(), false, true),
+        }
+        // A marker found mid-line ends the read at the end of that line, or once the port
+        // has been quiet for QUIET_GAP, whichever is first (decision 98).
+        if let Some(end) = matched_end {
+            if got[end..].iter().any(|&b| b == b'\n' || b == b'\r') || last_data.elapsed() >= QUIET_GAP {
+                return done(got, true, false, false);
+            }
         }
         if Instant::now() >= deadline {
             break;
         }
     }
-    Ok(Exchanged { bytes: got, until_seen: false, truncated: false })
+    done(got, matched_end.is_some(), false, false)
 }
 
 /// The first index at or after `from` where `needle` starts in `hay`.
@@ -272,25 +406,32 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay[from..].windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
 
-/// Opens `port_name` at `baud`, asserts DTR (a Zephyr CDC ACM shell may wait
-/// for it before it prints), optionally drops pending input, and runs one
-/// [`exchange`].
-pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> Result<ExchangeResponse> {
+/// Opens `port`, asserts DTR (a Zephyr CDC ACM shell may wait for it before it prints),
+/// optionally drops pending input, and runs one exchange. `core_state` is called only when
+/// nothing came back, to add the DUT core's run state (decision 98).
+pub fn run(
+    signal: &str,
+    port: &embarch_topology::hardware::DetectedPort,
+    baud: u32,
+    req: &ExchangeRequest,
+    core_state: impl FnOnce() -> CoreState,
+) -> Result<ExchangeResponse> {
     let started = Instant::now();
-    let mut port = serialport::new(port_name, baud)
+    let port_name = port.port_name.as_str();
+    let mut sp = serialport::new(port_name, baud)
         .timeout(READ_POLL)
         .open()
-        .with_context(|| format!("failed to open signal '{signal}' on {port_name} at {baud} baud"))?;
+        .with_context(|| format!("failed to open signal '{signal}' on {port_name} at {baud} baud: nothing was written"))?;
     // Best effort: a plain UART bridge may not support the control line, and
     // that is no reason to refuse the write.
-    let _ = port.write_data_terminal_ready(true);
+    let _ = sp.write_data_terminal_ready(true);
     if req.discard_pending {
-        let _ = port.clear(serialport::ClearBuffer::Input);
+        let _ = sp.clear(serialport::ClearBuffer::Input);
     }
     // serialport uses one timeout for both directions and a 50 ms write cut short loses bytes
     // on Windows, so the write gets what remains of `timeout_ms` (decision 79).
     let got = exchange_with(
-        &mut port,
+        &mut sp,
         req.write.as_bytes(),
         req.until.as_deref(),
         req.match_after_echo,
@@ -300,6 +441,7 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
             let _ = p.set_timeout(d);
         },
     )?;
+    let silent = got.bytes.is_empty();
     Ok(ExchangeResponse {
         signal: signal.to_string(),
         port: port_name.to_string(),
@@ -308,6 +450,12 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
         until_seen: got.until_seen,
         truncated: got.truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        bytes_read: got.bytes.len(),
+        echo_seen: got.echo_seen,
+        written: true,
+        port_lost: got.port_lost,
+        port_identity: silent.then(|| PortIdentity::of(port)),
+        core_state: silent.then(core_state),
     })
 }
 
@@ -485,10 +633,11 @@ mod tests {
         let got = exchange(&mut p, b"kernel uptime\n", Some("uart:~$ "), true, Duration::from_secs(5), 1024).unwrap();
         assert!(got.until_seen);
         assert!(String::from_utf8_lossy(&got.bytes).contains("Uptime: 17774 ms"));
-        // Without the echo rule the early prompt ends it, which is the bug.
+        // Without the echo rule the early prompt is the match; the read then runs on to the end of
+        // that line (decision 98), so it still ends at the prompt's line, not at the real one.
         let mut q = Fake::new(vec![Ok(b"uart:~$ ".to_vec()), Ok(b"kernel uptime\r\nUptime: 1 ms\r\n".to_vec())]);
         let early = exchange(&mut q, b"kernel uptime\n", Some("uart:~$ "), false, Duration::from_secs(5), 1024).unwrap();
-        assert!(early.until_seen && !String::from_utf8_lossy(&early.bytes).contains("Uptime"));
+        assert!(early.until_seen && !String::from_utf8_lossy(&early.bytes).contains("Uptime: 1 ms\r\nuart"));
     }
 
     #[test]
@@ -500,9 +649,85 @@ mod tests {
     }
 
     #[test]
-    fn a_read_error_is_an_error_not_a_short_reply() {
-        let mut p = Fake::new(vec![Err(std::io::ErrorKind::BrokenPipe.into())]);
-        assert!(exchange(&mut p, b"x\n", None, true, Duration::from_secs(1), 100).is_err());
+    fn zero_bytes_back_says_so_with_no_echo() {
+        let mut p = Fake::new(vec![]);
+        let got = exchange(&mut p, b"help\n", Some("$ "), true, Duration::from_millis(60), 100).unwrap();
+        assert!(got.bytes.is_empty() && !got.echo_seen && !got.until_seen && !got.port_lost);
+        assert_eq!(p.written, b"help\n");
+    }
+
+    #[test]
+    fn echo_then_silence_is_a_live_shell_that_said_nothing_more() {
+        let mut p = Fake::new(vec![Ok(b"help\r\n".to_vec())]);
+        let got = exchange(&mut p, b"help\n", Some("$ "), true, Duration::from_millis(60), 100).unwrap();
+        assert!(got.echo_seen && !got.until_seen && !got.port_lost);
+    }
+
+    #[test]
+    fn a_read_error_after_the_write_keeps_the_partial_text_and_says_the_port_was_lost() {
+        let mut p = Fake::new(vec![Ok(b"usb off\r\nbye\r\n".to_vec()), Err(std::io::ErrorKind::BrokenPipe.into())]);
+        let got = exchange(&mut p, b"usb off\n", None, true, Duration::from_secs(1), 100).unwrap();
+        assert!(got.port_lost && got.echo_seen);
+        assert_eq!(got.bytes, b"usb off\r\nbye\r\n");
+        assert_eq!(p.written, b"usb off\n");
+        // Even with nothing read, the loss is reported rather than erred.
+        let mut q = Fake::new(vec![Err(std::io::ErrorKind::BrokenPipe.into())]);
+        let lost = exchange(&mut q, b"x\n", None, true, Duration::from_secs(1), 100).unwrap();
+        assert!(lost.port_lost && lost.bytes.is_empty());
+    }
+
+    #[test]
+    fn a_marker_cut_mid_line_reads_on_to_the_verdict() {
+        let mut p = Fake::new(vec![Ok(b"pd sink 5\r\npd: o".to_vec()), Ok(b"k\r\n".to_vec())]);
+        let got = exchange(&mut p, b"pd sink 5\n", Some("pd: "), true, Duration::from_secs(5), 1024).unwrap();
+        assert!(got.until_seen);
+        assert!(got.bytes.ends_with(b"pd: ok\r\n"), "{:?}", String::from_utf8_lossy(&got.bytes));
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_after_it_returns_after_the_quiet_gap_not_the_deadline() {
+        let mut p = Fake::new(vec![Ok(b"x\r\nuart:~$ ".to_vec())]);
+        let t = Instant::now();
+        let got = exchange(&mut p, b"x\n", Some("uart:~$ "), true, Duration::from_secs(5), 1024).unwrap();
+        assert!(got.until_seen);
+        assert!(t.elapsed() >= QUIET_GAP && t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn dhcsr_bits_decode_and_the_unavailable_branches_say_why() {
+        let c = CoreState::from_dhcsr((1 << 17) | (1 << 25));
+        assert_eq!((c.s_halt, c.s_sleep, c.s_lockup, c.s_reset_st, c.s_retire_st), (Some(true), Some(false), Some(false), Some(true), Some(false)));
+        let no_probe = core_state_for("dut", |_| Ok(Some(("stm32g071rb".into(), String::new()))), |_, _| panic!("no probe, no read"));
+        assert!(no_probe.dhcsr.is_none() && no_probe.unavailable.unwrap().contains("no enrolled probe"));
+        let none = core_state_for("dut", |_| Ok(None), |_, _| panic!("not enrolled, no read"));
+        assert!(none.unavailable.unwrap().contains("nothing is enrolled"));
+        let absent = core_state_for("dut", |_| Ok(Some(("c".into(), "SER".into()))), |_, _| anyhow::bail!("no probe attached"));
+        assert!(absent.unavailable.unwrap().contains("no probe attached"));
+        let ok = core_state_for("dut", |_| Ok(Some(("c".into(), "SER".into()))), |c, p| {
+            assert_eq!((c, p), ("c", "SER"));
+            Ok(1 << 18)
+        });
+        assert_eq!(ok.s_sleep, Some(true));
+    }
+
+    #[test]
+    fn a_write_that_fails_is_an_error_that_says_nothing_was_written() {
+        struct Dead;
+        impl Read for Dead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        impl Write for Dead {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let e = exchange(&mut Dead, b"x\n", None, true, Duration::from_secs(1), 100).unwrap_err();
+        assert!(format!("{e:#}").contains("nothing was written"), "{e:#}");
     }
 
     #[test]

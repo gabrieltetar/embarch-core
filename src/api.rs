@@ -1349,10 +1349,30 @@ async fn signal_exchange_handler(
                 ),
             ));
         }
-        let port = crate::exchange::resolve_port_waiting(&name, req.port_wait_ms)
-            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        let role = link.origin_role.clone();
+        let core_state = || {
+            crate::exchange::core_state_for(
+                &role,
+                |r| {
+                    Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
+                        .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
+                },
+                crate::live::read_dhcsr,
+            )
+        };
+        let port = match crate::exchange::resolve_port_waiting(&name, req.port_wait_ms) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut msg = format!("{e:#}");
+                // A port wait that ran out: say what the core was doing meanwhile (decision 98).
+                if req.port_wait_ms > 0 {
+                    msg.push_str(&format!("; core state: {}", serde_json::to_string(&core_state()).unwrap_or_default()));
+                }
+                return Err((StatusCode::CONFLICT, msg));
+            }
+        };
         let baud = crate::stream_store::signal_baud_for(&link);
-        crate::exchange::run(&name, &port.port_name, baud, &req).map_err(internal_err)
+        crate::exchange::run(&name, &port, baud, &req, core_state).map_err(internal_err)
     })
     .await
     .map_err(internal_err)?

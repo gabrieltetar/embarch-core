@@ -133,6 +133,22 @@ pub fn run(chip: &str, probe_serial: &str, role: &str, req: &MemReadRequest) -> 
     })
 }
 
+/// `DHCSR`, the core's debug status register, read twice a few milliseconds apart so
+/// `S_RETIRE_ST` (clear on read) in the second read says whether instructions are retiring.
+/// A PPB read through the guarded attach: it never halts and needs no DMA clock (decision 98).
+pub fn read_dhcsr(chip: &str, probe_serial: &str) -> Result<u32> {
+    const DHCSR: u64 = 0xE000_EDF0;
+    embarch_topology::hardware::validate_serial(probe_serial).context("board-identity gate refused this read")?;
+    let mut probe = crate::hardware::open_probe(Some(probe_serial), "exchange")?;
+    embarch_topology::hardware::check_target_powered(&mut probe).context("can't read")?;
+    let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
+        .with_context(|| format!("failed to attach to target '{chip}'"))?;
+    let mut core = session.core(0).context("failed to select core 0")?;
+    core.read_word_32(DHCSR).context("failed to read DHCSR")?;
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    core.read_word_32(DHCSR).context("failed to read DHCSR")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
