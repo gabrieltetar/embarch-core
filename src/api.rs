@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, chip_resolve, hardware, logs, serial, study};
+use crate::{bootload, chip_resolve, hardware, lease, logs, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -55,6 +55,10 @@ pub struct AppState {
     pub tap_ports: study::TapPorts,
     /// Background captures by signal name (`capture.rs`, decision 92).
     pub captures: crate::capture::CaptureRegistry,
+    /// The bench lease (`lease.rs`, decision 93).
+    pub lease: lease::LeaseSlot,
+    /// The last image Core flashed per chip, for `GET /status` (decision 93).
+    pub images: lease::ImageLog,
 }
 
 impl AppState {
@@ -67,6 +71,8 @@ impl AppState {
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
             captures: crate::capture::CaptureRegistry::default(),
+            lease: lease::LeaseSlot::default(),
+            images: lease::ImageLog::default(),
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock: Arc::new(StdMutex::new(None)),
@@ -142,6 +148,7 @@ pub(crate) async fn acquire_hw_lock(state: &AppState, route: &'static str) -> Re
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/status", get(status_handler))
+        .route("/lease", post(take_lease_handler).get(get_lease_handler).put(renew_lease_handler).delete(release_lease_handler))
         .route("/flash", post(flash_handler))
         .route("/reset", post(reset_handler))
         .route("/bootload", post(bootload_handler))
@@ -174,6 +181,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/stream/{name}", get(study::stream_data_handler))
         .route("/study/{study_id}/stream/{name}/arrivals", get(study::stream_arrivals_handler))
         .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), lease_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -200,6 +208,102 @@ async fn auth_middleware(
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
+}
+
+/// Refuses a hardware route's request without the live lease's token, `409`
+/// naming the holder (decision 93). Runs inside `auth_middleware`, so an
+/// unauthenticated caller still learns nothing; and it matches on the
+/// registered path pattern (`lease::LEASE_GATED`), so `/signals/{name}/exchange`
+/// is one entry however many signals exist. With no lease live it admits
+/// everything, which is today's behaviour exactly.
+async fn lease_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let gated = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|p| lease::is_gated(req.method().as_str(), p.as_str()));
+    if gated {
+        if let Err(view) = state.lease.admit(lease_token(req.headers())) {
+            return (StatusCode::CONFLICT, view.refusal()).into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn lease_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(lease::LEASE_HEADER).and_then(|h| h.to_str().ok())
+}
+
+fn lease_err(e: lease::LeaseError) -> (StatusCode, String) {
+    match e {
+        lease::LeaseError::Held(view) => (StatusCode::CONFLICT, view.refusal()),
+        lease::LeaseError::NoLease => (
+            StatusCode::NOT_FOUND,
+            "no lease is live (never taken, released, expired, or Core restarted)".to_string(),
+        ),
+        lease::LeaseError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+// ---- /lease ---------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TakeLeaseRequest {
+    holder: String,
+    #[serde(default)]
+    purpose: String,
+    ttl_s: u64,
+}
+
+#[derive(Deserialize)]
+struct RenewLeaseRequest {
+    #[serde(default)]
+    ttl_s: Option<u64>,
+}
+
+/// Takes the whole bench; `409` naming the holder if a lease is live. The
+/// token in the answer is shown once (decision 93).
+// route: POST /lease
+async fn take_lease_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TakeLeaseRequest>,
+) -> Result<(StatusCode, Json<lease::Granted>), (StatusCode, String)> {
+    state
+        .lease
+        .take(&req.holder, &req.purpose, req.ttl_s)
+        .map(|g| (StatusCode::CREATED, Json(g)))
+        .map_err(lease_err)
+}
+
+/// The live lease without its token, or `404`.
+// route: GET /lease
+async fn get_lease_handler(State(state): State<AppState>) -> Result<Json<lease::LeaseView>, (StatusCode, String)> {
+    state.lease.view().map(Json).ok_or_else(|| lease_err(lease::LeaseError::NoLease))
+}
+
+/// Extends the live lease to `ttl_s` from now (its own TTL when omitted);
+/// needs the token.
+// route: PUT /lease
+async fn renew_lease_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    req: Option<Json<RenewLeaseRequest>>,
+) -> Result<Json<lease::LeaseView>, (StatusCode, String)> {
+    let ttl_s = req.and_then(|Json(r)| r.ttl_s);
+    state.lease.renew(lease_token(&headers), ttl_s).map(Json).map_err(lease_err)
+}
+
+/// Releases the live lease; needs the token. `204`.
+// route: DELETE /lease
+async fn release_lease_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.lease.release(lease_token(&headers)).map_err(lease_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) fn internal_err<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
@@ -300,6 +404,12 @@ struct StatusResponse {
     /// path couldn't be read back (permissions, a deleted/replaced binary);
     /// `/status` still serves everything else in that case (decision 68).
     binary_sha256: Option<String>,
+    /// The live bench lease, without its token, or `null` (decision 93).
+    /// Additive: `embarch-api`'s client ignores fields it does not know.
+    lease: Option<lease::LeaseView>,
+    /// The last image Core flashed (or bootloaded) per chip since it started
+    /// (decision 93). Empty means unknown, not "nothing flashed".
+    last_images: Vec<lease::FlashedImage>,
 }
 
 /// Hashes `std::env::current_exe()`'s bytes once and caches the result —
@@ -323,7 +433,7 @@ fn binary_sha256() -> Option<String> {
 }
 
 // route: GET /status
-async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> {
+async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let probes = tokio::task::spawn_blocking(hardware::list_probes)
         .await
         .map_err(internal_err)?
@@ -335,6 +445,8 @@ async fn status_handler() -> Result<Json<StatusResponse>, (StatusCode, String)> 
         study_designer_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
         core_version: env!("CARGO_PKG_VERSION"),
         binary_sha256: binary_sha256(),
+        lease: state.lease.view(),
+        last_images: state.images.all(),
     }))
 }
 
@@ -504,15 +616,29 @@ async fn flash_handler(
         None => None,
     };
 
-    let erased = tokio::task::spawn_blocking(move || {
+    let uploaded = _uploaded.is_some();
+    let image_path = if uploaded { "(uploaded)".to_string() } else { path.display().to_string() };
+    let image_probe = probe_serial.clone();
+    let (erased, image_sha) = tokio::task::spawn_blocking(move || {
+        let sha = std::fs::read(&path).ok().map(|b| lease::sha256_hex(&b));
         let result =
             hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref(), erase);
         drop(_uploaded); // outlives the flash call; dropped (deleted) here, not before
-        result
+        result.map(|erased| (erased, sha))
     })
     .await
     .map_err(internal_err)?
     .map_err(describe_topology_error)?;
+
+    // Only after the flash succeeded: the record says what is on the board.
+    state.images.record(lease::FlashedImage {
+        chip: chip_for_response.clone(),
+        probe_serial: image_probe,
+        path: image_path,
+        sha256: image_sha,
+        flashed_at: String::new(),
+        lease_holder: state.lease.view().map(|l| l.holder),
+    });
 
     // Only after the flash actually succeeded: a manifest bound to an image
     // that never reached the board would describe firmware that is not running.
@@ -670,6 +796,9 @@ async fn bootload_handler(
     let _guard = acquire_hw_lock(&state, "POST /bootload").await?;
     let taps = state.tap_ports.clone();
     let manifests = state.outpost_manifest.clone();
+    let images = state.images.clone();
+    let lease_slot = state.lease.clone();
+    let image_sha = lease::sha256_hex(&plan.image);
 
     tokio::task::spawn_blocking(move || {
         let dut = embarch_topology::hardware::DUT_ROLE;
@@ -687,13 +816,24 @@ async fn bootload_handler(
         let dut_chip = embarch_topology::hardware::find_enrolled_by_role(dut)
             .map_err(internal_err)?
             .map(|row| row.chip);
-        bootload::run(&mut bootload::UsbBench, &ports, &plan, &taps, &bootload::PLACEHOLDER_TIMEOUTS, || {
+        let result = bootload::run(&mut bootload::UsbBench, &ports, &plan, &taps, &bootload::PLACEHOLDER_TIMEOUTS, || {
             // The same rule `/flash` follows for an image with no manifest:
             // the one stored describes firmware that is about to be gone.
             if let Some(chip) = &dut_chip {
                 manifests.clear_for_chip(chip);
             }
-        })
+        });
+        if result.is_ok() {
+            images.record(lease::FlashedImage {
+                chip: dut_chip.unwrap_or_else(|| dut.to_string()),
+                probe_serial: None,
+                path: "(bootload image)".to_string(),
+                sha256: Some(image_sha),
+                flashed_at: String::new(),
+                lease_holder: lease_slot.view().map(|l| l.holder),
+            });
+        }
+        result
     })
     .await
     .map_err(internal_err)?
@@ -2431,6 +2571,10 @@ mod tests {
     /// two methods gets two rows.
     const AUTH_CASES: &[(&str, &str, &str)] = &[
         ("GET", "/status", "/status"),
+        ("POST", "/lease", "/lease"),
+        ("GET", "/lease", "/lease"),
+        ("PUT", "/lease", "/lease"),
+        ("DELETE", "/lease", "/lease"),
         ("POST", "/flash", "/flash"),
         ("POST", "/reset", "/reset"),
         ("POST", "/bootload", "/bootload"),
@@ -2509,7 +2653,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 33;
+    const DOCUMENTED_ROUTE_COUNT: usize = 34;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -2799,6 +2943,8 @@ mod tests {
             study_designer_schema_version: 7,
             core_version: "9.9.9",
             binary_sha256: Some("a".repeat(64)),
+            lease: None,
+            last_images: Vec::new(),
         })
         .unwrap();
 
@@ -2814,6 +2960,8 @@ mod tests {
             [
                 "binary_sha256",
                 "core_version",
+                "last_images",
+                "lease",
                 "probes",
                 "status",
                 "study_designer_schema_version",
@@ -3144,5 +3292,166 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!msg.starts_with("probe not attached"), "lead must not contradict reason: {msg}");
         assert!(msg.contains("is attached but could not be opened"), "got: {msg}");
+    }
+
+    // ---- decision 93: the bench lease -------------------------------------
+    //
+    // Nothing here touches hardware. A gated route that is *admitted* is
+    // sent a body its handler rejects before opening anything (`{}` on
+    // `/reset` is a `422`), so "not 409" proves the lease let it through.
+
+    /// A new route cannot be added without deciding whether a live lease
+    /// gates it: every `AUTH_CASES` row is in exactly one of the two lists.
+    #[test]
+    fn every_route_is_either_lease_gated_or_lease_open() {
+        for (method, path, _) in AUTH_CASES {
+            let gated = lease::LEASE_GATED.iter().any(|(m, p)| m == method && p == path);
+            let open = lease::LEASE_OPEN.iter().any(|(m, p)| m == method && p == path);
+            assert!(
+                gated ^ open,
+                "{method} {path} must be in exactly one of `lease::LEASE_GATED` / `LEASE_OPEN` \
+                 (gated: {gated}, open: {open}) — decide whether a live bench lease refuses it \
+                 (decision 93)"
+            );
+        }
+        for (method, path) in lease::LEASE_GATED.iter().chain(lease::LEASE_OPEN) {
+            assert!(
+                AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
+                "{method} {path} is in a lease list but is not a registered route"
+            );
+        }
+    }
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        lease_token: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer test-token");
+        if let Some(t) = lease_token {
+            b = b.header(lease::LEASE_HEADER, t);
+        }
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let req = b.body(axum::body::Body::from(body.unwrap_or("").to_string())).unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn take(router: &Router, holder: &str, ttl_s: u64) -> (StatusCode, serde_json::Value) {
+        let body = format!(r#"{{"holder":"{holder}","purpose":"flash and probe","ttl_s":{ttl_s}}}"#);
+        let (status, text) = send(router, "POST", "/lease", None, Some(&body)).await;
+        (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    }
+
+    #[tokio::test]
+    async fn no_lease_means_every_hardware_route_behaves_as_before() {
+        let router = test_router();
+        let (status, _) = send(&router, "POST", "/reset", None, Some("{}")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "no lease held: the request reaches its handler");
+    }
+
+    #[tokio::test]
+    async fn two_clients_a_live_lease_refuses_the_other_by_name() {
+        let router = test_router();
+        let (status, granted) = take(&router, "session-a", 60).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = granted["token"].as_str().unwrap().to_string();
+
+        // Client B, no token: refused 409 naming holder, purpose, start and expiry.
+        for (method, uri) in [
+            ("POST", "/reset"),
+            ("POST", "/flash"),
+            ("GET", "/serial-log"),
+            ("POST", "/live/mem-read"),
+            ("POST", "/validate"),
+            ("POST", "/study"),
+            ("POST", "/probes/enroll"),
+            ("POST", "/signals/console/exchange"),
+            ("POST", "/signals/console/capture"),
+            ("DELETE", "/signals/console/capture"),
+            ("POST", "/bootload"),
+        ] {
+            let (status, text) = send(&router, method, uri, None, Some("{}")).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {text}");
+            for needle in [
+                "session-a",
+                "flash and probe",
+                granted["started_at"].as_str().unwrap(),
+                granted["expires_at"].as_str().unwrap(),
+            ] {
+                assert!(text.contains(needle), "{method} {uri} refusal must name {needle}: {text}");
+            }
+        }
+        // ...and a wrong token is no better than none.
+        let (status, _) = send(&router, "POST", "/reset", Some("not-it"), Some("{}")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Client A carries the token: the same request reaches its handler.
+        let (status, _) = send(&router, "POST", "/reset", Some(&token), Some("{}")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Reads and the record stay open to B.
+        let (status, _) = send(&router, "GET", "/signals/console/capture", None, None).await;
+        assert_ne!(status, StatusCode::CONFLICT);
+        let (status, body) = send(&router, "GET", "/lease", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains(&token), "GET /lease must not leak the token");
+
+        // B cannot take it, renew it, or release it.
+        let (status, _) = take(&router, "session-b", 60).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(send(&router, "PUT", "/lease", None, Some("{}")).await.0, StatusCode::CONFLICT);
+        assert_eq!(send(&router, "DELETE", "/lease", None, None).await.0, StatusCode::CONFLICT);
+
+        // A renews, releases; B is then admitted and can take its own.
+        let (status, text) = send(&router, "PUT", "/lease", Some(&token), Some(r#"{"ttl_s":120}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(send(&router, "DELETE", "/lease", Some(&token), None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&router, "POST", "/reset", None, Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(take(&router, "session-b", 60).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_frees_the_bench_with_no_human() {
+        let router = test_router();
+        assert_eq!(take(&router, "crashed", 1).await.0, StatusCode::CREATED);
+        assert_eq!(send(&router, "POST", "/reset", None, Some("{}")).await.0, StatusCode::CONFLICT);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert_eq!(
+            send(&router, "POST", "/reset", None, Some("{}")).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a crashed holder must not block the bench past its TTL"
+        );
+        assert_eq!(send(&router, "GET", "/lease", None, None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_lease_without_its_token() {
+        let router = test_router();
+        let (_, body) = send(&router, "GET", "/status", None, None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["lease"].is_null());
+        let (_, granted) = take(&router, "session-a", 60).await;
+        let (_, body) = send(&router, "GET", "/status", None, None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["lease"]["holder"], "session-a");
+        assert!(!body.contains(granted["token"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn take_validates_ttl_and_holder() {
+        let router = test_router();
+        assert_eq!(take(&router, "a", 0).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(take(&router, "a", lease::MAX_TTL_S + 1).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(take(&router, " ", 5).await.0, StatusCode::BAD_REQUEST);
     }
 }
