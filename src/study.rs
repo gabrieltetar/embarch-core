@@ -2731,13 +2731,19 @@ fn read_signal_tap(
         match port.read(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
-                let record = StreamRecord {
-                    // Core is the node that received these bytes, so Core
-                    // stamps them (`embarch-study-designer` spec.md §4.8).
-                    rx_utc_ms: current_utc_ms(),
-                    bytes: heapless::Vec::from_slice(&buf[..n]).unwrap_or_default(),
-                };
-                write_stream_record(&capture, &tap, &record);
+                // One record per line (core/101): a read holding several
+                // lines would otherwise give them all one receive time. The
+                // raw bytes are unchanged; only the record boundaries move.
+                let rx_utc_ms = current_utc_ms();
+                for piece in buf[..n].split_inclusive(|b| *b == b'\n') {
+                    let record = StreamRecord {
+                        // Core is the node that received these bytes, so Core
+                        // stamps them (`embarch-study-designer` spec.md §4.8).
+                        rx_utc_ms,
+                        bytes: heapless::Vec::from_slice(piece).unwrap_or_default(),
+                    };
+                    write_stream_record(&capture, &tap, &record);
+                }
             }
             // A bounded per-read timeout with nothing on the wire is the
             // normal state of a debug UART, not an error.

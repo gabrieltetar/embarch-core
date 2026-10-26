@@ -321,7 +321,7 @@ pub fn execute<B: HostBackend>(
 // ---- submission checks ------------------------------------------------------
 
 /// What this Core does not execute yet, by name. `Prompt` and `Instrument` are later units of the
-/// host-study proposal; `Repeat`, `streams` and `line_counts` are `core/116`'s and `core/101`'s.
+/// host-study proposal; `Repeat` and `line_counts` are `core/116`'s; `streams` is accepted for `Text` + `WholeStudy` taps only.
 fn unsupported(study: &HostStudy) -> Option<String> {
     let in_list = |steps: &[HostStep], list: &str| {
         steps.iter().enumerate().find_map(|(i, s)| {
@@ -337,8 +337,15 @@ fn unsupported(study: &HostStudy) -> Option<String> {
     in_list(&study.steps, "steps")
         .or_else(|| in_list(&study.teardown, "teardown"))
         .or_else(|| {
-            (!study.streams.is_empty())
-                .then(|| "`streams` is not executed by this Core yet: a host study has no signal taps (core/101)".to_string())
+            study.streams.iter().find_map(|t| {
+                if !matches!(t.encoding, embarch_study_designer::StreamEncoding::Text) {
+                    Some(format!("streams[{}] '{}': only a `Text` tap is captured in a host study (decision 98)", t.id, t.name))
+                } else if !matches!(t.scope, embarch_study_designer::StreamScope::WholeStudy) {
+                    Some(format!("streams[{}] '{}': only a `WholeStudy` tap is captured in a host study (decision 98)", t.id, t.name))
+                } else {
+                    None
+                }
+            })
         })
         .or_else(|| {
             (!study.line_counts.is_empty())
@@ -423,18 +430,185 @@ impl HostEventsWriter {
         Ok(())
     }
 
-    pub fn finish(mut self, end: &RunEnd) -> anyhow::Result<()> {
+    pub fn finish(mut self, end: &RunEnd, streams: &[serde_json::Value]) -> anyhow::Result<()> {
         write!(
             self.file,
-            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"streams\":[]}}",
+            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"streams\":{}}}",
             end.completed,
             serde_json::to_string(&end.reason)?,
-            end.teardown_failures
+            end.teardown_failures,
+            serde_json::to_string(streams)?
         )?;
         self.file.flush()?;
         drop(self.file);
         std::fs::rename(&self.partial, &self.done)?;
         Ok(())
+    }
+}
+
+// ---- signal taps (decision 98) -----------------------------------------------
+
+/// How long a study's tap may run: six hours. **Reasoned, not measured**: the field's longest
+/// run was minutes; the cap only bounds a forgotten tap, as [`crate::capture::MAX_S`] does.
+const TAP_MAX_S: u64 = 6 * 3600;
+
+/// What a tap's signal resolves to: the carrier, found live from topology.
+pub struct TapTarget {
+    pub port_name: String,
+    pub baud: u32,
+    pub opener: crate::capture::Opener,
+    pub identity: Option<crate::exchange::PortIdentity>,
+}
+
+type TapError = (StatusCode, String);
+
+/// The real resolver: the signal must be declared and direct (a via-dev-bench route arrives over
+/// dev-bench's link and has no port for Core to own).
+fn resolve_tap(signal: &str) -> Result<TapTarget, TapError> {
+    let link = embarch_topology::hardware::find_signal(signal)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not read the signal table: {e:#}")))?
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("no signal is declared under the name '{signal}'")))?;
+    if matches!(link.route, embarch_topology::hardware::Route::ViaDevBench { .. }) {
+        return Err((StatusCode::BAD_REQUEST, format!("signal '{signal}' is a via-dev-bench route; Core taps only a direct one in a host study")));
+    }
+    let port = embarch_topology::hardware::resolve_signal_port(signal).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    let baud = crate::stream_store::signal_baud_for(&link);
+    let name = signal.to_string();
+    let opener: crate::capture::Opener = Arc::new(move || {
+        let p = embarch_topology::hardware::resolve_signal_port(&name)?;
+        let mut sp = serialport::new(p.port_name.as_str(), baud).timeout(crate::exchange::READ_POLL).open()?;
+        let _ = sp.write_data_terminal_ready(true);
+        Ok(Box::new(sp) as Box<dyn crate::capture::CapturePort>)
+    });
+    let identity = Some(crate::exchange::PortIdentity::of(&port));
+    Ok(TapTarget { port_name: port.port_name, baud, opener, identity })
+}
+
+struct LiveTap {
+    id: u8,
+    name: String,
+    signal: String,
+    port: String,
+    cap: Arc<crate::capture::Capture>,
+}
+
+/// A host study's signal taps: one [`crate::capture::Capture`] per tap, opened once at the start
+/// and held until the teardown ends. An `Exchange` on a tapped signal finds the capture in the
+/// registry (`api::run_signal_exchange`) and runs through its open port, so the port is opened
+/// once and nothing the console prints between steps is lost. Every byte it reads lands in
+/// `streams/<name>.txt`, one record per line, with Core's receive time in `<name>.arrival.csv`
+/// on one monotonic clock shared by all the study's taps. Dropping it stops the captures.
+pub struct StudyTaps {
+    captures: crate::capture::CaptureRegistry,
+    live: Vec<LiveTap>,
+    store: Arc<StdMutex<crate::stream_store::StreamStore>>,
+}
+
+impl StudyTaps {
+    /// Opens every tap's port, `None` when the study declares none. Nothing is half-started: a
+    /// failure stops the taps already open. `409` for a port a capture or another tap holds.
+    pub fn start(
+        captures: &crate::capture::CaptureRegistry,
+        tap_ports: &crate::study::TapPorts,
+        dir: &FsPath,
+        study: &HostStudy,
+        resolve: &dyn Fn(&str) -> Result<TapTarget, TapError>,
+    ) -> Result<Option<Self>, TapError> {
+        if study.streams.is_empty() {
+            return Ok(None);
+        }
+        let store = crate::stream_store::StreamStore::create(dir, &study.streams, &[], crate::stream_store::stream_max_bytes())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not create the study's streams/: {e:#}")))?;
+        let mut taps = StudyTaps { captures: captures.clone(), live: vec![], store: Arc::new(StdMutex::new(store)) };
+        // One anchor for the whole study: a tap's stamp is this instant plus the monotonic time
+        // since, so two consoles' lines order against each other without wall-clock steps.
+        let epoch = Instant::now();
+        let epoch_utc = now_ms();
+        for tap in &study.streams {
+            let embarch_study_designer::StreamSource::Signal { name: signal } = &tap.source else { continue };
+            let signal = signal.as_str();
+            let target = resolve(signal)?;
+            if tap_ports.holds(&target.port_name) {
+                return Err((StatusCode::CONFLICT, format!("{} is held by a running study's tap", target.port_name)));
+            }
+            let id = tap.id;
+            let store = taps.store.clone();
+            let sink: crate::capture::Sink = Arc::new(move |bytes: &[u8]| {
+                let stamp = epoch_utc + epoch.elapsed().as_millis() as u64;
+                let mut st = store.lock().unwrap();
+                // A record per line, so the arrival log gives each its own row.
+                for piece in bytes.split_inclusive(|b| *b == b'\n') {
+                    st.write_raw(id, piece);
+                    st.note_arrival(id, piece, stamp, stamp);
+                }
+            });
+            let claim = tap_ports.claim(&target.port_name);
+            let cap = captures
+                .start_with_sink(
+                    signal,
+                    &target.port_name,
+                    target.baud,
+                    TAP_MAX_S,
+                    crate::capture::MAX_BYTES,
+                    target.identity,
+                    target.opener,
+                    Box::new(claim),
+                    Some(sink),
+                )
+                .map_err(|e| match e {
+                    crate::capture::StartError::Conflict(m) | crate::capture::StartError::Open(m) => (StatusCode::CONFLICT, m),
+                })?;
+            taps.live.push(LiveTap { id, name: tap.name.to_string(), signal: signal.to_string(), port: target.port_name, cap });
+        }
+        Ok(Some(taps))
+    }
+
+    /// Stops every capture and waits (briefly) for its thread, so the ports are closed when
+    /// this returns.
+    fn shutdown(&mut self) {
+        for t in &self.live {
+            t.cap.stop();
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        while self.live.iter().any(|t| t.cap.state().running()) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for t in &self.live {
+            if self.captures.get(&t.signal).is_some_and(|c| c.id == t.cap.id) {
+                self.captures.remove(&t.signal);
+            }
+        }
+    }
+
+    /// Ends the taps and returns each one's entry for `events.json`'s `streams`: what it wrote,
+    /// how it ended (`stopped` is the normal end; `expired` or `byte_cap` means it stopped
+    /// early and a later exchange opened the port itself) and any gap where the port was lost.
+    pub fn finish(mut self) -> Vec<serde_json::Value> {
+        self.shutdown();
+        let refs = self.store.lock().unwrap().refs();
+        self.live
+            .iter()
+            .map(|t| {
+                let read = t.cap.read(0, 0);
+                let r = refs.iter().find(|r| r.name.as_str() == t.name);
+                serde_json::json!({
+                    "id": t.id,
+                    "name": t.name,
+                    "signal": t.signal,
+                    "port": t.port,
+                    "state": read.state,
+                    "bytes_written": r.map(|r| r.bytes_written).unwrap_or(0),
+                    "truncated": r.map(|r| r.truncated).unwrap_or(false) || read.state != crate::capture::State::Stopped,
+                    "gaps": read.gaps,
+                })
+            })
+            .collect()
+    }
+}
+
+impl Drop for StudyTaps {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -453,6 +627,7 @@ pub fn run_job<B: HostBackend>(
     cancel: &AtomicBool,
     jobs: &JobRegistry,
     events_tx: &broadcast::Sender<StudyEvent>,
+    taps: Option<StudyTaps>,
 ) {
     let mut writer = match HostEventsWriter::start(dir, &study.name) {
         Ok(w) => w,
@@ -481,11 +656,14 @@ pub fn run_job<B: HostBackend>(
             result: Box::new(rec.result),
         });
     });
+    // After the teardown, so a console's last words are held; dropping `taps` on an early
+    // return below stops them too.
+    let streams = taps.map(StudyTaps::finish).unwrap_or_default();
     if let Some(e) = write_err {
         crate::study::fail_job(jobs, events_tx, study_id, format!("could not write the study's record: {e}"));
         return;
     }
-    if let Err(e) = writer.finish(&end) {
+    if let Err(e) = writer.finish(&end, &streams) {
         crate::study::fail_job(jobs, events_tx, study_id, format!("failed to finalize events.json: {e:#}"));
         return;
     }
@@ -555,6 +733,12 @@ pub async fn post_host_study_handler(
     }
     let dir = crate::study::study_results_dir(&study_id).map_err(internal_err)?;
     std::fs::create_dir_all(&dir).map_err(internal_err)?;
+    let taps = {
+        let (st, s, d) = (state.clone(), study.clone(), dir.clone());
+        tokio::task::spawn_blocking(move || StudyTaps::start(&st.captures, &st.tap_ports, &d, &s, &resolve_tap))
+            .await
+            .map_err(internal_err)??
+    };
 
     let cancel = Arc::new(AtomicBool::new(false));
     *state.host_cancel.lock().unwrap() = Some((study_id.clone(), cancel.clone()));
@@ -574,7 +758,7 @@ pub async fn post_host_study_handler(
         let outcome = tokio::task::spawn_blocking(move || {
             let _hold = hold;
             let mut backend = CoreBackend { state, handle };
-            run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx);
+            run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx, taps);
         })
         .await;
         if let Err(e) = outcome {
@@ -896,7 +1080,7 @@ mod tests {
         let jobs: JobRegistry = Default::default();
         jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(2), reason: None });
         let (tx, mut rx) = broadcast::channel(16);
-        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx);
+        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None);
         let job = jobs.lock().unwrap().get("id1").cloned().unwrap();
         assert_eq!(job.status, "completed");
         assert!(job.reason.unwrap().contains("step 'b' failed"));
@@ -957,5 +1141,250 @@ mod tests {
         assert!(e.1.contains("bench study"));
         assert_eq!(cancel_study_handler(State(state.clone()), Path("d1".into())).await.unwrap_err().0, StatusCode::CONFLICT);
         assert_eq!(cancel_study_handler(State(state), Path("nope".into())).await.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    // ---- taps (decision 98) ----
+
+    /// One end of a virtual serial pair: the study side is `Console` (a `CapturePort`), the test
+    /// side feeds the console's output and reads what the study wrote. A write echoes the line
+    /// back with a prompt, as a Zephyr shell does.
+    #[derive(Clone, Default)]
+    struct Pair {
+        incoming: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+        written: Arc<StdMutex<Vec<u8>>>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Pair {
+        fn feed(&self, b: &[u8]) {
+            self.incoming.lock().unwrap().push_back(b.to_vec());
+        }
+        fn opener(&self) -> crate::capture::Opener {
+            let me = self.clone();
+            Arc::new(move || {
+                me.opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(me.clone()) as Box<dyn crate::capture::CapturePort>)
+            })
+        }
+    }
+
+    impl Read for Pair {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            match self.incoming.lock().unwrap().pop_front() {
+                Some(c) => {
+                    out[..c.len()].copy_from_slice(&c);
+                    Ok(c.len())
+                }
+                None => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    Err(std::io::ErrorKind::TimedOut.into())
+                }
+            }
+        }
+    }
+
+    impl Write for Pair {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(b);
+            let mut reply = b.to_vec();
+            reply.extend_from_slice(b"result\r\n> ");
+            self.incoming.lock().unwrap().push_back(reply);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::capture::CapturePort for Pair {
+        fn set_timeout(&mut self, _d: Duration) {}
+    }
+
+    /// The real backend's route minus topology: a tapped signal's exchange goes through its
+    /// capture, as `api::run_signal_exchange` does.
+    struct ViaCapture {
+        captures: crate::capture::CaptureRegistry,
+        replies: Vec<(String, String)>,
+    }
+
+    impl HostBackend for ViaCapture {
+        fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure> {
+            let cap = self.captures.running(signal).ok_or_else(|| ExchangeFailure::PortUnavailable("no tap".into()))?;
+            let r = cap.exchange(req, || crate::exchange::CoreState::unavailable("test")).map_err(|e| ExchangeFailure::Failed(format!("{e:#}")))?;
+            self.replies.push((signal.to_string(), r.text.clone()));
+            Ok(r)
+        }
+    }
+
+    fn tap(id: u8, name: &str, signal: &str) -> embarch_study_designer::StreamTap {
+        embarch_study_designer::StreamTap {
+            id,
+            name: name.try_into().unwrap(),
+            source: embarch_study_designer::StreamSource::Signal { name: signal.try_into().unwrap() },
+            encoding: embarch_study_designer::StreamEncoding::Text,
+            scope: embarch_study_designer::StreamScope::WholeStudy,
+        }
+    }
+
+    fn tapped_ex(name: &str, signal: &str, line: &str) -> HostStep {
+        let mut s = ex(name, line, "> ");
+        if let HostAction::Exchange { signal: sg, .. } = &mut s.action {
+            *sg = signal.into();
+        }
+        s.timeout_ms = 2000;
+        s
+    }
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < end, "timed out waiting");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn two_tapped_consoles_with_exchanges_on_both_are_each_opened_once_and_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pd, dut) = (Pair::default(), Pair::default());
+        let captures = crate::capture::CaptureRegistry::default();
+        let ports = crate::study::TapPorts::default();
+        let mut s = study(
+            vec![tapped_ex("pd-1", "pd", "pd status"), wait("gap", 150), tapped_ex("dut-1", "dut", "pd role"), tapped_ex("pd-2", "pd", "pd max")],
+            vec![],
+        );
+        s.streams = vec![tap(0, "pd console", "pd"), tap(1, "dut console", "dut")];
+        assert!(check_study(&s).is_ok());
+        let (pd2, dut2) = (pd.clone(), dut.clone());
+        let resolve = move |sig: &str| -> Result<TapTarget, TapError> {
+            let p = if sig == "pd" { &pd2 } else { &dut2 };
+            Ok(TapTarget { port_name: format!("FAKE-{sig}"), baud: 115_200, opener: p.opener(), identity: None })
+        };
+        let taps = StudyTaps::start(&captures, &ports, dir.path(), &s, &resolve).unwrap().unwrap();
+        assert!(ports.holds("FAKE-pd") && ports.holds("FAKE-dut"));
+        // Output the consoles print between steps, while nothing is exchanging.
+        pd.feed(b"pd: PPS timeout\r\npd: hard reset\r\n");
+        wait_for(|| captures.running("pd").unwrap().read(0, 0).total_bytes > 0);
+        let feeder = {
+            let dut = dut.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                dut.feed(b"dut: attach\ndut: contract 9V\n");
+            })
+        };
+        let mut b = ViaCapture { captures: captures.clone(), replies: vec![] };
+        let mut recs = vec![];
+        let end = execute(&s, &mut b, &AtomicBool::new(false), |r| recs.push(r));
+        feeder.join().unwrap();
+        assert!(end.completed, "{end:?}");
+        assert!(recs.iter().all(|r| matches!(r.result.outcome, Outcome::Pass)), "{recs:?}");
+        // Opened once each, though pd was exchanged on twice.
+        assert_eq!((pd.opens.load(Ordering::SeqCst), dut.opens.load(Ordering::SeqCst)), (1, 1));
+        let streams = taps.finish();
+        assert!(!ports.holds("FAKE-pd") && !ports.holds("FAKE-dut"), "ports are released");
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0]["state"], "stopped");
+
+        let raw = |n: &str| String::from_utf8(std::fs::read(dir.path().join("streams").join(n)).unwrap()).unwrap();
+        let pd_raw = raw("pd_console.txt");
+        let dut_raw = raw("dut_console.txt");
+        // What the console printed between steps is there, in order, before the first reply.
+        assert!(pd_raw.starts_with("pd: PPS timeout\r\npd: hard reset\r\n"), "{pd_raw:?}");
+        assert!(dut_raw.starts_with("dut: attach\ndut: contract 9V\n"), "{dut_raw:?}");
+        // Each exchange's reply is exactly the tap's bytes from its write to `until`.
+        let pd_replies: Vec<&String> = b.replies.iter().filter(|(s, _)| s == "pd").map(|(_, t)| t).collect();
+        assert_eq!(pd_replies.len(), 2);
+        let tail = pd_raw.strip_prefix("pd: PPS timeout\r\npd: hard reset\r\n").unwrap();
+        assert_eq!(tail, format!("{}{}", pd_replies[0], pd_replies[1]));
+        assert_eq!(&*pd.written.lock().unwrap(), b"pd status\npd max\n");
+        assert_eq!(&*dut.written.lock().unwrap(), b"pd role\n");
+        assert_eq!(streams[0]["bytes_written"], pd_raw.len());
+    }
+
+    #[test]
+    fn each_stored_line_has_a_receive_time_on_one_clock_across_taps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, c) = (Pair::default(), Pair::default());
+        let captures = crate::capture::CaptureRegistry::default();
+        let ports = crate::study::TapPorts::default();
+        let mut s = study(vec![wait("w", 5)], vec![]);
+        s.streams = vec![tap(0, "a", "a"), tap(1, "c", "c")];
+        let (a2, c2) = (a.clone(), c.clone());
+        let resolve = move |sig: &str| -> Result<TapTarget, TapError> {
+            let p = if sig == "a" { &a2 } else { &c2 };
+            Ok(TapTarget { port_name: format!("FAKE-{sig}"), baud: 115_200, opener: p.opener(), identity: None })
+        };
+        let taps = StudyTaps::start(&captures, &ports, dir.path(), &s, &resolve).unwrap().unwrap();
+        // One read holding two lines, then a line on the other console, then a split line.
+        a.feed(b"a1\na2\n");
+        wait_for(|| captures.running("a").unwrap().read(0, 0).total_bytes == 6);
+        std::thread::sleep(Duration::from_millis(80));
+        c.feed(b"c1\n");
+        wait_for(|| captures.running("c").unwrap().read(0, 0).total_bytes == 3);
+        std::thread::sleep(Duration::from_millis(80));
+        a.feed(b"a3 par");
+        wait_for(|| captures.running("a").unwrap().read(0, 0).total_bytes == 12);
+        a.feed(b"t\n");
+        wait_for(|| captures.running("a").unwrap().read(0, 0).total_bytes == 14);
+        let _ = taps.finish();
+        let rows = |n: &str| -> Vec<(u64, u64, u64)> {
+            std::fs::read_to_string(dir.path().join("streams").join(n))
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|l| {
+                    let v: Vec<u64> = l.split(',').map(|x| x.parse().unwrap()).collect();
+                    (v[0], v[1], v[2])
+                })
+                .collect()
+        };
+        let ar = rows("a.arrival.csv");
+        let cr = rows("c.arrival.csv");
+        // Lines are separate records: offsets 0, 3, 6 (the partial "a3 par"), 12 ("t\n").
+        assert_eq!(ar.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(0, 3), (3, 3), (6, 6), (12, 2)]);
+        assert_eq!(cr.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(0, 3)]);
+        // One clock: a's stamps never go backwards, and c1 (fed 80 ms after a1/a2, 80 ms before a3) sits between.
+        assert!(ar.windows(2).all(|w| w[0].1 <= w[1].1), "{ar:?}");
+        assert!(ar[1].1 <= cr[0].1 && cr[0].1 <= ar[2].1, "a {ar:?} c {cr:?}");
+        assert!(cr[0].1 - ar[1].1 >= 40 && ar[2].1 - cr[0].1 >= 40, "a {ar:?} c {cr:?}");
+        assert!(ar[0].1 > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn a_tap_on_a_port_something_else_holds_is_a_409_and_leaves_nothing_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, c) = (Pair::default(), Pair::default());
+        let captures = crate::capture::CaptureRegistry::default();
+        let ports = crate::study::TapPorts::default();
+        let _held = ports.claim("FAKE-c");
+        let mut s = study(vec![wait("w", 5)], vec![]);
+        s.streams = vec![tap(0, "a", "a"), tap(1, "c", "c")];
+        let (a2, c2) = (a.clone(), c.clone());
+        let resolve = move |sig: &str| -> Result<TapTarget, TapError> {
+            let p = if sig == "a" { &a2 } else { &c2 };
+            Ok(TapTarget { port_name: format!("FAKE-{sig}"), baud: 115_200, opener: p.opener(), identity: None })
+        };
+        let err = StudyTaps::start(&captures, &ports, dir.path(), &s, &resolve).err().unwrap();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("FAKE-c"), "{}", err.1);
+        // The first tap was stopped and released when the second refused.
+        assert!(!ports.holds("FAKE-a") && captures.running("a").is_none());
+        // A capture already running on the signal is refused the same way, naming it.
+        let cap = crate::capture::start_fake(&captures, "a", b"");
+        let err = StudyTaps::start(&captures, &ports, dir.path(), &s, &resolve).err().unwrap();
+        assert!(err.1.contains(&cap.id), "{}", err.1);
+        cap.stop();
+    }
+
+    #[test]
+    fn only_a_text_whole_study_tap_is_accepted_and_the_rest_are_refused_by_name() {
+        let mut s = study(vec![ex("a", "x", "pd: ")], vec![]);
+        s.streams = vec![tap(0, "pd console", "pd")];
+        assert!(check_study(&s).is_ok());
+        s.streams[0].encoding = embarch_study_designer::StreamEncoding::Raw;
+        assert!(check_study(&s).unwrap_err().contains("streams[0] 'pd console'"));
+        s.streams[0].encoding = embarch_study_designer::StreamEncoding::Text;
+        s.streams[0].scope = embarch_study_designer::StreamScope::Steps { from: 0, to: 0 };
+        assert!(check_study(&s).unwrap_err().contains("WholeStudy"));
     }
 }

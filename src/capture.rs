@@ -62,6 +62,11 @@ impl CapturePort for Box<dyn serialport::SerialPort> {
 /// re-enumerated device is found under its new name.
 pub type Opener = Arc<dyn Fn() -> Result<Box<dyn CapturePort>> + Send + Sync>;
 
+/// Called on the capture's thread with every run of bytes it just read (an exchange's reply
+/// included), in order, once the capture's own buffer holds them. A host study's tap persists
+/// through it (decision 98); the markers a capture inserts for a lost port are not passed.
+pub type Sink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -149,6 +154,7 @@ pub struct Capture {
     inner: Mutex<Inner>,
     stop: AtomicBool,
     jobs: Mutex<Sender<Job>>,
+    sink: Option<Sink>,
 }
 
 /// What `GET` and `DELETE` answer.
@@ -283,11 +289,18 @@ impl Write for Tee<'_> {
 
 /// Appends up to the byte cap. Returns whether the cap is now reached.
 fn append(cap: &Capture, bytes: &[u8]) -> bool {
-    let mut inner = cap.inner.lock().unwrap();
-    let room = cap.max_bytes.saturating_sub(inner.buf.len());
-    let now = cap.elapsed_ms();
-    inner.push(&bytes[..bytes.len().min(room)], now);
-    inner.buf.len() >= cap.max_bytes
+    let (full, taken) = {
+        let mut inner = cap.inner.lock().unwrap();
+        let room = cap.max_bytes.saturating_sub(inner.buf.len());
+        let now = cap.elapsed_ms();
+        let taken = bytes.len().min(room);
+        inner.push(&bytes[..taken], now);
+        (inner.buf.len() >= cap.max_bytes, taken)
+    };
+    if let (Some(sink), true) = (&cap.sink, taken > 0) {
+        sink(&bytes[..taken]);
+    }
+    full
 }
 
 fn finish(cap: &Capture, state: State) {
@@ -433,6 +446,23 @@ impl CaptureRegistry {
         opener: Opener,
         claim: Box<dyn Send>,
     ) -> Result<Arc<Capture>, StartError> {
+        self.start_with_sink(signal, port_name, baud, max_s, max_bytes, identity, opener, claim, None)
+    }
+
+    /// [`start`](Self::start) with a [`Sink`] that sees every byte the capture reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_sink(
+        &self,
+        signal: &str,
+        port_name: &str,
+        baud: u32,
+        max_s: u64,
+        max_bytes: usize,
+        identity: Option<PortIdentity>,
+        opener: Opener,
+        claim: Box<dyn Send>,
+        sink: Option<Sink>,
+    ) -> Result<Arc<Capture>, StartError> {
         let mut map = self.0.lock().unwrap();
         if let Some(c) = map.get(signal) {
             if c.state().running() {
@@ -461,6 +491,7 @@ impl CaptureRegistry {
             inner: Mutex::new(Inner { buf: Vec::new(), gaps: Vec::new(), lines: Vec::new(), at_line_start: true, state: State::Running }),
             stop: AtomicBool::new(false),
             jobs: Mutex::new(tx),
+            sink,
         });
         let c = Arc::clone(&cap);
         std::thread::Builder::new()
