@@ -423,6 +423,12 @@ fn validate_study(study: &Study) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // `embarch-study-designer` decision 83: a Notify/Indicate step with a wait
+    // budget of 0 is read by dev-bench as a deadline already past, so it would
+    // report `TimedOut` at once. `build_study` cannot emit one; a hand-written
+    // or saved study can. Computed by the crate, not restated (core decision 90).
+    study.validate_wait_budgets().map_err(|e| e.to_string())?;
+
     let recomputed = steps_crc(&study.steps)
         .map_err(|_| "failed to recompute steps_crc (a step's encoding is unexpectedly large)".to_string())?;
     if recomputed != study.steps_crc {
@@ -4906,6 +4912,31 @@ mod tests {
     fn validate_study_accepts_a_well_formed_study() {
         let study = study_with_steps(&[1_000, 2_000]);
         assert!(validate_study(&study).is_ok());
+    }
+
+    /// study-designer decision 83 / core decision 90: a zero Notify/Indicate
+    /// budget is refused by step and operation; a nonzero one passes.
+    #[test]
+    fn validate_study_rejects_a_zero_wait_budget() {
+        use embarch_study_designer::{GattOperation, Uuid};
+        for (zero, nonzero, kind) in [
+            (GattOperation::Notify { timeout_ms: 0 }, GattOperation::Notify { timeout_ms: 500 }, "Notify"),
+            (GattOperation::Indicate { timeout_ms: 0 }, GattOperation::Indicate { timeout_ms: 500 }, "Indicate"),
+        ] {
+            let with_op = |operation: GattOperation| {
+                let mut study = study_with_steps(&[1_000, 1_000]);
+                study.steps[1].action = Action::DataExchange {
+                    service_uuid: Uuid([0u8; 16]),
+                    characteristic_uuid: Uuid([1u8; 16]),
+                    operation,
+                };
+                study.steps_crc = steps_crc(&study.steps).unwrap();
+                study
+            };
+            let err = validate_study(&with_op(zero)).unwrap_err();
+            assert!(err.contains(kind) && err.contains('1'), "{err}");
+            assert!(validate_study(&with_op(nonzero)).is_ok());
+        }
     }
 
     #[test]
