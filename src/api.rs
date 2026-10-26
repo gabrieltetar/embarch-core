@@ -229,6 +229,11 @@ pub(crate) fn internal_err<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
 /// full message. It is still never `"mismatch"`'s `topology mismatch`
 /// wording: that lead is reserved for a live ID actually read and disagreed.
 pub(crate) fn describe_topology_error(e: anyhow::Error) -> (StatusCode, String) {
+    // The probe is enrolled for another chip family (decision 89): a caller-visible `409`
+    // carrying topology's own text, never the identity-gate wording.
+    if let Some(m) = e.downcast_ref::<embarch_topology::hardware::RequestedChipMismatch>() {
+        return (StatusCode::CONFLICT, m.to_string());
+    }
     match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
         Some(m) if m.live_hardware_id.is_none() => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2849,6 +2854,32 @@ mod tests {
         let (status, msg) = describe_topology_error(mismatch);
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(msg.starts_with("topology mismatch for role"), "got: {msg}");
+    }
+
+    fn enrolled(chip: &str) -> embarch_topology::hardware::EnrolledBoard {
+        toml::from_str(&format!(
+            "probe_serial = \"000001\"\nrole = \"dut\"\nname = \"nrf54l15dk\"\nchip = \"{chip}\"\n"
+        ))
+        .expect("an enrollment row with only the required fields parses")
+    }
+
+    /// `core/111`: a probe enrolled for chip A and asked for chip B is a `409` carrying topology's
+    /// own text, through the same `.context(..)` wrapper `hardware::flash`/`reset` add, and is
+    /// neither the `probe unavailable` nor the `topology mismatch` lead. An equal chip passes.
+    #[test]
+    fn a_requested_chip_that_differs_from_the_enrolled_one_is_its_own_refusal() {
+        use anyhow::Context;
+        let known = enrolled("nRF54L15_M33");
+        assert!(embarch_topology::hardware::check_requested_chip(&known, " nrf54l15_m33 ").is_ok());
+        let m = embarch_topology::hardware::check_requested_chip(&known, "STM32G0B1VE").unwrap_err();
+        let text = m.to_string();
+        let wrapped: anyhow::Result<()> =
+            Err(anyhow::Error::new(m)).context("board-identity gate refused this flash");
+        let (status, msg) = describe_topology_error(wrapped.unwrap_err());
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(msg, text);
+        assert!(msg.starts_with("chip-mismatch:"), "got: {msg}");
+        assert!(msg.contains("Nothing was attached"), "got: {msg}");
     }
 
     /// `core/077`: a probe found but stuck partway through opening it

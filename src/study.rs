@@ -1149,6 +1149,9 @@ async fn enforce_dev_bench_gate(
 /// `reason`'s own text; the lead stays neutral and lets `reason` carry the
 /// distinction, as it always has.
 fn describe_gate_error(e: anyhow::Error) -> String {
+    if let Some(m) = e.downcast_ref::<embarch_topology::hardware::RequestedChipMismatch>() {
+        return m.to_string();
+    }
     match e.downcast_ref::<embarch_topology::hardware::TopologyMismatch>() {
         Some(m) if m.live_hardware_id.is_none() => format!(
             "probe unavailable for role '{}' (probe {}, chip '{}'): {}",

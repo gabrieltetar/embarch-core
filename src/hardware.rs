@@ -177,7 +177,7 @@ pub fn flash(
     erase: bool,
 ) -> Result<Vec<Range<u64>>> {
     let gated_serial = resolved_serial(probe_serial, "flash")?;
-    embarch_topology::hardware::validate_serial(&gated_serial)
+    embarch_topology::hardware::validate_serial_for_chip(&gated_serial, chip)
         .context("board-identity gate refused this flash")?;
 
     // **Which program writes the image is decided before anything is opened**
@@ -388,7 +388,7 @@ pub(crate) fn plan_erase(regions: &[NvmRegion], algos: &[AlgoInfo], chip: &str) 
 /// `target_reset()` alone silently never did.
 pub fn reset(chip: &str, probe_serial: Option<&str>) -> Result<()> {
     let gated_serial = resolved_serial(probe_serial, "reset")?;
-    embarch_topology::hardware::validate_serial(&gated_serial)
+    embarch_topology::hardware::validate_serial_for_chip(&gated_serial, chip)
         .context("board-identity gate refused this reset")?;
     let mut probe = open_probe(probe_serial, "reset")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't reset")?;

@@ -90,7 +90,7 @@ pub fn check(req: &MemReadRequest) -> Result<(), String> {
 
 /// The read itself, behind the same board-identity gate as `/flash` and `/reset`.
 pub fn run(chip: &str, probe_serial: &str, role: &str, req: &MemReadRequest) -> Result<MemReadResponse> {
-    embarch_topology::hardware::validate_serial(probe_serial)
+    embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip)
         .context("board-identity gate refused this read")?;
     let mut probe = crate::hardware::open_probe(Some(probe_serial), "mem-read")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't read")?;
@@ -138,7 +138,7 @@ pub fn run(chip: &str, probe_serial: &str, role: &str, req: &MemReadRequest) -> 
 /// A PPB read through the guarded attach: it never halts and needs no DMA clock (decision 85).
 pub fn read_dhcsr(chip: &str, probe_serial: &str) -> Result<u32> {
     const DHCSR: u64 = 0xE000_EDF0;
-    embarch_topology::hardware::validate_serial(probe_serial).context("board-identity gate refused this read")?;
+    embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip).context("board-identity gate refused this read")?;
     let mut probe = crate::hardware::open_probe(Some(probe_serial), "exchange")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't read")?;
     let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
