@@ -1,5 +1,6 @@
 mod api;
 mod bootload;
+mod capture;
 mod chip_resolve;
 mod dev_bench_link;
 mod dev_bench_log;

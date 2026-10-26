@@ -53,6 +53,8 @@ pub struct AppState {
     /// Serial ports a study's direct-route taps hold open, so
     /// `POST /bootload` can refuse one by name (decision 77).
     pub tap_ports: study::TapPorts,
+    /// Background captures by signal name (`capture.rs`, decision 92).
+    pub captures: crate::capture::CaptureRegistry,
 }
 
 impl AppState {
@@ -64,6 +66,7 @@ impl AppState {
             token,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
+            captures: crate::capture::CaptureRegistry::default(),
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock: Arc::new(StdMutex::new(None)),
@@ -156,6 +159,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/signals", post(declare_signal_handler).get(list_signals_handler))
         .route("/signals/{name}", delete(remove_signal_handler))
         .route("/signals/{name}/exchange", post(signal_exchange_handler))
+        .route(
+            "/signals/{name}/capture",
+            post(start_capture_handler).get(read_capture_handler).delete(stop_capture_handler),
+        )
         .route("/live/mem-read", post(live_mem_read_handler))
         .route("/serial-ports", get(serial_ports_handler))
         .route("/validate", post(validate_handler))
@@ -1361,6 +1368,7 @@ async fn signal_exchange_handler(
 ) -> Result<Json<crate::exchange::ExchangeResponse>, (StatusCode, String)> {
     crate::exchange::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let _guard = acquire_hw_lock(&state, "POST /signals/{name}/exchange").await?;
+    let captures = state.captures.clone();
 
     tokio::task::spawn_blocking(move || {
         let link = embarch_topology::hardware::find_signal(&name)
@@ -1381,6 +1389,22 @@ async fn signal_exchange_handler(
             ));
         }
         let role = link.origin_role.clone();
+        // A capture owns the port: the exchange goes through its open handle (decision 92).
+        if let Some(cap) = captures.running(&name) {
+            let role = role.clone();
+            return cap
+                .exchange(req, move || {
+                    crate::exchange::core_state_for(
+                        &role,
+                        |r| {
+                            Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
+                                .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
+                        },
+                        crate::live::read_dhcsr,
+                    )
+                })
+                .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")));
+        }
         let core_state = || {
             crate::exchange::core_state_for(
                 &role,
@@ -1408,6 +1432,150 @@ async fn signal_exchange_handler(
     .await
     .map_err(internal_err)?
     .map(Json)
+}
+
+// ---- /signals/{name}/capture ------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StartCaptureRequest {
+    #[serde(default = "default_capture_s")]
+    max_s: u64,
+    #[serde(default = "default_capture_bytes")]
+    max_bytes: usize,
+}
+
+fn default_capture_s() -> u64 {
+    crate::capture::DEFAULT_S
+}
+
+fn default_capture_bytes() -> usize {
+    crate::capture::DEFAULT_BYTES
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadCaptureQuery {
+    #[serde(default)]
+    after: u64,
+    limit: Option<usize>,
+    /// A capture id from `POST`; a different (older) capture is a `404`.
+    id: Option<String>,
+}
+
+/// The capture on `name`, or the `404` that says there is none (or that `id` names an older one).
+fn capture_for(
+    state: &AppState,
+    name: &str,
+    id: Option<&str>,
+) -> Result<Arc<crate::capture::Capture>, (StatusCode, String)> {
+    let cap = state
+        .captures
+        .get(name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no capture on signal '{name}'")))?;
+    match id {
+        Some(id) if id != cap.id => {
+            Err((StatusCode::NOT_FOUND, format!("capture {id} on signal '{name}' is gone; the current one is {}", cap.id)))
+        }
+        _ => Ok(cap),
+    }
+}
+
+fn read_limit(q: &ReadCaptureQuery) -> usize {
+    q.limit.unwrap_or(crate::capture::DEFAULT_READ).min(crate::capture::MAX_READ)
+}
+
+/// Starts a background capture of a declared signal's port (decision 92). Takes **no**
+/// `hw_lock`: the capture owns only its port, so flash, reset and exchanges on other signals
+/// run while it records. `400` outside the caps; `404` nothing declared; `409` a capture is
+/// already running (it is named), the route is not `direct`, the port is not enumerable, or a
+/// study tap holds it.
+// route: POST /signals/{name}/capture
+async fn start_capture_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<StartCaptureRequest>,
+) -> Result<Json<crate::capture::CaptureRead>, (StatusCode, String)> {
+    crate::capture::check(req.max_s, req.max_bytes).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let captures = state.captures.clone();
+    let taps = state.tap_ports.clone();
+    tokio::task::spawn_blocking(move || {
+        let link = embarch_topology::hardware::find_signal(&name)
+            .map_err(internal_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
+        if matches!(link.route, embarch_topology::hardware::Route::ViaDevBench { .. }) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("signal '{name}' is a via-dev-bench route; Core captures only a direct one"),
+            ));
+        }
+        if let Some(c) = captures.running(&name) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("signal '{name}' already has capture {} running; DELETE it first", c.id),
+            ));
+        }
+        let port = embarch_topology::hardware::resolve_signal_port(&name)
+            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        if taps.holds(&port.port_name) {
+            return Err((StatusCode::CONFLICT, format!("{} is held by a running study's tap", port.port_name)));
+        }
+        let baud = crate::stream_store::signal_baud_for(&link);
+        let opener: crate::capture::Opener = {
+            let name = name.clone();
+            Arc::new(move || {
+                let p = embarch_topology::hardware::resolve_signal_port(&name)?;
+                let mut sp = serialport::new(p.port_name.as_str(), baud)
+                    .timeout(crate::exchange::READ_POLL)
+                    .open()?;
+                let _ = sp.write_data_terminal_ready(true);
+                Ok(Box::new(sp) as Box<dyn crate::capture::CapturePort>)
+            })
+        };
+        let claim = taps.claim(&port.port_name);
+        let identity = Some(crate::exchange::PortIdentity::of(&port));
+        let cap = captures
+            .start(&name, &port.port_name, baud, req.max_s, req.max_bytes, identity, opener, Box::new(claim))
+            .map_err(|e| match e {
+                crate::capture::StartError::Conflict(m) => (StatusCode::CONFLICT, m),
+                crate::capture::StartError::Open(m) => (StatusCode::CONFLICT, m),
+            })?;
+        Ok(cap.read(0, 0))
+    })
+    .await
+    .map_err(internal_err)?
+    .map(Json)
+}
+
+/// What a capture holds from byte `after` (default 0), at most `limit`. No hardware touched.
+/// `404` when there is no capture on the signal, or `id` names an older one.
+// route: GET /signals/{name}/capture
+async fn read_capture_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(q): Query<ReadCaptureQuery>,
+) -> Result<Json<crate::capture::CaptureRead>, (StatusCode, String)> {
+    let cap = capture_for(&state, &name, q.id.as_deref())?;
+    Ok(Json(cap.read(q.after, read_limit(&q))))
+}
+
+/// Stops the capture, waits briefly for its thread to end, and answers with what it holds from
+/// `after`; the record is then dropped, so the next `GET` is a `404`. A capture that already
+/// ended on its own (`max_s`, `max_bytes`) is just read and dropped.
+// route: DELETE /signals/{name}/capture
+async fn stop_capture_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(q): Query<ReadCaptureQuery>,
+) -> Result<Json<crate::capture::CaptureRead>, (StatusCode, String)> {
+    let cap = capture_for(&state, &name, q.id.as_deref())?;
+    cap.stop();
+    for _ in 0..100 {
+        if !cap.state().running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    state.captures.remove(&name);
+    Ok(Json(cap.read(q.after, read_limit(&q))))
 }
 
 // ---- POST /live/mem-read --------------------------------------------------
@@ -2101,6 +2269,59 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("zephyr.signed.bin"), "{text}");
+    }
+
+    async fn capture_call(state: &AppState, method: &str, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let request = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", "Bearer t")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Out-of-cap requests are refused before a signal is even looked up, and a capture's
+    /// reads and stop never wait on `hw_lock` (decision 92).
+    #[tokio::test]
+    async fn capture_routes_refuse_bad_caps_and_never_take_hw_lock() {
+        let state = AppState::new("t".to_string());
+        let _held = state.hw_lock.clone().try_lock_owned().unwrap();
+        for body in [r#"{"max_s":0}"#, r#"{"max_s":601}"#, r#"{"max_bytes":0}"#, r#"{"max_bytes":16777217}"#] {
+            let (st, _) = capture_call(&state, "POST", "/signals/dut/capture", body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(capture_call(&state, "GET", "/signals/dut/capture", "").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(capture_call(&state, "DELETE", "/signals/dut/capture", "").await.0, StatusCode::NOT_FOUND);
+
+        let cap = crate::capture::start_fake(&state.captures, "dut", b"boot ok\n");
+        let uri = format!("/signals/dut/capture?id={}", cap.id);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let (st, body) = capture_call(&state, "GET", &uri, "").await;
+            assert_eq!(st, StatusCode::OK);
+            if body["total_bytes"] == 8 {
+                break body;
+            }
+            assert!(std::time::Instant::now() < end);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(body["text"], "boot ok\n");
+        assert_eq!(body["running"], true);
+        // An id from an older capture is a 404 naming the current one.
+        let (st, _) = capture_call(&state, "GET", "/signals/dut/capture?id=cap-0", "").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        let (st, body) = capture_call(&state, "DELETE", "/signals/dut/capture?after=5", "").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["state"], "stopped");
+        assert_eq!(body["text"], "ok\n");
+        assert_eq!(capture_call(&state, "GET", "/signals/dut/capture", "").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 pub const MAX_TIMEOUT_MS: u64 = crate::serial::MAX_DURATION_MS;
 
 /// The read poll: the port's per-call timeout while reading.
-const READ_POLL: Duration = Duration::from_millis(50);
+pub(crate) const READ_POLL: Duration = Duration::from_millis(50);
 
 /// `timeout_ms` when the caller gives none: long enough for a shell command
 /// on a slow console, short enough to keep `hw_lock` free.
@@ -329,7 +329,7 @@ fn write_with_deadline<P: Write>(
 /// [`exchange`] with `set_timeout` called with the port's per-call timeout: what remains of
 /// the write deadline before each write, then the short read poll. One `timeout` covers the
 /// write and the read together, so an exchange ends within `timeout` plus one read poll.
-fn exchange_with<P: Read + Write>(
+pub(crate) fn exchange_with<P: Read + Write>(
     port: &mut P,
     write: &[u8],
     until: Option<&str>,
@@ -441,22 +441,37 @@ pub fn run(
             let _ = p.set_timeout(d);
         },
     )?;
+    Ok(response(signal, port_name, baud, started.elapsed().as_millis() as u64, got, || Some(PortIdentity::of(port)), core_state))
+}
+
+/// Builds the answer to an exchange, shared by [`run`] (its own port) and a capture's
+/// (the capture's open port, `capture.rs`). `identity` and `core_state` run only when nothing
+/// came back (decision 85).
+pub(crate) fn response(
+    signal: &str,
+    port_name: &str,
+    baud: u32,
+    elapsed_ms: u64,
+    got: Exchanged,
+    identity: impl FnOnce() -> Option<PortIdentity>,
+    core_state: impl FnOnce() -> CoreState,
+) -> ExchangeResponse {
     let silent = got.bytes.is_empty();
-    Ok(ExchangeResponse {
+    ExchangeResponse {
         signal: signal.to_string(),
         port: port_name.to_string(),
         baud,
         text: String::from_utf8_lossy(&got.bytes).into_owned(),
         until_seen: got.until_seen,
         truncated: got.truncated,
-        elapsed_ms: started.elapsed().as_millis() as u64,
+        elapsed_ms,
         bytes_read: got.bytes.len(),
         echo_seen: got.echo_seen,
         written: true,
         port_lost: got.port_lost,
-        port_identity: silent.then(|| PortIdentity::of(port)),
+        port_identity: if silent { identity() } else { None },
         core_state: silent.then(core_state),
-    })
+    }
 }
 
 #[cfg(test)]
