@@ -135,7 +135,7 @@ pub fn run(chip: &str, probe_serial: &str, role: &str, req: &MemReadRequest) -> 
 
 /// `DHCSR`, the core's debug status register, read twice a few milliseconds apart so
 /// `S_RETIRE_ST` (clear on read) in the second read says whether instructions are retiring.
-/// A PPB read through the guarded attach: it never halts and needs no DMA clock (decision 98).
+/// A PPB read through the guarded attach: it never halts and needs no DMA clock (decision 85).
 pub fn read_dhcsr(chip: &str, probe_serial: &str) -> Result<u32> {
     const DHCSR: u64 = 0xE000_EDF0;
     embarch_topology::hardware::validate_serial(probe_serial).context("board-identity gate refused this read")?;

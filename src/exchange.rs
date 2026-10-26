@@ -46,7 +46,7 @@ pub const MAX_READ_BYTES: usize = 256 * 1024;
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
 
 /// After `until` matches mid-line, how long the port must be quiet before the read ends there
-/// (decision 98): a prompt has nothing after it and returns at once; a verdict word follows a
+/// (decision 85): a prompt has nothing after it and returns at once; a verdict word follows a
 /// marker such as `pd: ` within one UART frame burst.
 pub const QUIET_GAP: Duration = Duration::from_millis(40);
 
@@ -101,7 +101,7 @@ pub struct ExchangeResponse {
     /// The read hit [`MAX_READ_BYTES`] before `until` or the deadline.
     pub truncated: bool,
     pub elapsed_ms: u64,
-    /// How many bytes came back after the write (decision 98). `0` is a console that said nothing.
+    /// How many bytes came back after the write (decision 85). `0` is a console that said nothing.
     pub bytes_read: usize,
     /// The echo of the written line (without its line ending) was seen in the reply: the
     /// console's shell is alive and reading. `false` with a non-empty reply is a console that
@@ -114,11 +114,11 @@ pub struct ExchangeResponse {
     /// `text` holds what was read before the loss; the command did run.
     pub port_lost: bool,
     /// The port's USB identity, added when nothing came back at all, so a USB-UART bridge is
-    /// told from the DUT's own USB device (decision 98).
+    /// told from the DUT's own USB device (decision 85).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_identity: Option<PortIdentity>,
     /// The DUT core's run state from `DHCSR`, added when nothing came back and the signal's
-    /// role has an enrolled probe. Never halts the core (decision 98).
+    /// role has an enrolled probe. Never halts the core (decision 85).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core_state: Option<CoreState>,
 }
@@ -143,7 +143,7 @@ impl PortIdentity {
     }
 }
 
-/// The DUT core as `DHCSR` shows it (decision 98), or why that could not be read.
+/// The DUT core as `DHCSR` shows it (decision 85), or why that could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CoreState {
     /// The raw register, when it was read.
@@ -190,7 +190,7 @@ impl CoreState {
 
 /// The run state of the core behind `role`: looks up the role's probe with `lookup`, then
 /// reads `DHCSR` with `read`. Two seams so the no-probe and probe-absent branches are
-/// testable with no probe (decision 98).
+/// testable with no probe (decision 85).
 pub fn core_state_for(
     role: &str,
     lookup: impl FnOnce(&str) -> Result<Option<(String, String)>>,
@@ -385,7 +385,7 @@ fn exchange_with<P: Read + Write>(
             Err(_) => return done(got.clone(), matched_end.is_some(), false, true),
         }
         // A marker found mid-line ends the read at the end of that line, or once the port
-        // has been quiet for QUIET_GAP, whichever is first (decision 98).
+        // has been quiet for QUIET_GAP, whichever is first (decision 85).
         if let Some(end) = matched_end {
             if got[end..].iter().any(|&b| b == b'\n' || b == b'\r') || last_data.elapsed() >= QUIET_GAP {
                 return done(got, true, false, false);
@@ -408,7 +408,7 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// Opens `port`, asserts DTR (a Zephyr CDC ACM shell may wait for it before it prints),
 /// optionally drops pending input, and runs one exchange. `core_state` is called only when
-/// nothing came back, to add the DUT core's run state (decision 98).
+/// nothing came back, to add the DUT core's run state (decision 85).
 pub fn run(
     signal: &str,
     port: &embarch_topology::hardware::DetectedPort,
@@ -634,7 +634,7 @@ mod tests {
         assert!(got.until_seen);
         assert!(String::from_utf8_lossy(&got.bytes).contains("Uptime: 17774 ms"));
         // Without the echo rule the early prompt is the match; the read then runs on to the end of
-        // that line (decision 98), so it still ends at the prompt's line, not at the real one.
+        // that line (decision 85), so it still ends at the prompt's line, not at the real one.
         let mut q = Fake::new(vec![Ok(b"uart:~$ ".to_vec()), Ok(b"kernel uptime\r\nUptime: 1 ms\r\n".to_vec())]);
         let early = exchange(&mut q, b"kernel uptime\n", Some("uart:~$ "), false, Duration::from_secs(5), 1024).unwrap();
         assert!(early.until_seen && !String::from_utf8_lossy(&early.bytes).contains("Uptime: 1 ms\r\nuart"));

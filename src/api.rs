@@ -1364,7 +1364,7 @@ async fn signal_exchange_handler(
             Ok(p) => p,
             Err(e) => {
                 let mut msg = format!("{e:#}");
-                // A port wait that ran out: say what the core was doing meanwhile (decision 98).
+                // A port wait that ran out: say what the core was doing meanwhile (decision 85).
                 if req.port_wait_ms > 0 {
                     msg.push_str(&format!("; core state: {}", serde_json::to_string(&core_state()).unwrap_or_default()));
                 }
