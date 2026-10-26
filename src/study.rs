@@ -25,7 +25,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use embarch_study_designer::{
     limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
     dev_bench_log_tap, protocols_crc, requirement_satisfied, samples_in, steps_crc, streams_crc,
-    validate_protocol, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Outcome, Provenance,
+    csv_cell_ok, validate_protocol, validate_record_checks, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Outcome, Provenance,
     Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
     VersionOverride, VersionSource, VersionSubject,
@@ -395,6 +395,11 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // of the rules to drift from.
     validate_taps(&study.streams, study.steps.len() as u32, study.decoders.len())
         .map_err(|e| e.to_string())?;
+
+    // `embarch-study-designer` decision 81: an empty record magic matches
+    // everywhere, so it is refused here rather than "verified" at capture
+    // close. Computed by the crate, not restated.
+    validate_record_checks(&study.record_checks).map_err(|e| e.to_string())?;
 
     // `embarch-study-designer` decision 40: both requirements
     // are mandatory and `"any"` is an explicit legal value, so a *blank* one
@@ -2287,7 +2292,8 @@ fn verify_declared_records(
                 total = report.total,
                 verified = report.verified,
                 leading_bytes = report.leading_bytes,
-                "this capture has records that do not verify; see `records` on its StreamRef"
+                "this capture has no records found, or has records that do not verify; \
+                 see `records` on its StreamRef"
             );
         }
         target.records = Some(report);
@@ -2936,10 +2942,10 @@ fn write_struct_rows(
         .get(step_index as usize)
         .map(|s| s.name.as_str())
         .unwrap_or("");
-    // A step name carrying a comma or a quote would break the column; the
-    // crate refuses one rather than quoting (`csv_escape_ok`), and the same
+    // A step name carrying a comma, quote, CR or LF would break the column;
+    // the crate refuses one rather than quoting (`csv_cell_ok`), and the same
     // rule applies here so both rendered files agree on what a legal name is.
-    let step_name = if step_name.contains([',', '"']) { "" } else { step_name };
+    let step_name = if csv_cell_ok(step_name) { step_name } else { "" };
     // `rx_utc_ms` is the capturing node's own stamp, the same convention
     // every other rendered row here uses; `core_rx_utc_ms` is appended last,
     // once, below.
@@ -4880,6 +4886,24 @@ mod tests {
         study.steps_crc = study.steps_crc.wrapping_add(1);
         let err = validate_study(&study).unwrap_err();
         assert!(err.contains("steps_crc mismatch"), "{err}");
+    }
+
+    /// study-designer decision 81: an empty record magic matches everywhere,
+    /// so `POST /study` refuses it with the crate's own text.
+    #[test]
+    fn validate_study_rejects_an_empty_record_magic() {
+        let mut study = study_with_steps(&[1_000]);
+        study.record_checks.push(embarch_study_designer::RecordCheck {
+            stream_id: 0,
+            framing: embarch_study_designer::RecordFraming::MagicPrefixedCrc32Le {
+                magic: Default::default(),
+            },
+        }).unwrap();
+        let err = validate_study(&study).unwrap_err();
+        let want = embarch_study_designer::validate_record_checks(&study.record_checks)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&want), "{err}");
     }
 
     /// A declared outpost mode is read from an outpost capture's header
