@@ -247,6 +247,8 @@ pub const LEASE_GATED: &[(&str, &str)] = &[
     ("POST", "/live/mem-read"),
     ("POST", "/validate"),
     ("POST", "/study"),
+    ("POST", "/host-studies"),
+    ("POST", "/study/{study_id}/cancel"),
 ];
 
 /// Routes a lease never gates: reads that touch no board, the lease's own

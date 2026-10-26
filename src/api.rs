@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, chip_resolve, hardware, lease, logs, serial, study};
+use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -53,6 +53,8 @@ pub struct AppState {
     /// Serial ports a study's direct-route taps hold open, so
     /// `POST /bootload` can refuse one by name (decision 77).
     pub tap_ports: study::TapPorts,
+    /// The cancel flag of the host study in flight (`host_study.rs`, decision 95).
+    pub host_cancel: crate::host_study::HostCancel,
     /// Background captures by signal name (`capture.rs`, decision 92).
     pub captures: crate::capture::CaptureRegistry,
     /// The bench lease (`lease.rs`, decision 93).
@@ -70,6 +72,7 @@ impl AppState {
             token,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
+            host_cancel: Arc::new(StdMutex::new(None)),
             captures: crate::capture::CaptureRegistry::default(),
             lease: lease::LeaseSlot::default(),
             images: lease::ImageLog::default(),
@@ -174,6 +177,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs/recent", get(logs_recent_handler))
         .route("/studies", get(study::studies_handler))
         .route("/study", post(study::post_study_handler))
+        .route("/host-studies", post(host_study::post_host_study_handler))
+        .route("/study/{study_id}/cancel", post(host_study::cancel_study_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
@@ -1507,68 +1512,78 @@ async fn signal_exchange_handler(
     let _guard = acquire_hw_lock(&state, "POST /signals/{name}/exchange").await?;
     let captures = state.captures.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let link = embarch_topology::hardware::find_signal(&name)
-            .map_err(internal_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
-        if !link.host_can_write() {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "signal '{name}' is declared {:?} on a {} route; Core writes only a direct \
-                     host-to-dut or bidirectional signal (embarch-topology decision 37)",
-                    link.direction,
-                    match link.route {
-                        embarch_topology::hardware::Route::Direct { .. } => "direct",
-                        embarch_topology::hardware::Route::ViaDevBench { .. } => "via-dev-bench",
-                    }
-                ),
-            ));
-        }
-        let role = link.origin_role.clone();
-        // A capture owns the port: the exchange goes through its open handle (decision 92).
-        if let Some(cap) = captures.running(&name) {
-            let role = role.clone();
-            return cap
-                .exchange(req, move || {
-                    crate::exchange::core_state_for(
-                        &role,
-                        |r| {
-                            Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
-                                .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
-                        },
-                        crate::live::read_dhcsr,
-                    )
-                })
-                .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")));
-        }
-        let core_state = || {
-            crate::exchange::core_state_for(
-                &role,
-                |r| {
-                    Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
-                        .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
-                },
-                crate::live::read_dhcsr,
-            )
-        };
-        let port = match crate::exchange::resolve_port_waiting(&name, req.port_wait_ms) {
-            Ok(p) => p,
-            Err(e) => {
-                let mut msg = format!("{e:#}");
-                // A port wait that ran out: say what the core was doing meanwhile (decision 85).
-                if req.port_wait_ms > 0 {
-                    msg.push_str(&format!("; core state: {}", serde_json::to_string(&core_state()).unwrap_or_default()));
+    tokio::task::spawn_blocking(move || run_signal_exchange(&captures, &name, req))
+        .await
+        .map_err(internal_err)?
+        .map(Json)
+}
+
+/// The exchange route's whole blocking body, with `hw_lock` already held by the caller: the
+/// signal lookup, the writable check, a running capture's open handle or a fresh port, and the
+/// exchange itself. `POST /host-studies` runs every `Exchange` step through this same function
+/// (decision 95), so a step and the route cannot disagree about what a signal accepts.
+pub(crate) fn run_signal_exchange(
+    captures: &crate::capture::CaptureRegistry,
+    name: &str,
+    req: crate::exchange::ExchangeRequest,
+) -> Result<crate::exchange::ExchangeResponse, (StatusCode, String)> {
+    let link = embarch_topology::hardware::find_signal(name)
+        .map_err(internal_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
+    if !link.host_can_write() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "signal '{name}' is declared {:?} on a {} route; Core writes only a direct \
+                 host-to-dut or bidirectional signal (embarch-topology decision 37)",
+                link.direction,
+                match link.route {
+                    embarch_topology::hardware::Route::Direct { .. } => "direct",
+                    embarch_topology::hardware::Route::ViaDevBench { .. } => "via-dev-bench",
                 }
-                return Err((StatusCode::CONFLICT, msg));
+            ),
+        ));
+    }
+    let role = link.origin_role.clone();
+    // A capture owns the port: the exchange goes through its open handle (decision 92).
+    if let Some(cap) = captures.running(name) {
+        let role = role.clone();
+        return cap
+            .exchange(req, move || {
+                crate::exchange::core_state_for(
+                    &role,
+                    |r| {
+                        Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
+                            .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
+                    },
+                    crate::live::read_dhcsr,
+                )
+            })
+            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")));
+    }
+    let core_state = || {
+        crate::exchange::core_state_for(
+            &role,
+            |r| {
+                Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
+                    .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
+            },
+            crate::live::read_dhcsr,
+        )
+    };
+    let port = match crate::exchange::resolve_port_waiting(name, req.port_wait_ms) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut msg = format!("{e:#}");
+            // A port wait that ran out: say what the core was doing meanwhile (decision 85).
+            if req.port_wait_ms > 0 {
+                msg.push_str(&format!("; core state: {}", serde_json::to_string(&core_state()).unwrap_or_default()));
             }
-        };
-        let baud = crate::stream_store::signal_baud_for(&link);
-        crate::exchange::run(&name, &port, baud, &req, core_state).map_err(internal_err)
-    })
-    .await
-    .map_err(internal_err)?
-    .map(Json)
+            return Err((StatusCode::CONFLICT, msg));
+        }
+    };
+    let baud = crate::stream_store::signal_baud_for(&link);
+    crate::exchange::run(name, &port, baud, &req, core_state).map_err(internal_err)
 }
 
 // ---- /signals/{name}/capture ------------------------------------------------
@@ -2605,6 +2620,8 @@ mod tests {
         ("GET", "/logs/recent", "/logs/recent"),
         ("GET", "/studies", "/studies"),
         ("POST", "/study", "/study"),
+        ("POST", "/host-studies", "/host-studies"),
+        ("POST", "/study/{study_id}/cancel", "/study/abc/cancel"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
@@ -2653,7 +2670,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 34;
+    const DOCUMENTED_ROUTE_COUNT: usize = 36;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -2803,12 +2820,13 @@ mod tests {
 
     /// The `(method, path)` a handler's own `// route: METHOD path` comment
     /// declares, read from directly above its `[pub] async fn NAME(` line in
-    /// `api.rs` (bare name) or `study.rs` (`study::`-prefixed name). `None`
+    /// `api.rs` (bare name) or `study.rs` (`study::`-prefixed name) or `host_study.rs` (`host_study::`). `None`
     /// if the handler has no such comment immediately above its definition.
     fn handler_declared_route(handler_name: &str) -> Option<(String, String)> {
-        let (source, bare_name) = match handler_name.strip_prefix("study::") {
-            Some(stripped) => (include_str!("study.rs"), stripped),
-            None => (include_str!("api.rs"), handler_name),
+        let (source, bare_name) = match (handler_name.strip_prefix("study::"), handler_name.strip_prefix("host_study::")) {
+            (Some(stripped), _) => (include_str!("study.rs"), stripped),
+            (_, Some(stripped)) => (include_str!("host_study.rs"), stripped),
+            _ => (include_str!("api.rs"), handler_name),
         };
         let lines: Vec<&str> = source.lines().collect();
         let fn_prefixes = [format!("async fn {bare_name}("), format!("pub async fn {bare_name}(")];

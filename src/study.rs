@@ -181,10 +181,10 @@ pub struct StudyJobResponse {
     pub reason: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct StudyAcceptedResponse {
-    study_id: String,
-    status: &'static str,
+    pub(crate) study_id: String,
+    pub(crate) status: &'static str,
 }
 
 /// One live event pushed to every subscriber of `GET /study/{study_id}/
@@ -373,6 +373,19 @@ pub enum StudyEvent {
         field_name: String,
         value: f64,
         core_rx_utc_ms: u64,
+    },
+    /// A host study's step ended (decision 95): the study-designer `HostStepResult`, with the
+    /// list it ran in, its position there and Core's own `detail` word for why the outcome is
+    /// what it is. Its own variant because a bench `StepResult` cannot carry a reply.
+    HostStepCompleted {
+        study_id: String,
+        list: embarch_study_designer::HostList,
+        step_index: u32,
+        result: Box<embarch_study_designer::HostStepResult>,
+        detail: String,
+        started_utc_ms: u64,
+        ended_utc_ms: u64,
+        delay_before_ms: u32,
     },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
@@ -746,7 +759,7 @@ fn clamp_version(
     })
 }
 
-fn generate_study_id() -> String {
+pub(crate) fn generate_study_id() -> String {
     let mut bytes = [0u8; 16];
     rand::fill(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -763,7 +776,7 @@ fn study_results_root() -> anyhow::Result<PathBuf> {
     Ok(token_store::local_data_dir()?.join("study_results"))
 }
 
-fn study_results_dir(study_id: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn study_results_dir(study_id: &str) -> anyhow::Result<PathBuf> {
     Ok(study_results_root()?.join(study_id))
 }
 
@@ -771,14 +784,14 @@ fn study_results_dir(study_id: &str) -> anyhow::Result<PathBuf> {
 /// Missing is silently ignored rather than panicking — losing the race
 /// against a hypothetical future cleanup pass shouldn't crash a background
 /// study task.
-fn update_job<F: FnOnce(&mut StudyJob)>(jobs: &JobRegistry, study_id: &str, f: F) {
+pub(crate) fn update_job<F: FnOnce(&mut StudyJob)>(jobs: &JobRegistry, study_id: &str, f: F) {
     let mut guard = jobs.lock().unwrap();
     if let Some(job) = guard.get_mut(study_id) {
         f(job);
     }
 }
 
-fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, reason: String) {
+pub(crate) fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, reason: String) {
     tracing::error!(study_id, %reason, "study failed");
     update_job(jobs, study_id, |job| {
         job.status = "failed".to_string();
@@ -1353,6 +1366,22 @@ async fn run_outpost_preflight(
 
 // ---- POST /study -----------------------------------------------------------
 
+/// Takes [`StudyLock`] for `study_id`, or refuses `409` naming what holds it. Shared by
+/// `POST /study` and `POST /host-studies` (decision 95): one lock for both kinds.
+pub(crate) fn take_study_lock(state: &AppState, study_id: &str) -> Result<(), (StatusCode, String)> {
+    let mut guard = state.study_lock.lock().unwrap();
+    if let Some(in_flight) = guard.as_ref() {
+        let what = if in_flight == HELLO_HOLDER {
+            format!("dev-bench link is busy: {in_flight} is holding it")
+        } else {
+            format!("a study is already in flight: {in_flight}")
+        };
+        return Err((StatusCode::CONFLICT, what));
+    }
+    *guard = Some(study_id.to_string());
+    Ok(())
+}
+
 /// `embarch-study-designer` spec.md §5.1: validate, take the study lock, open dev-bench and hand it
 /// the study, then return immediately and let a background task own the rest
 /// of the study's lifetime.
@@ -1379,18 +1408,7 @@ pub async fn post_study_handler(
 
     let study_id = generate_study_id();
 
-    {
-        let mut guard = state.study_lock.lock().unwrap();
-        if let Some(in_flight) = guard.as_ref() {
-            let what = if in_flight == HELLO_HOLDER {
-                format!("dev-bench link is busy: {in_flight} is holding it")
-            } else {
-                format!("a study is already in flight: {in_flight}")
-            };
-            return Err((StatusCode::CONFLICT, what));
-        }
-        *guard = Some(study_id.clone());
-    }
+    take_study_lock(&state, &study_id)?;
 
     // From here on, any early return must release the lock we just took.
     let release_lock = || {
@@ -3520,6 +3538,7 @@ fn event_study_id(event: &StudyEvent) -> &str {
         | StudyEvent::StreamText { study_id, .. }
         | StudyEvent::OutpostRows { study_id, .. }
         | StudyEvent::StructChartValue { study_id, .. }
+        | StudyEvent::HostStepCompleted { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -3677,6 +3696,25 @@ pub struct StudyStepEntryResponse {
     /// absent rather than filled in with a guess.
     pub started_utc_ms: Option<u64>,
     pub ended_utc_ms: Option<u64>,
+    /// The fields below exist only on a **host study's** rows (decision 95) and are absent, not
+    /// null, on a bench study's. `list` is `"Steps"` or `"Teardown"`; `detail` is Core's word for
+    /// why the outcome is what it is (`empty_reply` is a console that said nothing, apart from
+    /// `until_not_seen`); `reply` is the raw capped text, `reply_bytes` what came back before the
+    /// cap, `elapsed_ms` the step's own duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3713,6 +3751,21 @@ struct EventsFileStep {
     ended_utc_ms: Option<u64>,
     #[serde(default)]
     delay_before_ms: Option<u32>,
+    // Host-study rows only (decision 95).
+    #[serde(default)]
+    list: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    reply_truncated: Option<bool>,
+    #[serde(default)]
+    reply_bytes: Option<usize>,
+    #[serde(default)]
+    elapsed_ms: Option<u64>,
 }
 
 /// Splits [`Outcome`]'s serialized form into a name and, for a `Fail`, the
@@ -3767,6 +3820,12 @@ pub async fn study_steps_handler(
     Ok(Json(steps_response(parsed)))
 }
 
+/// `events.json` text to the steps answer, for the host-study tests.
+#[cfg(test)]
+pub(crate) fn steps_for_test(text: &str) -> StudyStepsResponse {
+    steps_response(serde_json::from_str(text).unwrap())
+}
+
 /// [`study_steps_handler`]'s whole body minus the disk read, so the shaping
 /// is testable without a writable results root.
 fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
@@ -3784,6 +3843,13 @@ fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
                 delay_before_ms: s.delay_before_ms,
                 started_utc_ms: s.started_utc_ms,
                 ended_utc_ms: s.ended_utc_ms,
+                list: s.list,
+                detail: s.detail,
+                note: s.note,
+                reply: s.reply,
+                reply_truncated: s.reply_truncated,
+                reply_bytes: s.reply_bytes,
+                elapsed_ms: s.elapsed_ms,
             }
         })
         .collect();
