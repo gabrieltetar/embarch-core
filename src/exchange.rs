@@ -101,6 +101,9 @@ pub struct ExchangeResponse {
     /// The read hit [`MAX_READ_BYTES`] before `until` or the deadline.
     pub truncated: bool,
     pub elapsed_ms: u64,
+    /// When the exchange began, UTC ms since the Unix epoch: the clock a capture's
+    /// `started_utc_ms` is on, so a reply and a capture's lines merge exactly (decision 94).
+    pub started_utc_ms: u64,
     /// How many bytes came back after the write (decision 85). `0` is a console that said nothing.
     pub bytes_read: usize,
     /// The echo of the written line (without its line ending) was seen in the reply: the
@@ -406,6 +409,11 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay[from..].windows(needle.len()).position(|w| w == needle).map(|i| i + from)
 }
 
+/// Now, UTC milliseconds since the Unix epoch (decision 94).
+pub fn utc_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 /// Opens `port`, asserts DTR (a Zephyr CDC ACM shell may wait for it before it prints),
 /// optionally drops pending input, and runs one exchange. `core_state` is called only when
 /// nothing came back, to add the DUT core's run state (decision 85).
@@ -417,6 +425,7 @@ pub fn run(
     core_state: impl FnOnce() -> CoreState,
 ) -> Result<ExchangeResponse> {
     let started = Instant::now();
+    let started_utc_ms = utc_ms();
     let port_name = port.port_name.as_str();
     let mut sp = serialport::new(port_name, baud)
         .timeout(READ_POLL)
@@ -441,17 +450,19 @@ pub fn run(
             let _ = p.set_timeout(d);
         },
     )?;
-    Ok(response(signal, port_name, baud, started.elapsed().as_millis() as u64, got, || Some(PortIdentity::of(port)), core_state))
+    Ok(response(signal, port_name, baud, started.elapsed().as_millis() as u64, started_utc_ms, got, || Some(PortIdentity::of(port)), core_state))
 }
 
 /// Builds the answer to an exchange, shared by [`run`] (its own port) and a capture's
 /// (the capture's open port, `capture.rs`). `identity` and `core_state` run only when nothing
 /// came back (decision 85).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn response(
     signal: &str,
     port_name: &str,
     baud: u32,
     elapsed_ms: u64,
+    started_utc_ms: u64,
     got: Exchanged,
     identity: impl FnOnce() -> Option<PortIdentity>,
     core_state: impl FnOnce() -> CoreState,
@@ -465,6 +476,7 @@ pub(crate) fn response(
         until_seen: got.until_seen,
         truncated: got.truncated,
         elapsed_ms,
+        started_utc_ms,
         bytes_read: got.bytes.len(),
         echo_seen: got.echo_seen,
         written: true,

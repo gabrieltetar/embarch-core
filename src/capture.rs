@@ -91,10 +91,42 @@ pub struct Gap {
     pub reopened_at_ms: Option<u64>,
 }
 
+/// When one line's first byte was received (decision 94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LineRx {
+    /// Byte offset of the line's first byte, in the same space as `offset`, `next_offset` and
+    /// `gaps`.
+    pub offset: u64,
+    /// Milliseconds after the capture started (`started_utc_ms`), read off the `read()` that
+    /// first returned the line's first byte.
+    pub rx_ms: u64,
+}
+
 struct Inner {
     buf: Vec<u8>,
     gaps: Vec<Gap>,
+    /// One entry per line start, ascending by `offset`.
+    lines: Vec<LineRx>,
+    /// The next byte appended begins a line.
+    at_line_start: bool,
     state: State,
+}
+
+impl Inner {
+    /// Appends `bytes` and stamps every line whose first byte is among them with `now_ms`.
+    fn push(&mut self, bytes: &[u8], now_ms: u64) {
+        let base = self.buf.len() as u64;
+        for (i, b) in bytes.iter().enumerate() {
+            if self.at_line_start {
+                self.lines.push(LineRx { offset: base + i as u64, rx_ms: now_ms });
+                self.at_line_start = false;
+            }
+            if *b == b'\n' {
+                self.at_line_start = true;
+            }
+        }
+        self.buf.extend_from_slice(bytes);
+    }
 }
 
 struct Job {
@@ -109,6 +141,8 @@ pub struct Capture {
     pub port: String,
     pub baud: u32,
     started: Instant,
+    /// `started` as UTC milliseconds since the Unix epoch (decision 94).
+    started_utc_ms: u64,
     deadline: Instant,
     max_bytes: usize,
     identity: Option<PortIdentity>,
@@ -135,6 +169,11 @@ pub struct CaptureRead {
     pub text: String,
     pub elapsed_ms: u64,
     pub gaps: Vec<Gap>,
+    /// The capture's start, UTC ms since the Unix epoch: the clock an exchange reply's
+    /// `started_utc_ms` is also on (decision 94).
+    pub started_utc_ms: u64,
+    /// The lines whose first byte lies in `[offset, next_offset)`, with when it was received.
+    pub lines: Vec<LineRx>,
 }
 
 /// Why a capture could not start.
@@ -189,6 +228,10 @@ impl Capture {
             text: String::from_utf8_lossy(slice).into_owned(),
             elapsed_ms: self.elapsed_ms(),
             gaps: inner.gaps.clone(),
+            started_utc_ms: self.started_utc_ms,
+            lines: inner.lines[inner.lines.partition_point(|l| l.offset < from as u64)
+                ..inner.lines.partition_point(|l| l.offset < next as u64)]
+                .to_vec(),
         }
     }
 
@@ -242,7 +285,8 @@ impl Write for Tee<'_> {
 fn append(cap: &Capture, bytes: &[u8]) -> bool {
     let mut inner = cap.inner.lock().unwrap();
     let room = cap.max_bytes.saturating_sub(inner.buf.len());
-    inner.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    let now = cap.elapsed_ms();
+    inner.push(&bytes[..bytes.len().min(room)], now);
     inner.buf.len() >= cap.max_bytes
 }
 
@@ -253,8 +297,9 @@ fn finish(cap: &Capture, state: State) {
 fn mark_lost(cap: &Capture) {
     let mut inner = cap.inner.lock().unwrap();
     let offset = inner.buf.len() as u64;
-    inner.buf.extend_from_slice(b"\n[embarch: port lost]\n");
-    inner.gaps.push(Gap { offset, lost_at_ms: cap.elapsed_ms(), reopened_at_ms: None });
+    let now = cap.elapsed_ms();
+    inner.push(b"\n[embarch: port lost]\n", now);
+    inner.gaps.push(Gap { offset, lost_at_ms: now, reopened_at_ms: None });
     inner.state = State::Reopening;
 }
 
@@ -264,12 +309,13 @@ fn mark_reopened(cap: &Capture) {
     if let Some(g) = inner.gaps.last_mut() {
         g.reopened_at_ms = Some(now);
     }
-    inner.buf.extend_from_slice(b"[embarch: port reopened]\n");
+    inner.push(b"[embarch: port reopened]\n", now);
     inner.state = State::Running;
 }
 
 fn run_job(cap: &Capture, port: &mut dyn CapturePort, job: Job) -> bool {
     let started = Instant::now();
+    let started_utc_ms = crate::exchange::utc_ms();
     let mut tee = Tee { port, cap };
     let r = crate::exchange::exchange_with(
         &mut tee,
@@ -287,6 +333,7 @@ fn run_job(cap: &Capture, port: &mut dyn CapturePort, job: Job) -> bool {
             &cap.port,
             cap.baud,
             started.elapsed().as_millis() as u64,
+            started_utc_ms,
             got,
             || cap.identity.clone(),
             job.core_state,
@@ -400,16 +447,18 @@ impl CaptureRegistry {
         port.set_timeout(crate::exchange::READ_POLL);
         let (tx, rx) = channel();
         let now = Instant::now();
+        let started_utc_ms = crate::exchange::utc_ms();
         let cap = Arc::new(Capture {
             id: format!("cap-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst)),
             signal: signal.to_string(),
             port: port_name.to_string(),
             baud,
             started: now,
+            started_utc_ms,
             deadline: now + Duration::from_secs(max_s),
             max_bytes,
             identity,
-            inner: Mutex::new(Inner { buf: Vec::new(), gaps: Vec::new(), state: State::Running }),
+            inner: Mutex::new(Inner { buf: Vec::new(), gaps: Vec::new(), lines: Vec::new(), at_line_start: true, state: State::Running }),
             stop: AtomicBool::new(false),
             jobs: Mutex::new(tx),
         });
@@ -675,6 +724,50 @@ mod tests {
         w.feed(&bytes[2..]);
         wait(|| c.read(0, 100).total_bytes == 3);
         assert_eq!(c.read(1, 100).text, "é");
+    }
+
+    #[test]
+    fn lines_carry_receive_times_and_offsets_match_text_across_a_gap() {
+        let reg = CaptureRegistry::default();
+        let w = Wire::default();
+        let c = start(&reg, "dut", &w, 30, 4096);
+        w.feed(b"first\n");
+        wait(|| c.read(0, 100).total_bytes == 6);
+        std::thread::sleep(Duration::from_millis(200));
+        w.feed(b"sec");
+        wait(|| c.read(0, 100).total_bytes == 9);
+        w.feed(b"ond\n");
+        wait(|| c.read(0, 100).total_bytes == 13);
+        std::thread::sleep(Duration::from_millis(50));
+        w.feed(b"third\n");
+        wait(|| c.read(0, 100).total_bytes == 19);
+        let r = c.read(0, 100);
+        // A line is stamped when its first byte arrives, so "second" is placed by "sec".
+        assert_eq!(r.lines.iter().map(|l| l.offset).collect::<Vec<_>>(), [0, 6, 13]);
+        let dt = r.lines[1].rx_ms - r.lines[0].rx_ms;
+        assert!((150..=600).contains(&dt), "two lines 200 ms apart were {dt} ms apart");
+        assert!(r.lines[2].rx_ms >= r.lines[1].rx_ms);
+        assert!(r.started_utc_ms > 1_700_000_000_000);
+        // A range returns only the lines that start inside it.
+        let tail = c.read(6, 100);
+        assert_eq!(tail.lines.iter().map(|l| l.offset).collect::<Vec<_>>(), [6, 13]);
+        // Across a gap: markers are lines too, and every offset is the start of a line in text.
+        w.fail.store(true, Ordering::SeqCst);
+        wait(|| c.state() == State::Reopening);
+        w.fail.store(false, Ordering::SeqCst);
+        wait(|| c.state() == State::Running);
+        w.feed(b"after\n");
+        wait(|| c.read(0, 4096).text.ends_with("after\n"));
+        let r = c.read(0, 4096);
+        let bytes = r.text.as_bytes();
+        assert_eq!(r.lines.len(), r.text.lines().count());
+        for l in &r.lines {
+            let o = l.offset as usize;
+            assert!(o == 0 || bytes[o - 1] == b'\n', "offset {o} is not a line start");
+        }
+        let lost = r.text.find("[embarch: port lost]").unwrap() as u64;
+        assert!(r.lines.iter().any(|l| l.offset == lost));
+        assert_eq!(r.gaps[0].offset + 1, lost);
     }
 
     #[test]
