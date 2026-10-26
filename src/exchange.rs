@@ -152,6 +152,7 @@ pub fn resolve_port_waiting(name: &str, wait_ms: u64) -> anyhow::Result<embarch_
 /// Writes `write`, then reads until `until` appears in what was read, the
 /// deadline passes, or `max_bytes` is reached — over any `Read + Write`, so
 /// every exit is testable with no port opened.
+#[cfg(test)]
 pub fn exchange<P: Read + Write>(
     port: &mut P,
     write: &[u8],
@@ -160,8 +161,56 @@ pub fn exchange<P: Read + Write>(
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<Exchanged> {
-    port.write_all(write).context("error writing to the signal's port")?;
+    exchange_with(port, write, until, match_after_echo, timeout, max_bytes, |_| {})
+}
+
+/// Writes all of `write` within `deadline`: a `TimedOut`, `WouldBlock`, `Interrupted` or
+/// zero-length write is a throttled device, not a failure, and is retried from the byte
+/// count the port reported. Past the deadline it fails with the count of bytes written.
+fn write_with_deadline<P: Write>(port: &mut P, write: &[u8], deadline: Instant) -> Result<()> {
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+    let mut sent = 0;
+    while sent < write.len() {
+        let stalled = match port.write(&write[sent..]) {
+            Ok(0) => true,
+            Ok(n) => {
+                sent += n;
+                false
+            }
+            Err(e) if matches!(e.kind(), TimedOut | WouldBlock | Interrupted) => true,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("error writing to the signal's port after {sent} of {} bytes", write.len())
+                })
+            }
+        };
+        if stalled {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "the signal's port took only {sent} of {} bytes before the write deadline",
+                    write.len()
+                );
+            }
+            std::thread::sleep(IDLE_SLEEP);
+        }
+    }
+    Ok(())
+}
+
+/// [`exchange`] with `before_read` run once the line is written (the real port
+/// swaps its long write timeout for the short read poll there).
+fn exchange_with<P: Read + Write>(
+    port: &mut P,
+    write: &[u8],
+    until: Option<&str>,
+    match_after_echo: bool,
+    timeout: Duration,
+    max_bytes: usize,
+    before_read: impl FnOnce(&mut P),
+) -> Result<Exchanged> {
+    write_with_deadline(port, write, Instant::now() + timeout)?;
     port.flush().context("error flushing the signal's port")?;
+    before_read(port);
     let deadline = Instant::now() + timeout;
     let needle = until.map(str::as_bytes);
     // The written line without its line ending: what a shell echoes back.
@@ -223,13 +272,19 @@ pub fn run(signal: &str, port_name: &str, baud: u32, req: &ExchangeRequest) -> R
     if req.discard_pending {
         let _ = port.clear(serialport::ClearBuffer::Input);
     }
-    let got = exchange(
+    // The write gets the exchange's whole timeout: serialport uses one timeout for both
+    // directions and a 50 ms write cut short loses bytes on Windows (decision 79).
+    let _ = serialport::SerialPort::set_timeout(&mut *port, Duration::from_millis(req.timeout_ms));
+    let got = exchange_with(
         &mut port,
         req.write.as_bytes(),
         req.until.as_deref(),
         req.match_after_echo,
         Duration::from_millis(req.timeout_ms),
         MAX_READ_BYTES,
+        |p| {
+            let _ = p.set_timeout(Duration::from_millis(50));
+        },
     )?;
     Ok(ExchangeResponse {
         signal: signal.to_string(),
@@ -281,6 +336,81 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Takes at most `cap` bytes per call; every call stalls first (a `TimedOut`
+    /// error, as a throttled CDC ACM device gives) unless `never` is false.
+    struct Throttled {
+        inner: Fake,
+        cap: usize,
+        stall_every_call: bool,
+        accept: bool,
+        stalled: bool,
+    }
+
+    impl Read for Throttled {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(b)
+        }
+    }
+
+    impl Write for Throttled {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.stall_every_call && !self.stalled || !self.accept {
+                self.stalled = true;
+                std::thread::sleep(Duration::from_millis(60));
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.stalled = false;
+            let n = buf.len().min(self.cap);
+            self.inner.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_throttled_device_gets_the_whole_line_in_order() {
+        let line: Vec<u8> = (0..357u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut p = Throttled { inner: Fake::new(vec![Ok(b"ok$ ".to_vec())]), cap: 16, stall_every_call: true, accept: true, stalled: false };
+        let t = Instant::now();
+        let got = exchange(&mut p, &line, Some("ok$ "), false, Duration::from_secs(30), 1024).unwrap();
+        assert!(got.until_seen);
+        assert_eq!(p.inner.written, line);
+        assert!(t.elapsed() > Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_device_that_never_takes_the_rest_fails_by_the_deadline_with_the_count() {
+        let mut p = Throttled { inner: Fake::new(vec![]), cap: 4, stall_every_call: false, accept: true, stalled: false };
+        p.accept = true;
+        // Accept 4 bytes once, then stall forever.
+        struct Once(Throttled, bool);
+        impl Read for Once {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(b)
+            }
+        }
+        impl Write for Once {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.1 {
+                    self.1 = true;
+                    return self.0.write(buf);
+                }
+                self.0.accept = false;
+                self.0.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut o = Once(p, false);
+        let t = Instant::now();
+        let e = exchange(&mut o, b"0123456789", None, true, Duration::from_millis(150), 1024).unwrap_err();
+        assert!(format!("{e:#}").contains("only 4 of 10 bytes"), "{e:#}");
+        assert!(t.elapsed() >= Duration::from_millis(150) && t.elapsed() < Duration::from_secs(2));
     }
 
     fn req(write: &str) -> ExchangeRequest {
