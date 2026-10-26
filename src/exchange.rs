@@ -253,9 +253,19 @@ pub fn check(req: &ExchangeRequest) -> Result<(), String> {
 /// The signal's port, waiting up to `wait_ms` for it to be enumerable: only a declared direct
 /// port that is not there now is waited for; any other failure answers at once.
 pub fn resolve_port_waiting(name: &str, wait_ms: u64) -> anyhow::Result<embarch_topology::hardware::DetectedPort> {
+    resolve_port_waiting_with(wait_ms, || embarch_topology::hardware::resolve_signal_port(name))
+}
+
+/// [`resolve_port_waiting`] over any resolver, so the wait's exits are testable with no port
+/// enumerated. A `SignalAmbiguous` (decision 46: several ports share the declared serial) is
+/// present, not missing, so it is never waited on.
+fn resolve_port_waiting_with(
+    wait_ms: u64,
+    mut resolve: impl FnMut() -> anyhow::Result<embarch_topology::hardware::DetectedPort>,
+) -> anyhow::Result<embarch_topology::hardware::DetectedPort> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     loop {
-        match embarch_topology::hardware::resolve_signal_port(name) {
+        match resolve() {
             Ok(port) => return Ok(port),
             Err(e)
                 if e.downcast_ref::<embarch_topology::hardware::SignalMismatch>()
@@ -774,5 +784,32 @@ mod tests {
         let r: ExchangeRequest = serde_json::from_str(r#"{"write":"help\n"}"#).unwrap();
         assert_eq!(r.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert!(r.discard_pending && r.match_after_echo && r.until.is_none());
+    }
+
+    #[test]
+    fn an_ambiguous_declared_serial_is_not_waited_on() {
+        use embarch_topology::hardware::{DetectedPort, SignalAmbiguous};
+        let port = |n: &str, i: u8| -> DetectedPort {
+            serde_json::from_value(serde_json::json!({
+                "port_name": n, "detected_by": "declared-serial", "interface": i,
+            }))
+            .unwrap()
+        };
+        let mut calls = 0;
+        let t = Instant::now();
+        let e = resolve_port_waiting_with(30_000, || {
+            calls += 1;
+            Err(anyhow::Error::new(SignalAmbiguous {
+                name: "console".into(),
+                origin_role: "dut".into(),
+                declared_port_serial: "FT9ABCDE".into(),
+                candidates: vec![port("COM15", 0), port("COM17", 2)],
+            }))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let text = format!("{e:#}");
+        assert!(text.contains("COM15") && text.contains("COM17"), "{text}");
     }
 }
