@@ -77,6 +77,19 @@ pub type JobRegistry = Arc<StdMutex<HashMap<String, StudyJob>>>;
 /// is in flight.
 pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
+/// What `GET /dev-bench/hello` writes into [`StudyLock`] while it holds the
+/// dev-bench link, so a study (or a second hello) is refused `409` naming it.
+const HELLO_HOLDER: &str = "GET /dev-bench/hello";
+
+/// Releases [`StudyLock`] on drop; hello's hold on the link.
+struct HelloHold(StudyLock);
+
+impl Drop for HelloHold {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 /// The serial ports a study's `Route::Direct` taps hold open right now, by
 /// name (`AppState::tap_ports`, decision 77).
 ///
@@ -1092,7 +1105,16 @@ async fn open_and_handshake(
 /// `spawn_blocking`: the gate attaches to real hardware and reads memory,
 /// exactly the blocking probe-rs calls every other hardware-touching
 /// handler in this crate already wraps.
-async fn enforce_dev_bench_gate() -> Result<embarch_topology::hardware::EnrolledBoard, String> {
+async fn enforce_dev_bench_gate(
+    state: &AppState,
+    route: &'static str,
+) -> Result<embarch_topology::hardware::EnrolledBoard, (StatusCode, String)> {
+    // The attach opens the dev-bench's debug probe, so it is a physical
+    // connection like any other and takes `hw_lock` (decision 14's 503 on a
+    // wait that times out). Held for the gate only and dropped on return:
+    // `run_outpost_preflight` takes the same lock later, and holding it
+    // across would deadlock it.
+    let _hw = crate::api::acquire_hw_lock(state, route).await?;
     // Returns the enrolled board rather than just `Ok(())` since §3 decision
     // 35: the JTAG-verified identity it confirms is exactly what the
     // `HelloAck` comparison needs, and re-reading it would be a second
@@ -1101,8 +1123,8 @@ async fn enforce_dev_bench_gate() -> Result<embarch_topology::hardware::Enrolled
         embarch_topology::hardware::validate_role(embarch_topology::hardware::DEV_BENCH_ROLE)
     })
     .await
-    .map_err(|e| format!("board-identity gate task panicked: {e:?}"))?
-    .map_err(describe_gate_error)
+    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("board-identity gate task panicked: {e:?}")))?
+    .map_err(|e| (StatusCode::BAD_GATEWAY, describe_gate_error(e)))
 }
 
 /// The same `not_attached`-versus-`mismatch` split `api.rs`'s
@@ -1163,15 +1185,19 @@ fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity)
 pub async fn hello_handler(
     State(state): State<AppState>,
 ) -> Result<Json<HelloAckInfo>, (StatusCode, String)> {
-    {
-        let guard = state.study_lock.lock().unwrap();
+    // Held (as `study_lock`) until this returns, the way `POST /study` holds
+    // it, so nothing else opens the dev-bench port during the handshake.
+    let _hold = {
+        let mut guard = state.study_lock.lock().unwrap();
         if let Some(in_flight) = guard.as_ref() {
             return Err((
                 StatusCode::CONFLICT,
-                format!("a study is already in flight ({in_flight}) — dev-bench link is busy"),
+                format!("dev-bench link is busy: {in_flight} is holding it"),
             ));
         }
-    }
+        *guard = Some(HELLO_HOLDER.to_string());
+        HelloHold(state.study_lock.clone())
+    };
 
     let port = match tokio::task::spawn_blocking(embarch_topology::hardware::resolve_dev_bench_port).await {
         Ok(Ok(port)) => port,
@@ -1182,9 +1208,7 @@ pub async fn hello_handler(
         Err(e) => return Err(internal_err(e)),
     };
 
-    let enrolled = enforce_dev_bench_gate()
-        .await
-        .map_err(|msg| (StatusCode::BAD_GATEWAY, msg))?;
+    let enrolled = enforce_dev_bench_gate(&state, "GET /dev-bench/hello").await?;
 
     let (_link, info) = open_and_handshake(port.port_name, &enrolled)
         .await
@@ -1332,10 +1356,12 @@ pub async fn post_study_handler(
     {
         let mut guard = state.study_lock.lock().unwrap();
         if let Some(in_flight) = guard.as_ref() {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("a study is already in flight: {in_flight}"),
-            ));
+            let what = if in_flight == HELLO_HOLDER {
+                format!("dev-bench link is busy: {in_flight} is holding it")
+            } else {
+                format!("a study is already in flight: {in_flight}")
+            };
+            return Err((StatusCode::CONFLICT, what));
         }
         *guard = Some(study_id.clone());
     }
@@ -1361,11 +1387,11 @@ pub async fn post_study_handler(
         }
     };
 
-    let enrolled = match enforce_dev_bench_gate().await {
+    let enrolled = match enforce_dev_bench_gate(&state, "POST /study identity gate").await {
         Ok(board) => board,
-        Err(msg) => {
+        Err(e) => {
             release_lock();
-            return Err((StatusCode::BAD_GATEWAY, msg));
+            return Err(e);
         }
     };
 
@@ -6953,5 +6979,55 @@ mod tests {
         assert!(!msg.starts_with("probe not attached"), "lead must not contradict reason: {msg}");
         assert!(!msg.contains("topology mismatch"), "got: {msg}");
         assert!(msg.contains("opened but failed to attach"), "got: {msg}");
+    }
+
+    // ---- core/104: the gate and hello take the locks they share --------------
+
+    /// The gate attaches the probe, so it waits on `hw_lock` and answers the
+    /// decision-14 `503` naming the holder, without ever reaching the probe.
+    #[tokio::test]
+    async fn the_identity_gate_is_refused_503_naming_the_hw_lock_holder() {
+        let state = AppState::new("t".to_string());
+        let _held = crate::api::acquire_hw_lock(&state, "POST /flash").await.unwrap();
+        let (status, msg) = enforce_dev_bench_gate(&state, "POST /study identity gate")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("POST /flash"), "got: {msg}");
+    }
+
+    /// While hello holds the link, a study is refused `409` naming hello.
+    #[tokio::test]
+    async fn a_study_is_refused_409_naming_hello_while_hello_holds_the_link() {
+        let state = AppState::new("t".to_string());
+        *state.study_lock.lock().unwrap() = Some(HELLO_HOLDER.to_string());
+        let err = post_study_handler(
+            State(state.clone()),
+            Query(StudyRunParams::default()),
+            Json(study_with_steps(&[1000])),
+        )
+        .await;
+        let Err(err) = err else { panic!("must be refused") };
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains(HELLO_HOLDER), "got: {}", err.1);
+        // The refused study must not have released hello's hold.
+        assert_eq!(state.study_lock.lock().unwrap().as_deref(), Some(HELLO_HOLDER));
+    }
+
+    /// Hello is refused `409` while a study is in flight, and while another
+    /// hello is; and its own hold is released when it returns.
+    #[tokio::test]
+    async fn hello_is_refused_409_while_the_link_is_held_and_releases_its_own_hold() {
+        let state = AppState::new("t".to_string());
+        *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
+        let Err(err) = hello_handler(State(state.clone())).await else { panic!("must be refused") };
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("study-abc"), "got: {}", err.1);
+        *state.study_lock.lock().unwrap() = None;
+
+        // Free link: hello takes the hold, then fails later (no bench here);
+        // whatever it returns, the hold must be gone afterwards.
+        let _ = hello_handler(State(state.clone())).await;
+        assert!(state.study_lock.lock().unwrap().is_none());
     }
 }
