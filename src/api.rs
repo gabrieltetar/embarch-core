@@ -946,6 +946,43 @@ struct EnrollProbeResponse {
     /// identity everywhere except `GET /dev-bench/hello` (decision 56).
     hardware_id: String,
     confirmed_at_utc_ms: u64,
+    /// The row that held this role under a different probe and lost it to
+    /// this enrol (decision 87). Absent when nothing was displaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    displaced: Option<embarch_topology::hardware::EnrolledBoard>,
+    /// The row **this probe** held under a different real role, as it was
+    /// before (decision 87). Absent when it vacated none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vacated: Option<embarch_topology::hardware::EnrolledBoard>,
+    /// Whether `vacated`'s board half stays on record, probe half cleared.
+    /// Present only with `vacated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vacated_kept: Option<bool>,
+}
+
+/// Builds the enroll response from the written row and what the write moved.
+/// Pure, so role->role is testable without a probe.
+fn enroll_response(
+    board: embarch_topology::hardware::EnrolledBoard,
+    up: embarch_topology::hardware::Upserted,
+) -> EnrollProbeResponse {
+    // Both halves are `Option` on the row since `embarch-ui` decision 45 —
+    // a role can hold a board type with no probe — but *this* route is the
+    // one that writes the probe half, so a row it just produced always has
+    // both. The probe half stays flat rather than growing two nullable
+    // fields nothing could ever see as null.
+    let vacated_kept = up.vacated.as_ref().map(|_| up.vacated_kept);
+    EnrollProbeResponse {
+        probe_serial: board.probe_serial.unwrap_or_default(),
+        role: board.role,
+        name: board.name,
+        chip: board.chip,
+        hardware_id: board.hardware_id.unwrap_or_default(),
+        confirmed_at_utc_ms: board.confirmed_at_utc_ms.unwrap_or_default(),
+        displaced: up.displaced,
+        vacated: up.vacated,
+        vacated_kept,
+    }
 }
 
 // route: POST /probes/enroll
@@ -992,26 +1029,14 @@ async fn enroll_probe_handler(
         ));
     }
 
-    let board = tokio::task::spawn_blocking(move || {
-        embarch_topology::hardware::enroll(&role, &chip, probe_serial.as_deref(), &name)
+    let (board, up) = tokio::task::spawn_blocking(move || {
+        embarch_topology::hardware::enroll_reporting(&role, &chip, probe_serial.as_deref(), &name)
     })
-        .await
-        .map_err(internal_err)?
-        .map_err(internal_err)?;
+    .await
+    .map_err(internal_err)?
+    .map_err(internal_err)?;
 
-    // Both halves are `Option` on the row since `embarch-ui` decision 45 —
-    // a role can hold a board type with no probe — but *this* route is the
-    // one that writes the probe half, so a row it just produced always has
-    // both. The response shape stays flat rather than growing two nullable
-    // fields nothing could ever see as null.
-    Ok(Json(EnrollProbeResponse {
-        probe_serial: board.probe_serial.unwrap_or_default(),
-        role: board.role,
-        name: board.name,
-        chip: board.chip,
-        hardware_id: board.hardware_id.unwrap_or_default(),
-        confirmed_at_utc_ms: board.confirmed_at_utc_ms.unwrap_or_default(),
-    }))
+    Ok(Json(enroll_response(board, up)))
 }
 
 // ---- GET /probes/enrolled ---------------------------------------------------
@@ -1763,6 +1788,42 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+
+    fn board(role: &str, probe: &str) -> embarch_topology::hardware::EnrolledBoard {
+        embarch_topology::hardware::EnrolledBoard {
+            role: role.to_string(),
+            name: String::new(),
+            chip: "nrf54l15".to_string(),
+            probe_serial: Some(probe.to_string()),
+            hardware_id: Some("hw".to_string()),
+            confirmed_at_utc_ms: Some(1),
+            link_port_serial: None,
+            link_port_interface: None,
+        }
+    }
+
+    #[test]
+    fn enroll_response_omits_vacated_fields_when_nothing_moved() {
+        let v = serde_json::to_value(enroll_response(board("dut", "P1"), Default::default()))
+            .unwrap();
+        for k in ["displaced", "vacated", "vacated_kept"] {
+            assert!(v.get(k).is_none(), "{k} must be absent: {v}");
+        }
+    }
+
+    #[test]
+    fn enroll_response_reports_role_to_role_vacated_row() {
+        let up = embarch_topology::hardware::Upserted {
+            displaced: Some(board("dut", "P2")),
+            vacated: Some(board("dev-bench", "P1")),
+            vacated_kept: true,
+        };
+        let v = serde_json::to_value(enroll_response(board("dut", "P1"), up)).unwrap();
+        assert_eq!(v["role"], "dut");
+        assert_eq!(v["vacated"]["role"], "dev-bench");
+        assert_eq!(v["displaced"]["probe_serial"], "P2");
+        assert_eq!(v["vacated_kept"], true);
+    }
 
     #[tokio::test]
     async fn serial_log_over_the_duration_cap_is_a_bad_request_naming_both_numbers() {
