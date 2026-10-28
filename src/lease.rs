@@ -275,6 +275,9 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("GET", "/study/{study_id}/stream/{name}"),
     ("GET", "/study/{study_id}/stream/{name}/arrivals"),
     ("GET", "/study/{study_id}/stream/{name}/load"),
+    // Counts lines of files already on disk: no port, no hardware (core/116).
+    ("GET", "/study/{study_id}/line-counts"),
+    ("POST", "/study/{study_id}/line-counts"),
     ("POST", "/lease"),
     ("GET", "/lease"),
     ("PUT", "/lease"),

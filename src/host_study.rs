@@ -18,7 +18,7 @@ use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use embarch_study_designer::{
     limits::{MAX_FAIL_REASON_LEN, MAX_HOST_REPLY_LEN},
-    HostAction, HostList, HostStep, HostStepResult, HostStudy, Outcome,
+    HostAction, HostList, HostStep, HostStepResult, HostStudy, IterationMarker, IterationRef, Outcome, VALUE_PLACEHOLDER,
 };
 use serde::Serialize;
 use std::io::Write as _;
@@ -30,7 +30,11 @@ use tokio::sync::broadcast;
 
 use crate::api::{internal_err, AppState};
 use crate::exchange::{ExchangeRequest, ExchangeResponse};
+use crate::host_counts::RepeatSpan;
 use crate::study::{JobRegistry, StudyAcceptedResponse, StudyEvent, StudyJob};
+
+/// The submitted `HostStudy`, kept in the study's directory.
+pub const STUDY_FILE: &str = "study.json";
 
 /// What ends a step's wait or a `Wait`, polled this often so a cancel is seen within it.
 const CANCEL_POLL: Duration = Duration::from_millis(20);
@@ -71,8 +75,11 @@ pub struct StepRecord {
     #[serde(flatten)]
     pub result: HostStepResult,
     pub list: HostList,
-    /// Position in `list`.
+    /// Position in `list`; for a step inside a `Repeat`, the `Repeat`'s position.
     pub index: u32,
+    /// Position inside the `Repeat`'s `steps`; `None` for a step that is not in one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_index: Option<u32>,
     /// One of [`detail`]: why the outcome is what it is.
     pub detail: &'static str,
     /// Fuller text for a `Fail` whose 64-byte `reason` cannot hold it (the ports seen, the error).
@@ -95,6 +102,28 @@ pub struct RunEnd {
     pub reason: Option<String>,
     /// Teardown steps that did not pass. They never stop the rest of the teardown.
     pub teardown_failures: u32,
+    /// One marker per pass that started, in order, on the study clock.
+    pub iterations: Vec<IterationMarker>,
+    /// When each `Repeat` that started ran, on the study clock.
+    pub spans: Vec<RepeatSpan>,
+}
+
+/// The study's one clock: an anchor taken once plus the monotonic time since, so a pass marker, a
+/// step's times and a tap's per-line stamps all compare without a wall-clock step in between.
+#[derive(Debug, Clone, Copy)]
+pub struct StudyClock {
+    epoch: Instant,
+    epoch_utc: u64,
+}
+
+impl StudyClock {
+    pub fn new() -> Self {
+        Self { epoch: Instant::now(), epoch_utc: now_ms() }
+    }
+
+    pub fn now(&self) -> u64 {
+        self.epoch_utc + self.epoch.elapsed().as_millis() as u64
+    }
 }
 
 fn now_ms() -> u64 {
@@ -177,8 +206,9 @@ fn run_step<B: HostBackend>(
     index: u32,
     backend: &mut B,
     cancel: Option<&AtomicBool>,
+    clock: StudyClock,
 ) -> StepRecord {
-    let started = now_ms();
+    let started = clock.now();
     let t0 = Instant::now();
     let delayed = step.delay_before_ms == 0 || sleep_for(step.delay_before_ms as u64, cancel);
     let mut rec = StepRecord {
@@ -193,6 +223,7 @@ fn run_step<B: HostBackend>(
         },
         list,
         index,
+        inner_index: None,
         detail: detail::WAITED,
         note: None,
         reply_bytes: 0,
@@ -258,8 +289,123 @@ fn run_step<B: HostBackend>(
         }
     }
     rec.result.elapsed_ms = t0.elapsed().as_millis() as u64;
-    rec.ended_utc_ms = now_ms();
+    rec.ended_utc_ms = clock.now();
     rec
+}
+
+/// What a run accumulates beside the step records.
+struct Acc {
+    iterations: Vec<IterationMarker>,
+    spans: Vec<RepeatSpan>,
+}
+
+/// `step` with `{value}` replaced in an `Exchange` or `Instrument` line.
+fn substitute(step: &HostStep, value: &str) -> HostStep {
+    let mut s = step.clone();
+    match &mut s.action {
+        HostAction::Exchange { line, .. } | HostAction::Instrument { line, .. } => *line = line.replace(VALUE_PLACEHOLDER, value),
+        _ => {}
+    }
+    s
+}
+
+/// Why `rec` stops the study, or `None` to go on. Teardown never asks.
+fn stop_reason(step: &HostStep, rec: &StepRecord) -> Option<String> {
+    match &rec.result.outcome {
+        Outcome::Pass => None,
+        _ if rec.detail == detail::CANCELLED => Some(format!("cancelled during step '{}'", step.name)),
+        Outcome::Fail { reason } if !step.continue_on_fail => Some(format!("step '{}' failed ({reason})", step.name)),
+        Outcome::TimedOut if !step.continue_on_fail => Some(format!("step '{}' timed out ({})", step.name, rec.detail)),
+        _ => None,
+    }
+}
+
+/// Runs one `Repeat`: a marker as each pass starts, then the inner steps with `{value}` filled
+/// in, each record tagged with its pass. Returns why it stopped the study, if it did. Each inner
+/// step's own `continue_on_fail` governs; the `Repeat`'s own has no effect.
+#[allow(clippy::too_many_arguments)]
+fn run_repeat<B: HostBackend>(
+    step: &HostStep,
+    inner: &[HostStep],
+    count: Option<u32>,
+    values: &[String],
+    list: HostList,
+    index: u32,
+    backend: &mut B,
+    cancel: Option<&AtomicBool>,
+    clock: StudyClock,
+    acc: &mut Acc,
+    on_step: &mut dyn FnMut(StepRecord),
+) -> Option<String> {
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+    if step.delay_before_ms > 0 && !sleep_for(step.delay_before_ms as u64, cancel) {
+        return Some(format!("cancelled during step '{}'", step.name));
+    }
+    let passes: Vec<Option<&String>> = if values.is_empty() { (0..count.unwrap_or(0)).map(|_| None).collect() } else { values.iter().map(Some).collect() };
+    for (pass, entry) in passes.iter().enumerate() {
+        let pass = pass as u32;
+        if cancelled() {
+            return Some(format!("cancelled before pass {} of '{}'", pass + 1, step.name));
+        }
+        acc.iterations.push(IterationMarker {
+            list,
+            repeat_index: index,
+            pass,
+            value: entry.map(|v| v.to_string()),
+            started_utc_ms: clock.now(),
+        });
+        let value = entry.map(|v| v.to_string()).unwrap_or_else(|| (pass + 1).to_string());
+        for (j, s) in inner.iter().enumerate() {
+            if cancelled() {
+                return Some(format!("cancelled before step '{}'", s.name));
+            }
+            let mut rec = run_step(&substitute(s, &value), list, index, backend, cancel, clock);
+            rec.inner_index = Some(j as u32);
+            rec.result.iteration = Some(IterationRef { list, repeat_index: index, pass });
+            let why = if list == HostList::Steps { stop_reason(s, &rec) } else { None };
+            on_step(rec);
+            if why.is_some() {
+                return why;
+            }
+        }
+    }
+    None
+}
+
+/// Runs `steps` in order. In the main list a step that fails, times out or is cancelled stops the
+/// walk (unless `continue_on_fail`); in the teardown nothing stops it and failures are counted.
+#[allow(clippy::too_many_arguments)]
+fn walk<B: HostBackend>(
+    steps: &[HostStep],
+    list: HostList,
+    backend: &mut B,
+    cancel: Option<&AtomicBool>,
+    clock: StudyClock,
+    acc: &mut Acc,
+    on_step: &mut dyn FnMut(StepRecord),
+) -> Option<String> {
+    for (i, step) in steps.iter().enumerate() {
+        let i = i as u32;
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return Some(format!("cancelled before step '{}'", step.name));
+        }
+        if let HostAction::Repeat { count, values, steps: inner } = &step.action {
+            let started = clock.now();
+            let why = run_repeat(step, inner, *count, values, list, i, backend, cancel, clock, acc, on_step);
+            acc.spans.push(RepeatSpan { list, repeat_index: i, name: step.name.clone(), started_utc_ms: started, ended_utc_ms: clock.now() });
+            if why.is_some() {
+                return why;
+            }
+            continue;
+        }
+        let rec = run_step(step, list, i, backend, cancel, clock);
+        let why = if list == HostList::Steps { stop_reason(step, &rec) } else { None };
+        on_step(rec);
+        if why.is_some() {
+            return why;
+        }
+    }
+    None
 }
 
 /// Runs `study`: its steps until one stops it or `cancel` is set, then **always** its teardown.
@@ -268,32 +414,15 @@ pub fn execute<B: HostBackend>(
     study: &HostStudy,
     backend: &mut B,
     cancel: &AtomicBool,
+    clock: StudyClock,
     mut on_step: impl FnMut(StepRecord),
 ) -> RunEnd {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    let mut end = RunEnd { completed: true, reason: None, teardown_failures: 0 };
+    let mut acc = Acc { iterations: vec![], spans: vec![] };
+    let mut end = RunEnd { completed: true, reason: None, teardown_failures: 0, iterations: vec![], spans: vec![] };
     let main = catch_unwind(AssertUnwindSafe(|| {
-        for (i, step) in study.steps.iter().enumerate() {
-            if cancel.load(Ordering::SeqCst) {
-                return Some(format!("cancelled before step '{}'", step.name));
-            }
-            let rec = run_step(step, HostList::Steps, i as u32, backend, Some(cancel));
-            let (outcome, d) = (rec.result.outcome.clone(), rec.detail);
-            on_step(rec);
-            match outcome {
-                Outcome::Pass => {}
-                _ if d == detail::CANCELLED => return Some(format!("cancelled during step '{}'", step.name)),
-                Outcome::Fail { reason } if !step.continue_on_fail => {
-                    return Some(format!("step '{}' failed ({reason})", step.name));
-                }
-                Outcome::TimedOut if !step.continue_on_fail => {
-                    return Some(format!("step '{}' timed out ({d})", step.name));
-                }
-                _ => {}
-            }
-        }
-        None
+        walk(&study.steps, HostList::Steps, backend, Some(cancel), clock, &mut acc, &mut on_step)
     }));
     match main {
         Ok(None) => {}
@@ -308,34 +437,54 @@ pub fn execute<B: HostBackend>(
     }
     // Teardown: every step runs, the cancel flag is not consulted, and a failure is recorded
     // and walked past (`continue_on_fail` has no effect here).
-    for (i, step) in study.teardown.iter().enumerate() {
-        let rec = run_step(step, HostList::Teardown, i as u32, backend, None);
+    let mut failures = 0u32;
+    walk(&study.teardown, HostList::Teardown, backend, None, clock, &mut acc, &mut |rec: StepRecord| {
         if !matches!(rec.result.outcome, Outcome::Pass) {
-            end.teardown_failures += 1;
+            failures += 1;
         }
         on_step(rec);
-    }
+    });
+    end.teardown_failures = failures;
+    end.iterations = acc.iterations;
+    end.spans = acc.spans;
     end
 }
 
 // ---- submission checks ------------------------------------------------------
 
+/// Every step that runs, with where it is: the list's own steps, and for a `Repeat` its inner
+/// steps (one level, the designer's rule). `(list name, position, step)`; an inner step's
+/// position reads `"{repeat}.{inner}"`.
+fn flat_steps(study: &HostStudy) -> Vec<(&'static str, String, &HostStep)> {
+    let mut out = Vec::new();
+    for (list, steps) in [("steps", &study.steps), ("teardown", &study.teardown)] {
+        for (i, s) in steps.iter().enumerate() {
+            if let HostAction::Repeat { steps: inner, .. } = &s.action {
+                for (j, t) in inner.iter().enumerate() {
+                    out.push((list, format!("{i}.{j}"), t));
+                }
+            } else {
+                out.push((list, i.to_string(), s));
+            }
+        }
+    }
+    out
+}
+
 /// What this Core does not execute yet, by name. `Prompt` and `Instrument` are later units of the
-/// host-study proposal; `Repeat` and `line_counts` are `core/116`'s; `streams` is accepted for `Text` + `WholeStudy` taps only.
+/// host-study proposal (also inside a `Repeat`); `streams` is accepted for `Text` + `WholeStudy`
+/// taps only.
 fn unsupported(study: &HostStudy) -> Option<String> {
-    let in_list = |steps: &[HostStep], list: &str| {
-        steps.iter().enumerate().find_map(|(i, s)| {
+    flat_steps(study)
+        .into_iter()
+        .find_map(|(list, pos, s)| {
             let what = match &s.action {
                 HostAction::Prompt { .. } => "Prompt",
                 HostAction::Instrument { .. } => "Instrument",
-                HostAction::Repeat { .. } => "Repeat",
-                HostAction::Exchange { .. } | HostAction::Wait { .. } => return None,
+                HostAction::Exchange { .. } | HostAction::Wait { .. } | HostAction::Repeat { .. } => return None,
             };
-            Some(format!("{list}[{i}] '{}' is a {what} step, which this Core does not execute yet (only Exchange and Wait)", s.name))
+            Some(format!("{list}[{pos}] '{}' is a {what} step, which this Core does not execute yet (only Exchange, Wait and Repeat)", s.name))
         })
-    };
-    in_list(&study.steps, "steps")
-        .or_else(|| in_list(&study.teardown, "teardown"))
         .or_else(|| {
             study.streams.iter().find_map(|t| {
                 if !matches!(t.encoding, embarch_study_designer::StreamEncoding::Text) {
@@ -347,10 +496,6 @@ fn unsupported(study: &HostStudy) -> Option<String> {
                 }
             })
         })
-        .or_else(|| {
-            (!study.line_counts.is_empty())
-                .then(|| "`line_counts` is not executed by this Core yet: counting is core/116's".to_string())
-        })
 }
 
 /// Everything checkable with no topology and no lock: the study's own rules, then what this Core
@@ -360,19 +505,20 @@ pub fn check_study(study: &HostStudy) -> Result<(), String> {
     if let Some(msg) = unsupported(study) {
         return Err(msg);
     }
-    for (list, steps) in [("steps", &study.steps), ("teardown", &study.teardown)] {
-        for (i, s) in steps.iter().enumerate() {
-            if let HostAction::Exchange { line, until, match_after_echo, .. } = &s.action {
-                let req = ExchangeRequest {
-                    write: format!("{line}\n"),
-                    until: Some(until.clone()),
-                    timeout_ms: s.timeout_ms as u64,
-                    discard_pending: true,
-                    match_after_echo: *match_after_echo,
-                    port_wait_ms: 0,
-                };
-                crate::exchange::check(&req).map_err(|e| format!("{list}[{i}] '{}': {e}", s.name))?;
-            }
+    for (list, pos, s) in flat_steps(study) {
+        if let HostAction::Exchange { until, match_after_echo, .. } = &s.action {
+            // A `{value}` is checked as the first thing it will become.
+            let probe = substitute(s, "1");
+            let HostAction::Exchange { line: probe_line, .. } = &probe.action else { continue };
+            let req = ExchangeRequest {
+                write: format!("{probe_line}\n"),
+                until: Some(until.clone()),
+                timeout_ms: s.timeout_ms as u64,
+                discard_pending: true,
+                match_after_echo: *match_after_echo,
+                port_wait_ms: 0,
+            };
+            crate::exchange::check(&req).map_err(|e| format!("{list}[{pos}] '{}': {e}", s.name))?;
         }
     }
     Ok(())
@@ -380,18 +526,16 @@ pub fn check_study(study: &HostStudy) -> Result<(), String> {
 
 /// Every signal an `Exchange` names must be declared and writable now. Reads enrollment.
 fn check_signals(study: &HostStudy) -> Result<(), String> {
-    for (list, steps) in [("steps", &study.steps), ("teardown", &study.teardown)] {
-        for (i, s) in steps.iter().enumerate() {
-            let HostAction::Exchange { signal, .. } = &s.action else { continue };
-            let link = embarch_topology::hardware::find_signal(signal)
-                .map_err(|e| format!("could not read the signal table: {e:#}"))?
-                .ok_or_else(|| format!("{list}[{i}] '{}': no signal is declared under the name '{signal}'", s.name))?;
-            if !link.host_can_write() {
-                return Err(format!(
-                    "{list}[{i}] '{}': signal '{signal}' is not a direct host-to-dut or bidirectional signal Core may write (embarch-topology decision 37)",
-                    s.name
-                ));
-            }
+    for (list, pos, s) in flat_steps(study) {
+        let HostAction::Exchange { signal, .. } = &s.action else { continue };
+        let link = embarch_topology::hardware::find_signal(signal)
+            .map_err(|e| format!("could not read the signal table: {e:#}"))?
+            .ok_or_else(|| format!("{list}[{pos}] '{}': no signal is declared under the name '{signal}'", s.name))?;
+        if !link.host_can_write() {
+            return Err(format!(
+                "{list}[{pos}] '{}': signal '{signal}' is not a direct host-to-dut or bidirectional signal Core may write (embarch-topology decision 37)",
+                s.name
+            ));
         }
     }
     Ok(())
@@ -433,11 +577,13 @@ impl HostEventsWriter {
     pub fn finish(mut self, end: &RunEnd, streams: &[serde_json::Value]) -> anyhow::Result<()> {
         write!(
             self.file,
-            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"streams\":{}}}",
+            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"streams\":{},\"iterations\":{},\"repeats\":{}}}",
             end.completed,
             serde_json::to_string(&end.reason)?,
             end.teardown_failures,
-            serde_json::to_string(streams)?
+            serde_json::to_string(streams)?,
+            serde_json::to_string(&end.iterations)?,
+            serde_json::to_string(&end.spans)?
         )?;
         self.file.flush()?;
         drop(self.file);
@@ -499,6 +645,8 @@ struct LiveTap {
 /// `streams/<name>.txt`, one record per line, with Core's receive time in `<name>.arrival.csv`
 /// on one monotonic clock shared by all the study's taps. Dropping it stops the captures.
 pub struct StudyTaps {
+    /// The clock every tap stamps with; the run's markers and step times use it too.
+    pub clock: StudyClock,
     captures: crate::capture::CaptureRegistry,
     live: Vec<LiveTap>,
     store: Arc<StdMutex<crate::stream_store::StreamStore>>,
@@ -519,11 +667,10 @@ impl StudyTaps {
         }
         let store = crate::stream_store::StreamStore::create(dir, &study.streams, &[], crate::stream_store::stream_max_bytes())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not create the study's streams/: {e:#}")))?;
-        let mut taps = StudyTaps { captures: captures.clone(), live: vec![], store: Arc::new(StdMutex::new(store)) };
-        // One anchor for the whole study: a tap's stamp is this instant plus the monotonic time
-        // since, so two consoles' lines order against each other without wall-clock steps.
-        let epoch = Instant::now();
-        let epoch_utc = now_ms();
+        let clock = StudyClock::new();
+        let mut taps = StudyTaps { clock, captures: captures.clone(), live: vec![], store: Arc::new(StdMutex::new(store)) };
+        // One anchor for the whole study ([`StudyClock`]), so two consoles' lines order against
+        // each other without wall-clock steps.
         for tap in &study.streams {
             let embarch_study_designer::StreamSource::Signal { name: signal } = &tap.source else { continue };
             let signal = signal.as_str();
@@ -534,7 +681,7 @@ impl StudyTaps {
             let id = tap.id;
             let store = taps.store.clone();
             let sink: crate::capture::Sink = Arc::new(move |bytes: &[u8]| {
-                let stamp = epoch_utc + epoch.elapsed().as_millis() as u64;
+                let stamp = clock.now();
                 let mut st = store.lock().unwrap();
                 // A record per line, so the arrival log gives each its own row.
                 for piece in bytes.split_inclusive(|b| *b == b'\n') {
@@ -636,8 +783,18 @@ pub fn run_job<B: HostBackend>(
             return;
         }
     };
+    // The submitted study is kept beside its record, so a count can be rendered again later.
+    match serde_json::to_vec_pretty(study) {
+        Ok(b) => {
+            if let Err(e) = std::fs::write(dir.join(STUDY_FILE), b) {
+                tracing::warn!("could not keep the submitted study beside its record: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("could not serialise the submitted study: {e}"),
+    }
+    let clock = taps.as_ref().map(|t| t.clock).unwrap_or_else(StudyClock::new);
     let mut write_err: Option<String> = None;
-    let end = execute(study, backend, cancel, |rec| {
+    let end = execute(study, backend, cancel, clock, |rec| {
         if let Err(e) = writer.step(&rec) {
             write_err.get_or_insert(format!("{e:#}"));
         }
@@ -769,6 +926,101 @@ pub async fn post_host_study_handler(
     Ok((StatusCode::ACCEPTED, Json(StudyAcceptedResponse { study_id, status: "accepted" })))
 }
 
+// ---- the per-pass line-count view (core/116) ---------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct LineCountsResponse {
+    study_id: String,
+    line_counts: Vec<crate::host_counts::CountView>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LineCountsBody {
+    line_counts: Vec<embarch_study_designer::LineCount>,
+}
+
+/// Reads one tap's raw bytes and arrival rows (offsets rebased onto what the raw file still holds).
+/// A tap's bytes and its `(byte_offset, core_rx_utc_ms)` rows.
+type TapFiles = (Vec<u8>, Vec<(u64, u64)>);
+
+fn read_tap(streams_dir: &FsPath, name: &str) -> Result<Option<TapFiles>, String> {
+    let index = crate::stream_store::read_index(streams_dir).map_err(|e| format!("{e:#}"))?;
+    let Some(entry) = index.as_ref().and_then(|i| i.find(name)) else { return Ok(None) };
+    let raw = crate::stream_store::read_capture(streams_dir, &entry.raw_file, false).map_err(|e| format!("{e:#}"))?.unwrap_or_default();
+    let Some(arrival) = entry.arrival_file.as_deref() else { return Ok(Some((raw, vec![]))) };
+    let csv = crate::stream_store::read_capture(streams_dir, arrival, true).map_err(|e| format!("{e:#}"))?.unwrap_or_default();
+    let (csv, _) = crate::stream_store::rebase_byte_arrivals(&csv, raw.len() as u64);
+    let rows = String::from_utf8_lossy(&csv)
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.splitn(3, ',');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect();
+    Ok(Some((raw, rows)))
+}
+
+/// Renders `counts` (or the stored study's own) over the finished run in `dir`. Blocking.
+fn render_counts_for(
+    dir: &FsPath,
+    study_id: &str,
+    counts: Option<Vec<embarch_study_designer::LineCount>>,
+) -> Result<LineCountsResponse, (StatusCode, String)> {
+    let study: HostStudy = std::fs::read(dir.join(STUDY_FILE))
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("study '{study_id}' has no {STUDY_FILE}: it is not a host study this Core ran, or was run before Core kept the submitted study")))
+        .and_then(|b| serde_json::from_slice(&b).map_err(internal_err))?;
+    let events: serde_json::Value = std::fs::read(dir.join("events.json"))
+        .map_err(|_| (StatusCode::CONFLICT, format!("study '{study_id}' has not finished: counts are rendered over a finished run")))
+        .and_then(|b| serde_json::from_slice(&b).map_err(internal_err))?;
+    let markers: Vec<embarch_study_designer::IterationMarker> =
+        serde_json::from_value(events.get("iterations").cloned().unwrap_or_default()).unwrap_or_default();
+    let spans: Vec<crate::host_counts::RepeatSpan> =
+        serde_json::from_value(events.get("repeats").cloned().unwrap_or_default()).unwrap_or_default();
+    let counts = counts.unwrap_or_else(|| study.line_counts.clone());
+    for c in &counts {
+        if !study.streams.iter().any(|t| t.name.as_str() == c.tap) {
+            return Err((StatusCode::BAD_REQUEST, format!("count '{}' names tap '{}', which the study does not declare", c.name, c.tap)));
+        }
+    }
+    let streams_dir = dir.join(crate::stream_store::STREAMS_DIR);
+    let mut taps = std::collections::HashMap::new();
+    for c in &counts {
+        if !taps.contains_key(&c.tap) {
+            let t = read_tap(&streams_dir, &c.tap).map_err(|e| internal_err(anyhow::anyhow!(e)))?;
+            taps.insert(c.tap.clone(), t);
+        }
+    }
+    let tap_of = |name: &str| {
+        taps.get(name).and_then(|t| t.as_ref()).map(|(raw, arrivals)| crate::host_counts::TapInput { raw, arrivals })
+    };
+    let line_counts = crate::host_counts::render(&counts, &tap_of, &markers, &spans).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    Ok(LineCountsResponse { study_id: study_id.to_string(), line_counts })
+}
+
+/// `GET /study/{id}/line-counts`: the study's own `line_counts`, counted over the finished run's
+/// raw tap files, per pass and in total. A view: no expected value, no verdict.
+// route: GET /study/{study_id}/line-counts
+pub async fn line_counts_handler(Path(study_id): Path<String>) -> Result<Json<LineCountsResponse>, (StatusCode, String)> {
+    let dir = crate::study::study_results_dir(&study_id).map_err(internal_err)?;
+    tokio::task::spawn_blocking(move || render_counts_for(&dir, &study_id, None)).await.map_err(internal_err)?.map(Json)
+}
+
+/// `POST /study/{id}/line-counts`: the same view with the counts in the body, so a corrected
+/// pattern is counted over the finished run without running the bench again. Nothing is stored.
+// route: POST /study/{study_id}/line-counts
+pub async fn line_counts_rerender_handler(
+    Path(study_id): Path<String>,
+    Json(body): Json<LineCountsBody>,
+) -> Result<Json<LineCountsResponse>, (StatusCode, String)> {
+    let dir = crate::study::study_results_dir(&study_id).map_err(internal_err)?;
+    tokio::task::spawn_blocking(move || render_counts_for(&dir, &study_id, Some(body.line_counts)))
+        .await
+        .map_err(internal_err)?
+        .map(Json)
+}
+
 #[derive(Debug, Serialize)]
 pub struct CancelResponse {
     study_id: String,
@@ -891,7 +1143,7 @@ mod tests {
 
     fn run(s: &HostStudy, b: &mut Script, cancel: &AtomicBool) -> (RunEnd, Vec<StepRecord>) {
         let mut recs = vec![];
-        let end = execute(s, b, cancel, |r| recs.push(r));
+        let end = execute(s, b, cancel, StudyClock::new(), |r| recs.push(r));
         (end, recs)
     }
 
@@ -1051,6 +1303,78 @@ mod tests {
         assert_eq!(cap_reply("short"), ("short".to_string(), false));
     }
 
+    fn repeat_step(name: &str, count: Option<u32>, values: &[&str], inner: Vec<HostStep>) -> HostStep {
+        HostStep {
+            name: name.into(),
+            action: HostAction::Repeat { count, values: values.iter().map(|v| v.to_string()).collect(), steps: inner },
+            timeout_ms: 0,
+            continue_on_fail: false,
+            delay_before_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_repeat_substitutes_the_pass_number_or_the_entry_and_marks_each_pass() {
+        let counted = repeat_step("x3", Some(3), &[], vec![ex("go", "pd hr {value}", "ok"), wait("settle", 1)]);
+        let sweep = repeat_step("sweep", None, &["5", "9"], vec![ex("pps", "pd pps {value}", "ok")]);
+        let s = study(vec![wait("first", 1), counted, sweep], vec![]);
+        let mut b = Script::new(vec![
+            ok_reply("pd hr 1", "ok"),
+            ok_reply("pd hr 2", "ok"),
+            ok_reply("pd hr 3", "ok"),
+            ok_reply("pd pps 5", "ok"),
+            ok_reply("pd pps 9", "ok"),
+        ]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert!(end.completed, "{:?}", end.reason);
+        assert_eq!(b.written, ["pd hr 1\n", "pd hr 2\n", "pd hr 3\n", "pd pps 5\n", "pd pps 9\n"]);
+        // Markers: one per pass, in order, the `values` entry kept and a `count` repeat's `None`.
+        let m: Vec<_> = end.iterations.iter().map(|m| (m.repeat_index, m.pass, m.value.clone())).collect();
+        assert_eq!(m, [(1, 0, None), (1, 1, None), (1, 2, None), (2, 0, Some("5".into())), (2, 1, Some("9".into()))]);
+        assert!(end.iterations.windows(2).all(|w| w[0].started_utc_ms <= w[1].started_utc_ms));
+        // Each inner record is tagged with its pass; a step outside a repeat is not.
+        assert_eq!(recs.len(), 1 + 6 + 2);
+        assert_eq!(recs[0].result.iteration, None);
+        let it = recs[3].result.iteration.as_ref().unwrap();
+        assert_eq!((it.repeat_index, it.pass, recs[3].inner_index), (1, 1, Some(0)));
+        // The marker precedes the pass's first step on one clock; the spans cover their passes.
+        assert!(end.iterations[1].started_utc_ms <= recs[3].started_utc_ms);
+        assert_eq!(end.spans.len(), 2);
+        assert!(end.spans[0].started_utc_ms <= end.iterations[0].started_utc_ms && end.iterations[2].started_utc_ms <= end.spans[0].ended_utc_ms);
+    }
+
+    #[test]
+    fn a_failing_step_in_a_repeat_stops_the_study_and_the_teardown_still_runs() {
+        let rep = repeat_step("x3", Some(3), &[], vec![ex("go", "pd hr {value}", "ok")]);
+        let s = study(vec![rep], vec![ex("down", "pd off", "ok")]);
+        // Pass 1 passes, pass 2 gets no reply.
+        let mut b = Script::new(vec![ok_reply("pd hr 1", "ok"), Ok(vec![]), ok_reply("pd off", "ok")]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert!(!end.completed);
+        assert_eq!(b.written, ["pd hr 1\n", "pd hr 2\n", "pd off\n"]);
+        assert_eq!(end.iterations.len(), 2);
+        assert_eq!(recs.last().unwrap().list, HostList::Teardown);
+        assert_eq!(end.spans.len(), 1);
+    }
+
+    #[test]
+    fn a_cancel_before_a_pass_skips_the_rest_of_the_repeat() {
+        let rep = repeat_step("x4", Some(4), &[], vec![ex("go", "x {value}", "ok")]);
+        let s = study(vec![rep], vec![]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        let mut b = Script::new((1..=4).map(|n| ok_reply(&format!("x {n}"), "ok")).collect());
+        b.before = Box::new(move |n| {
+            if n == 1 {
+                c2.store(true, Ordering::SeqCst);
+            }
+        });
+        let (end, _) = run(&s, &mut b, &cancel);
+        assert!(!end.completed);
+        // Pass 2's exchange ran (the flag was set as it started); pass 3 never began.
+        assert_eq!(end.iterations.len(), 2);
+    }
+
     #[test]
     fn what_this_core_does_not_run_is_refused_by_name_at_submission() {
         let s = study(vec![ex("a", "x", "pd: ")], vec![]);
@@ -1058,13 +1382,16 @@ mod tests {
         let prompt = HostStep { name: "ask".into(), action: HostAction::Prompt { text: "plug in".into() }, timeout_ms: 1000, continue_on_fail: false, delay_before_ms: 0 };
         let e = check_study(&study(vec![ex("a", "x", "pd: "), prompt], vec![])).unwrap_err();
         assert!(e.contains("steps[1] 'ask' is a Prompt step"), "{e}");
-        let repeat = HostStep { name: "loop".into(), action: HostAction::Repeat { count: Some(2), values: vec![], steps: vec![ex("i", "x", "pd: ")] }, timeout_ms: 0, continue_on_fail: false, delay_before_ms: 0 };
-        assert!(check_study(&study(vec![repeat], vec![])).unwrap_err().contains("Repeat"));
+        let repeat = |inner: HostStep| HostStep { name: "loop".into(), action: HostAction::Repeat { count: Some(2), values: vec![], steps: vec![inner] }, timeout_ms: 0, continue_on_fail: false, delay_before_ms: 0 };
+        assert!(check_study(&study(vec![repeat(ex("i", "x {value}", "pd: "))], vec![])).is_ok());
+        let ask = HostStep { name: "ask".into(), action: HostAction::Prompt { text: "plug in".into() }, timeout_ms: 1000, continue_on_fail: false, delay_before_ms: 0 };
+        let e = check_study(&study(vec![repeat(ask)], vec![])).unwrap_err();
+        assert!(e.contains("steps[0.0] 'ask' is a Prompt"), "{e}");
         let e = check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).unwrap_err();
         assert!(e.contains("teardown[0]") && e.contains("Instrument"), "{e}");
         let mut with_counts = study(vec![ex("a", "x", "pd: ")], vec![]);
         with_counts.line_counts.push(embarch_study_designer::host_study::LineCount { name: "n".into(), tap: "t".into(), pattern: "p".into(), kind: Default::default() });
-        // It fails the study's own check first (no such tap); either way it is refused at submission.
+        // A count on a tap the study does not declare is the study's own check.
         assert!(check_study(&with_counts).is_err());
         // An exchange timeout the exchange route would refuse is refused here, by step.
         let mut long = ex("slow", "x", "pd: ");
@@ -1274,7 +1601,7 @@ mod tests {
         };
         let mut b = ViaCapture { captures: captures.clone(), replies: vec![] };
         let mut recs = vec![];
-        let end = execute(&s, &mut b, &AtomicBool::new(false), |r| recs.push(r));
+        let end = execute(&s, &mut b, &AtomicBool::new(false), StudyClock::new(), |r| recs.push(r));
         feeder.join().unwrap();
         assert!(end.completed, "{end:?}");
         assert!(recs.iter().all(|r| matches!(r.result.outcome, Outcome::Pass)), "{recs:?}");
@@ -1386,5 +1713,99 @@ mod tests {
         s.streams[0].encoding = embarch_study_designer::StreamEncoding::Text;
         s.streams[0].scope = embarch_study_designer::StreamScope::Steps { from: 0, to: 0 };
         assert!(check_study(&s).unwrap_err().contains("WholeStudy"));
+    }
+
+    /// The fixture study of `embarch-study-designer` (8 Hard Resets, four patterns, two taps)
+    /// rendered over a canned capture written through the real stream store.
+    #[test]
+    fn the_fixture_study_renders_its_eight_counts_from_the_raw_files() {
+        use crate::host_counts::PassCount;
+        let study: HostStudy = serde_json::from_str(include_str!("../../embarch-study-designer/tests/fixtures/host_pd_hard_reset_counts.json")).unwrap();
+        study.validate().unwrap();
+        assert_eq!(study.line_counts.len(), 8);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STUDY_FILE), serde_json::to_vec(&study).unwrap()).unwrap();
+        // Hard Reset x8: pass k starts at 1000 + 6000 k (repeat 1, ends 49000); PPS sweep: 7 passes
+        // from 49000 every 3000 (repeat 2, ends 70000).
+        let mut iterations = vec![];
+        for k in 0..8u64 {
+            iterations.push(serde_json::json!({"list": "Steps", "repeat_index": 1, "pass": k, "value": null, "started_utc_ms": 1000 + 6000 * k}));
+        }
+        for (k, v) in ["5", "9", "12", "15", "18", "20", "21"].iter().enumerate() {
+            iterations.push(serde_json::json!({"list": "Steps", "repeat_index": 2, "pass": k, "value": v, "started_utc_ms": 49000 + 3000 * k as u64}));
+        }
+        let repeats = serde_json::json!([
+            {"list": "Steps", "repeat_index": 1, "name": "hard reset x8", "started_utc_ms": 1000, "ended_utc_ms": 48999},
+            {"list": "Steps", "repeat_index": 2, "name": "PPS sweep", "started_utc_ms": 49000, "ended_utc_ms": 70000}
+        ]);
+        std::fs::write(
+            dir.path().join("events.json"),
+            serde_json::to_vec(&serde_json::json!({"kind": "host", "study_name": study.name, "steps": [], "iterations": iterations, "repeats": repeats})).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut st = crate::stream_store::StreamStore::create(dir.path(), &study.streams, &[], crate::stream_store::stream_max_bytes()).unwrap();
+            let mut put = |id: u8, t: u64, text: &str| {
+                st.write_raw(id, text.as_bytes());
+                st.note_arrival(id, text.as_bytes(), t, t);
+            };
+            put(0, 100, "pd: Hard Reset (boot)\n"); // before pass 1: outside
+            for k in 0..8u64 {
+                let t = 1000 + 6000 * k;
+                if k == 4 {
+                    // One line in two records: its first byte lands in pass 4, its tail 3.9 s later.
+                    put(0, t + 100, "pd: Hard Re");
+                    put(0, t + 4000, "set received\n");
+                } else {
+                    put(0, t + 100, "pd: Hard Reset received\n");
+                }
+                put(0, t + 1500, "pd: contract in force 5V\n");
+                if k == 2 {
+                    put(0, t + 2000, "pd: rx overrun\n");
+                    put(0, t + 2100, "pd: rx overrun\n");
+                }
+                if k != 2 {
+                    put(1, t + 200, "dut: Hard Reset\n");
+                }
+                put(1, t + 1600, "dut: contract in force\n");
+            }
+            for k in 0..7u64 {
+                put(0, 49000 + 3000 * k + 500, "pd: contract in force 9V\n");
+            }
+            put(1, 80000, "dut: rx message error\n"); // after the last pass: outside
+        }
+        let r = render_counts_for(dir.path(), "s1", None).unwrap();
+        assert_eq!(r.line_counts.len(), 8);
+        let by = |n: &str| r.line_counts.iter().find(|c| c.name == n).unwrap();
+        let passes = |c: &crate::host_counts::CountView, rep: usize| c.repeats[rep].passes.iter().map(|p: &PassCount| p.count).collect::<Vec<_>>();
+
+        let hr = by("Hard Reset (pd-bench console)");
+        // 8 in passes, once each (the split line is one, in pass 4), plus the boot line outside.
+        assert_eq!((hr.total, hr.outside_passes), (9, 1));
+        assert_eq!(passes(hr, 0), [1; 8]);
+        assert_eq!(passes(hr, 1), [0; 7]);
+        // 1 boot + 8 resets + 8 contracts + 2 overruns + 7 PPS contracts.
+        assert_eq!(hr.tap_lines, 26);
+        let cf = by("contract in force (pd-bench console)");
+        assert_eq!((cf.total, cf.outside_passes), (15, 0));
+        assert_eq!((passes(cf, 0), passes(cf, 1)), (vec![1; 8], vec![1; 7]));
+        assert_eq!(cf.repeats[1].passes.iter().map(|p| p.value.clone().unwrap()).collect::<Vec<_>>(), ["5", "9", "12", "15", "18", "20", "21"]);
+        let ov = by("rx overrun (pd-bench console)");
+        assert_eq!((ov.total, passes(ov, 0)), (2, vec![0, 0, 2, 0, 0, 0, 0, 0]));
+        assert_eq!(by("rx message error (pd-bench console)").total, 0);
+        let dh = by("Hard Reset (dut console)");
+        assert_eq!((dh.total, passes(dh, 0)), (7, vec![1, 1, 0, 1, 1, 1, 1, 1]));
+        assert_eq!(by("contract in force (dut console)").total, 8);
+        let de = by("rx message error (dut console)");
+        assert_eq!((de.total, de.outside_passes), (1, 1));
+        assert_eq!(by("rx overrun (dut console)").total, 0);
+
+        // A corrected pattern is counted over the same finished run, no bench needed.
+        let fixed = vec![embarch_study_designer::LineCount { name: "reset, either word order".into(), tap: "pd-bench console".into(), pattern: "Hard Re.*received".into(), kind: embarch_study_designer::PatternKind::Regex }];
+        let r2 = render_counts_for(dir.path(), "s1", Some(fixed)).unwrap();
+        assert_eq!((r2.line_counts[0].total, r2.line_counts[0].outside_passes), (8, 0));
+        // A tap the study never declared is a 400.
+        let bad = vec![embarch_study_designer::LineCount { name: "n".into(), tap: "nope".into(), pattern: "x".into(), kind: Default::default() }];
+        assert_eq!(render_counts_for(dir.path(), "s1", Some(bad)).unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 }

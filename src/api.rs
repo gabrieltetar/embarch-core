@@ -180,6 +180,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study", post(study::post_study_handler))
         .route("/host-studies", post(host_study::post_host_study_handler))
         .route("/study/{study_id}/cancel", post(host_study::cancel_study_handler))
+        .route("/study/{study_id}/line-counts", get(host_study::line_counts_handler).post(host_study::line_counts_rerender_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
@@ -2654,6 +2655,8 @@ mod tests {
         ("POST", "/study", "/study"),
         ("POST", "/host-studies", "/host-studies"),
         ("POST", "/study/{study_id}/cancel", "/study/abc/cancel"),
+        ("GET", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
+        ("POST", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
@@ -2702,7 +2705,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 37;
+    const DOCUMENTED_ROUTE_COUNT: usize = 38;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
