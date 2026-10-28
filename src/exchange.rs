@@ -191,20 +191,21 @@ impl CoreState {
     }
 }
 
-/// The run state of the core behind `role`: looks up the role's probe with `lookup`, then
+/// The run state of the core behind a signal's origin, named `origin` in messages (`role 'dut'`, or a
+/// bench board, topology decision 48): looks up its chip and probe with `lookup`, then
 /// reads `DHCSR` with `read`. Two seams so the no-probe and probe-absent branches are
 /// testable with no probe (decision 85).
 pub fn core_state_for(
-    role: &str,
-    lookup: impl FnOnce(&str) -> Result<Option<(String, String)>>,
+    origin: &str,
+    lookup: impl FnOnce() -> Result<Option<(String, String)>>,
     read: impl FnOnce(&str, &str) -> Result<u32>,
 ) -> CoreState {
-    match lookup(role) {
+    match lookup() {
         Err(e) => CoreState::unavailable(format!("enrollment could not be read: {e:#}")),
-        Ok(None) => CoreState::unavailable(format!("nothing is enrolled under the role '{role}'")),
+        Ok(None) => CoreState::unavailable(format!("nothing is enrolled under {origin}")),
         Ok(Some((chip, probe))) if probe.is_empty() => {
             let _ = chip;
-            CoreState::unavailable(format!("the role '{role}' has no enrolled probe"))
+            CoreState::unavailable(format!("{origin} has no enrolled probe"))
         }
         Ok(Some((chip, probe))) => match read(&chip, &probe) {
             Ok(v) => CoreState::from_dhcsr(v),
@@ -734,13 +735,13 @@ mod tests {
     fn dhcsr_bits_decode_and_the_unavailable_branches_say_why() {
         let c = CoreState::from_dhcsr((1 << 17) | (1 << 25));
         assert_eq!((c.s_halt, c.s_sleep, c.s_lockup, c.s_reset_st, c.s_retire_st), (Some(true), Some(false), Some(false), Some(true), Some(false)));
-        let no_probe = core_state_for("dut", |_| Ok(Some(("stm32g071rb".into(), String::new()))), |_, _| panic!("no probe, no read"));
+        let no_probe = core_state_for("role 'dut'", || Ok(Some(("stm32g071rb".into(), String::new()))), |_, _| panic!("no probe, no read"));
         assert!(no_probe.dhcsr.is_none() && no_probe.unavailable.unwrap().contains("no enrolled probe"));
-        let none = core_state_for("dut", |_| Ok(None), |_, _| panic!("not enrolled, no read"));
+        let none = core_state_for("role 'dut'", || Ok(None), |_, _| panic!("not enrolled, no read"));
         assert!(none.unavailable.unwrap().contains("nothing is enrolled"));
-        let absent = core_state_for("dut", |_| Ok(Some(("c".into(), "SER".into()))), |_, _| anyhow::bail!("no probe attached"));
+        let absent = core_state_for("role 'dut'", || Ok(Some(("c".into(), "SER".into()))), |_, _| anyhow::bail!("no probe attached"));
         assert!(absent.unavailable.unwrap().contains("no probe attached"));
-        let ok = core_state_for("dut", |_| Ok(Some(("c".into(), "SER".into()))), |c, p| {
+        let ok = core_state_for("role 'dut'", || Ok(Some(("c".into(), "SER".into()))), |c, p| {
             assert_eq!((c, p), ("c", "SER"));
             Ok(1 << 18)
         });
@@ -802,6 +803,7 @@ mod tests {
             Err(anyhow::Error::new(SignalAmbiguous {
                 name: "console".into(),
                 origin_role: "dut".into(),
+                origin_board: None,
                 declared_port_serial: "FT9ABCDE".into(),
                 candidates: vec![port("COM15", 0), port("COM17", 2)],
             }))

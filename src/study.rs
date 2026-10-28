@@ -1290,10 +1290,10 @@ async fn run_outpost_preflight(
         .to_string();
 
     // Which board to reset, if it comes to that: the signal's own declared
-    // origin role, not a hardcoded `"dut"`. A bench with two DUTs has two
-    // roles, and the signal is the thing that knows which one this trace
-    // leaves.
-    let origin_role = {
+    // origin, not a hardcoded `"dut"`. A bench with two DUTs has two roles,
+    // a bench board has none (decision 103, `embarch-topology` decision 48),
+    // and the signal is the thing that knows which board this trace leaves.
+    let origin_link = {
         let name = signal_name.clone();
         tokio::task::spawn_blocking(move || embarch_topology::hardware::find_signal(&name))
             .await
@@ -1304,7 +1304,6 @@ async fn run_outpost_preflight(
                     format!("couldn't read the declared route for '{signal_name}': {e:?}"),
                 )
             })?
-            .map(|link| link.origin_role)
     };
 
     let _guard = crate::api::acquire_hw_lock(state, "POST /study outpost pre-flight").await?;
@@ -1312,29 +1311,15 @@ async fn run_outpost_preflight(
     let name_for_read = signal_name.clone();
     let reading = tokio::task::spawn_blocking(move || {
         crate::outpost_preflight::read_header(&name_for_read, || {
-            let Some(role) = origin_role else {
+            let Some(link) = origin_link else {
                 return Err(format!(
-                    "signal '{name_for_read}' has no declared route, so there is no board to                      reset"
+                    "signal '{name_for_read}' has no declared route, so there is no board to reset"
                 ));
             };
-            let board = embarch_topology::hardware::find_enrolled_by_role(&role)
-                .map_err(|e| format!("couldn't read the enrollment for role '{role}': {e:?}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "signal '{name_for_read}' comes out of role '{role}', which is not                          enrolled — so the board carrying this study's outpost cannot be reset                          to get its power-on header (enrol it with POST /probes/enroll)"
-                    )
-                })?;
-            // A role can name a board type and hold no probe (`embarch-ui`
-            // decision 45); resetting needs the probe, so the absence is
-            // named rather than falling through to "no probe attached".
-            let probe_serial = board.probe_serial.as_deref().ok_or_else(|| {
-                format!(
-                    "signal '{name_for_read}' comes out of role '{role}', which holds no probe \
-                     — bind one before a reset can reach that board"
-                )
-            })?;
-            crate::hardware::reset(&board.chip, Some(probe_serial))
-                .map_err(|e| format!("resetting '{role}' to get a power-on header failed: {e:?}"))
+            let found = embarch_topology::hardware::find_signal_origin_board(&link);
+            let (board, origin) = signal_origin_board(&name_for_read, &link, found)?;
+            crate::hardware::reset(&board.chip, Some(board.probe_serial.as_deref().unwrap_or_default()))
+                .map_err(|e| format!("resetting {origin} to get a power-on header failed: {e:?}"))
         })
     })
     .await
@@ -2518,6 +2503,43 @@ impl SignalTapReader {
             let _ = handle.join();
         }
     }
+}
+
+/// The board a reset resolved from a signal reaches (decision 103): the board holding the
+/// signal's role, or the bench board on its probe (`embarch-topology` decision 48), already
+/// looked up as `found`, plus how a message names it — a bench board by its enrolled name and
+/// probe, never by a role it does not hold. A refusal says which origin the signal declares.
+fn signal_origin_board(
+    signal: &str,
+    link: &embarch_topology::hardware::SignalLink,
+    found: anyhow::Result<Option<embarch_topology::hardware::EnrolledBoard>>,
+) -> Result<(embarch_topology::hardware::EnrolledBoard, String), String> {
+    let declared = link.origin().to_string();
+    let board = found
+        .map_err(|e| format!("couldn't read the enrollment for signal '{signal}' ({declared}): {e:?}"))?
+        .ok_or_else(|| {
+            format!(
+                "signal '{signal}' comes out of {declared}, which is not enrolled — so the board \
+                 carrying this study's outpost cannot be reset to get its power-on header (enrol it \
+                 with POST /probes/enroll)"
+            )
+        })?;
+    let origin = match link.origin() {
+        embarch_topology::hardware::SignalOrigin::Role(_) => declared,
+        embarch_topology::hardware::SignalOrigin::Board { probe_serial } => {
+            format!("bench board '{}' (probe '{probe_serial}')", board.name)
+        }
+    };
+    // A role can name a board type and hold no probe (`embarch-ui` decision
+    // 45); resetting needs the probe, so the absence is named rather than
+    // falling through to "no probe attached".
+    if board.probe_serial.is_none() {
+        return Err(format!(
+            "signal '{signal}' comes out of {origin}, which holds no probe — bind one before a reset \
+             can reach that board"
+        ));
+    }
+    Ok((board, origin))
 }
 
 /// `POST /study` pre-flight: refuses `409` a `StreamSource::Signal` tap whose
@@ -7187,6 +7209,43 @@ mod tests {
         assert!(state.study_lock.lock().unwrap().is_none());
         // A different signal is not caught by this check.
         assert!(check_signal_taps_are_not_captured(&tapped("other"), &state.captures).is_ok());
+    }
+
+    /// Decision 103: a reset resolved from a signal reaches the board the signal names, and a
+    /// bench board is named by its enrolled name and probe, never by a role it does not hold.
+    #[test]
+    fn a_signal_origin_resolves_to_its_board_and_names_a_bench_board_by_name() {
+        use embarch_topology::hardware::{EnrolledBoard, Route, SignalDirection, SignalLink};
+        let link = |role: &str, board: Option<&str>| SignalLink {
+            name: "pd-console".into(),
+            origin_role: role.into(),
+            origin_board: board.map(Into::into),
+            direction: SignalDirection::Bidirectional,
+            route: Route::Direct { port_serial: "0671FF".into(), interface: Some(2) },
+            baud: None,
+        };
+        let enrolled = |role: &str, name: &str, probe: Option<&str>| EnrolledBoard {
+            probe_serial: probe.map(Into::into),
+            role: role.into(),
+            name: name.into(),
+            chip: "STM32G071RB".into(),
+            hardware_id: None,
+            confirmed_at_utc_ms: None,
+            link_port_serial: None,
+            link_port_interface: None,
+        };
+        let on_board = link("", Some("0671FF"));
+        let (board, origin) =
+            signal_origin_board("pd-console", &on_board, Ok(Some(enrolled("", "pd-bench", Some("0671FF"))))).unwrap();
+        assert_eq!(board.probe_serial.as_deref(), Some("0671FF"));
+        assert_eq!(origin, "bench board 'pd-bench' (probe '0671FF')");
+        let gone = signal_origin_board("pd-console", &on_board, Ok(None)).unwrap_err();
+        assert!(gone.contains("bench board on probe '0671FF'") && !gone.contains("role"), "{gone}");
+        let (_, by_role) =
+            signal_origin_board("console", &link("dut", None), Ok(Some(enrolled("dut", "nff", Some("0008"))))).unwrap();
+        assert_eq!(by_role, "role 'dut'");
+        let unbound = signal_origin_board("console", &link("dut", None), Ok(Some(enrolled("dut", "nff", None)))).unwrap_err();
+        assert!(unbound.contains("role 'dut', which holds no probe"), "{unbound}");
     }
 
     /// While hello holds the link, a study is refused `409` naming hello.

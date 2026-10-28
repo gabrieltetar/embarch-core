@@ -1580,6 +1580,20 @@ async fn signal_exchange_handler(
         .map(Json)
 }
 
+/// The run state of the core a signal leaves (decision 85), found through the signal's own
+/// origin: the board holding its role, or a bench board by its probe (decision 103,
+/// `embarch-topology` decision 48).
+fn signal_origin_core_state(link: &embarch_topology::hardware::SignalLink) -> crate::exchange::CoreState {
+    crate::exchange::core_state_for(
+        &link.origin().to_string(),
+        || {
+            Ok(embarch_topology::hardware::find_signal_origin_board(link)?
+                .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
+        },
+        crate::live::read_dhcsr,
+    )
+}
+
 /// The exchange route's whole blocking body, with `hw_lock` already held by the caller: the
 /// signal lookup, the writable check, a running capture's open handle or a fresh port, and the
 /// exchange itself. `POST /host-studies` runs every `Exchange` step through this same function
@@ -1606,33 +1620,14 @@ pub(crate) fn run_signal_exchange(
             ),
         ));
     }
-    let role = link.origin_role.clone();
     // A capture owns the port: the exchange goes through its open handle (decision 92).
     if let Some(cap) = captures.running(name) {
-        let role = role.clone();
+        let link = link.clone();
         return cap
-            .exchange(req, move || {
-                crate::exchange::core_state_for(
-                    &role,
-                    |r| {
-                        Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
-                            .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
-                    },
-                    crate::live::read_dhcsr,
-                )
-            })
+            .exchange(req, move || signal_origin_core_state(&link))
             .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")));
     }
-    let core_state = || {
-        crate::exchange::core_state_for(
-            &role,
-            |r| {
-                Ok(embarch_topology::hardware::find_enrolled_by_role(r)?
-                    .map(|b| (b.chip.clone(), b.probe_serial.clone().unwrap_or_default())))
-            },
-            crate::live::read_dhcsr,
-        )
-    };
+    let core_state = || signal_origin_core_state(&link);
     let port = match crate::exchange::resolve_port_waiting(name, req.port_wait_ms) {
         Ok(p) => p,
         Err(e) => {
@@ -1794,12 +1789,13 @@ async fn stop_capture_handler(
 
 // ---- POST /live/mem-read --------------------------------------------------
 
-/// Reads words of a role's target memory over its enrolled probe, halting a
+/// Reads words of a board's target memory over its enrolled probe — the board named by role,
+/// or by `probe_serial` for any enrolled board, a bench board included (decision 103) — halting a
 /// running core for the read and letting it run again (decision 81). See
 /// [`crate::live`].
 ///
 /// `400` for a request [`crate::live::check`] refuses, before `hw_lock`;
-/// `404` when nothing is enrolled under the role; `409` when the role's board
+/// `404` when nothing is enrolled under the role or probe; `409` when the role's board
 /// was enrolled without a probe. A refused identity gate maps the way
 /// `/reset`'s does. Takes `hw_lock`: it opens the probe, like `/reset`.
 // route: POST /live/mem-read
@@ -1811,20 +1807,36 @@ async fn live_mem_read_handler(
     let _guard = acquire_hw_lock(&state, "POST /live/mem-read").await?;
 
     tokio::task::spawn_blocking(move || {
-        let board = embarch_topology::hardware::find_enrolled_by_role(&req.role)
-            .map_err(internal_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("nothing is enrolled under the role '{}'", req.role)))?;
-        let probe_serial = board.probe_serial.clone().ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                format!("the role '{}' has a board type but no enrolled probe to read through", req.role),
-            )
-        })?;
+        let target = crate::live::target(&req.role, &req.probe_serial).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let (board, probe_serial) = live_target_board(target)?;
         crate::live::run(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
     })
     .await
     .map_err(internal_err)?
     .map(Json)
+}
+
+/// The enrolled board and probe a live read reaches, by role or by probe serial (decision 103):
+/// `404` when nothing is enrolled there, `409` when a role's board holds no probe. The read
+/// itself still passes the identity gate on that probe, whichever way it was named.
+fn live_target_board(
+    target: crate::live::Target<'_>,
+) -> Result<(embarch_topology::hardware::EnrolledBoard, String), (StatusCode, String)> {
+    let (found, named) = match target {
+        crate::live::Target::Role(role) => {
+            (embarch_topology::hardware::find_enrolled_by_role(role), format!("the role '{role}'"))
+        }
+        crate::live::Target::Probe(probe) => {
+            (embarch_topology::hardware::find_enrolled_by_probe(probe), format!("the probe '{probe}'"))
+        }
+    };
+    let board = found
+        .map_err(internal_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("nothing is enrolled under {named}")))?;
+    let probe_serial = board.probe_serial.clone().ok_or_else(|| {
+        (StatusCode::CONFLICT, format!("{named} has a board type but no enrolled probe to read through"))
+    })?;
+    Ok((board, probe_serial))
 }
 
 // ---- POST /live/core-state -------------------------------------------------
@@ -1841,15 +1853,8 @@ async fn live_core_state_handler(
     let _guard = acquire_hw_lock(&state, "POST /live/core-state").await?;
 
     tokio::task::spawn_blocking(move || {
-        let board = embarch_topology::hardware::find_enrolled_by_role(&req.role)
-            .map_err(internal_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("nothing is enrolled under the role '{}'", req.role)))?;
-        let probe_serial = board.probe_serial.clone().ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                format!("the role '{}' has a board type but no enrolled probe to read through", req.role),
-            )
-        })?;
+        let target = crate::live::target(&req.role, &req.probe_serial).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let (board, probe_serial) = live_target_board(target)?;
         crate::live::run_core_state(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
     })
     .await
@@ -1932,9 +1937,25 @@ async fn dev_bench_port_handler(
 /// response can carry `validated_at_utc_ms` — the instant *this* call's
 /// check passed — alongside the unchanged `confirmed_at_utc_ms` from the
 /// enrolled record (`embarch-core` decision below).
+///
+/// Exactly one of `role` and `probe_serial` (decision 103): a probe serial
+/// validates any enrolled board, a bench board included, through the same
+/// identity gate a role reaches.
 #[derive(Deserialize)]
 struct ValidateRequest {
-    role: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    probe_serial: Option<String>,
+}
+
+/// What a `POST /validate` names, refused `400` before `hw_lock` unless it is
+/// exactly one of the two.
+fn validate_target(req: &ValidateRequest) -> Result<crate::live::Target<'_>, (StatusCode, String)> {
+    match (req.role.as_deref(), req.probe_serial.as_deref()) {
+        (None, None) => Err((StatusCode::BAD_REQUEST, "name the board by role or by probe_serial".to_string())),
+        _ => crate::live::target(&req.role, &req.probe_serial).map_err(|e| (StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 #[derive(Serialize)]
@@ -2032,12 +2053,22 @@ async fn validate_handler(
     State(state): State<AppState>,
     Json(req): Json<ValidateRequest>,
 ) -> Result<Response, (StatusCode, String)> {
+    validate_target(&req)?;
     let _guard = acquire_hw_lock(&state, "POST /validate").await?;
-    let role = req.role;
 
-    let result = tokio::task::spawn_blocking(move || embarch_topology::hardware::validate_role_timed(&role))
-        .await
-        .map_err(internal_err)?;
+    let result = tokio::task::spawn_blocking(move || match validate_target(&req)? {
+        crate::live::Target::Role(role) => Ok(embarch_topology::hardware::validate_role_timed(role)),
+        crate::live::Target::Probe(probe) => {
+            // `validate_serial_timed` refuses an unenrolled probe as plain
+            // text; ask first, so it is the same `404` a role answers.
+            if embarch_topology::hardware::find_enrolled_by_probe(probe).map_err(internal_err)?.is_none() {
+                return Err((StatusCode::NOT_FOUND, format!("no board is enrolled on probe '{probe}'")));
+            }
+            Ok(embarch_topology::hardware::validate_serial_timed(probe))
+        }
+    })
+    .await
+    .map_err(internal_err)??;
 
     match result {
         Ok(validation) => {
@@ -2218,6 +2249,19 @@ mod tests {
         }
     }
 
+    /// Decision 103: `POST /validate` takes exactly one of `role` and `probe_serial`, refused
+    /// `400` otherwise, and a body naming only `role` (every caller before this) reads as before.
+    #[test]
+    fn validate_names_a_board_by_exactly_one_of_role_and_probe_serial() {
+        let req = |body: &str| serde_json::from_str::<ValidateRequest>(body).unwrap();
+        assert_eq!(validate_target(&req(r#"{"role":"dev-bench"}"#)).unwrap(), crate::live::Target::Role("dev-bench"));
+        assert_eq!(validate_target(&req(r#"{"probe_serial":"0671FF"}"#)).unwrap(), crate::live::Target::Probe("0671FF"));
+        let neither = validate_target(&req("{}")).unwrap_err();
+        assert_eq!(neither.0, StatusCode::BAD_REQUEST);
+        let both = validate_target(&req(r#"{"role":"dut","probe_serial":"0671FF"}"#)).unwrap_err();
+        assert!(both.0 == StatusCode::BAD_REQUEST && both.1.contains("not both"), "{both:?}");
+    }
+
     #[test]
     fn enroll_response_omits_vacated_fields_when_nothing_moved() {
         let v = serde_json::to_value(enroll_response(board("dut", "P1"), Default::default()))
@@ -2313,6 +2357,7 @@ mod tests {
         embarch_topology::hardware::SignalLink {
             name: "s".to_string(),
             origin_role: "dut".to_string(),
+            origin_board: None,
             direction,
             route,
             baud: None,

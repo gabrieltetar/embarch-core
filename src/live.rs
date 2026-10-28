@@ -41,15 +41,39 @@ pub struct Range {
 
 #[derive(Debug, Deserialize)]
 pub struct MemReadRequest {
-    /// The enrolled role whose probe and chip are used.
-    #[serde(default = "default_role")]
-    pub role: String,
+    /// The enrolled role whose probe and chip are used; the DUT when neither
+    /// this nor `probe_serial` is named.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Any enrolled board by its probe serial, a bench board included
+    /// (decision 103). Exclusive with `role`.
+    #[serde(default)]
+    pub probe_serial: Option<String>,
     /// Read in order, all under one halt, so they are one snapshot.
     pub ranges: Vec<Range>,
 }
 
-fn default_role() -> String {
-    embarch_topology::hardware::DUT_ROLE.to_string()
+/// Which enrolled board a live read reaches (decision 103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// The board holding a role.
+    Role(&'a str),
+    /// The board enrolled on a probe — a role's or a bench board's
+    /// (`embarch-topology` decision 41).
+    Probe(&'a str),
+}
+
+/// The board a request names: by `role` or by `probe_serial`, never both, and
+/// the DUT's role when it names neither — the default every caller had before
+/// `probe_serial` existed.
+pub fn target<'a>(role: &'a Option<String>, probe_serial: &'a Option<String>) -> Result<Target<'a>, String> {
+    match (role.as_deref(), probe_serial.as_deref()) {
+        (Some(_), Some(_)) => Err("name the board by role or by probe_serial, not both".to_string()),
+        (_, Some(p)) if p.trim().is_empty() => Err("probe_serial is empty".to_string()),
+        (_, Some(p)) => Ok(Target::Probe(p)),
+        (Some(r), None) => Ok(Target::Role(r)),
+        (None, None) => Ok(Target::Role(embarch_topology::hardware::DUT_ROLE)),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +156,7 @@ const S_HALT: u32 = 1 << 17;
 
 /// Refuses a request before any hardware is touched.
 pub fn check(req: &MemReadRequest) -> Result<(), String> {
+    target(&req.role, &req.probe_serial)?;
     if req.ranges.is_empty() || req.ranges.len() > MAX_RANGES {
         return Err(format!("ranges must hold 1 to {MAX_RANGES} ranges, got {}", req.ranges.len()));
     }
@@ -244,9 +269,13 @@ pub const MAX_SAMPLES: u32 = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct CoreStateRequest {
-    /// The enrolled role whose probe and chip are used.
-    #[serde(default = "default_role")]
-    pub role: String,
+    /// The enrolled role whose probe and chip are used; as
+    /// [`MemReadRequest::role`].
+    #[serde(default)]
+    pub role: Option<String>,
+    /// As [`MemReadRequest::probe_serial`] (decision 103).
+    #[serde(default)]
+    pub probe_serial: Option<String>,
     /// Stop the core once and read its registers; the default never halts.
     #[serde(default)]
     pub halt: bool,
@@ -261,6 +290,7 @@ fn default_samples() -> u32 {
 
 /// Refuses a request before any hardware is touched.
 pub fn check_core_state(req: &CoreStateRequest) -> Result<(), String> {
+    target(&req.role, &req.probe_serial)?;
     if req.samples == 0 || req.samples > MAX_SAMPLES {
         return Err(format!("samples must be 1 to {MAX_SAMPLES}, got {}", req.samples));
     }
@@ -373,7 +403,7 @@ pub fn read_core_state(
     let dhcsr = Dhcsr::decode(core.read_word(DHCSR).context("failed to read DHCSR")?);
     let found = RunState::of(dhcsr.s_halt);
     let mut out = CoreStateResponse {
-        role: req.role.clone(),
+        role: String::new(),
         chip: String::new(),
         probe_serial: String::new(),
         found,
@@ -473,7 +503,8 @@ mod tests {
 
     fn req(ranges: &[(u64, u32)]) -> MemReadRequest {
         MemReadRequest {
-            role: "dut".into(),
+            role: Some("dut".into()),
+            probe_serial: None,
             ranges: ranges.iter().map(|&(address, words)| Range { address, words }).collect(),
         }
     }
@@ -500,8 +531,27 @@ mod tests {
     fn the_role_defaults_to_the_dut() {
         let r: MemReadRequest =
             serde_json::from_str(r#"{"ranges": [{"address": 1073877052, "words": 1}]}"#).unwrap();
-        assert_eq!(r.role, "dut");
+        assert_eq!(target(&r.role, &r.probe_serial), Ok(Target::Role("dut")));
         assert_eq!(r.ranges[0].address, 0x4002_103C);
+    }
+
+    /// Decision 103: a probe serial names any enrolled board, a bench board
+    /// included; naming both a role and a probe is a 400 before any lock.
+    #[test]
+    fn a_probe_serial_names_the_board_and_excludes_a_role() {
+        let r: MemReadRequest = serde_json::from_str(
+            r#"{"probe_serial": "0671FF", "ranges": [{"address": 536870912, "words": 1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(target(&r.role, &r.probe_serial), Ok(Target::Probe("0671FF")));
+        assert!(check(&r).is_ok());
+        let both: MemReadRequest = serde_json::from_str(
+            r#"{"role": "dut", "probe_serial": "0671FF", "ranges": [{"address": 536870912, "words": 1}]}"#,
+        )
+        .unwrap();
+        assert!(check(&both).unwrap_err().contains("not both"));
+        let state: CoreStateRequest = serde_json::from_str(r#"{"probe_serial": " "}"#).unwrap();
+        assert!(check_core_state(&state).unwrap_err().contains("empty"));
     }
 
     /// A scripted core: answers by address, counts halts and resumes.
@@ -563,13 +613,13 @@ mod tests {
     }
 
     fn state_req(halt: bool, samples: u32) -> CoreStateRequest {
-        CoreStateRequest { role: "dut".into(), halt, samples }
+        CoreStateRequest { role: Some("dut".into()), probe_serial: None, halt, samples }
     }
 
     #[test]
     fn core_state_requests_are_checked_and_default_to_no_halt() {
         let r: CoreStateRequest = serde_json::from_str("{}").unwrap();
-        assert_eq!((r.role.as_str(), r.halt, r.samples), ("dut", false, 8));
+        assert_eq!((target(&r.role, &r.probe_serial), r.halt, r.samples), (Ok(Target::Role("dut")), false, 8));
         assert!(check_core_state(&r).is_ok());
         assert!(check_core_state(&state_req(false, 0)).unwrap_err().contains("samples must be"));
         assert!(check_core_state(&state_req(true, MAX_SAMPLES + 1)).unwrap_err().contains("samples must be"));
