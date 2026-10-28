@@ -1393,6 +1393,10 @@ pub async fn post_study_handler(
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
+    // A tap on a signal a decision 92 capture holds open would be refused by
+    // the OS only after the flash and reset (core decision 102).
+    check_signal_taps_are_not_captured(&study, &state.captures)?;
+
     // A `StreamSource::Signal` tap names a signal `embarch-topology` has to
     // have a declared route for before Core can open anything
     // (`embarch-topology` decision 18) — a wire between two
@@ -2514,6 +2518,31 @@ impl SignalTapReader {
             let _ = handle.join();
         }
     }
+}
+
+/// `POST /study` pre-flight: refuses `409` a `StreamSource::Signal` tap whose
+/// signal a running capture owns (decision 92), naming both, before the lock,
+/// the flash or the reset. The same lookup `GET /serial-log` uses (decision 101).
+fn check_signal_taps_are_not_captured(
+    study: &Study,
+    captures: &crate::capture::CaptureRegistry,
+) -> Result<(), (StatusCode, String)> {
+    for tap in study.streams.iter() {
+        if let StreamSource::Signal { name } = &tap.source {
+            let name = name.as_str();
+            if captures.running(name).is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "tap '{}' reads signal '{name}', which a running capture owns; \
+                         stop it with DELETE /signals/{name}/capture, or read it with GET /signals/{name}/capture",
+                        tap.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `POST /study` pre-flight for every `StreamSource::Signal` tap: the signal
@@ -7138,6 +7167,26 @@ mod tests {
             .unwrap_err();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(msg.contains("POST /flash"), "got: {msg}");
+    }
+
+    /// Core decision 102: a tap on a captured signal is a `409` before any lock, flash or reset.
+    #[tokio::test]
+    async fn a_study_tapping_a_captured_signal_is_refused_409_before_taking_the_lock() {
+        let state = AppState::new("t".to_string());
+        let _cap = crate::capture::start_fake(&state.captures, "console", b"x\n");
+        let tapped = |sig: &str| study_with_taps(&[1000], &[tap(
+            0,
+            "log",
+            StreamSource::Signal { name: heapless::String::try_from(sig).unwrap() },
+            embarch_study_designer::StreamEncoding::Text,
+        )]);
+        let Err(err) = post_study_handler(State(state.clone()), Query(StudyRunParams::default()), Json(tapped("console"))).await
+        else { panic!("must be refused") };
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("'console'") && err.1.contains("capture"), "got: {}", err.1);
+        assert!(state.study_lock.lock().unwrap().is_none());
+        // A different signal is not caught by this check.
+        assert!(check_signal_taps_are_not_captured(&tapped("other"), &state.captures).is_ok());
     }
 
     /// While hello holds the link, a study is refused `409` naming hello.
