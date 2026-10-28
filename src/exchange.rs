@@ -298,7 +298,7 @@ pub fn exchange<P: Read + Write>(
 /// Writes all of `write` within `deadline`: a `TimedOut`, `WouldBlock`, `Interrupted` or
 /// zero-length write is a throttled device, not a failure, and is retried from the byte
 /// count the port reported. Past the deadline it fails with the count of bytes written.
-fn write_with_deadline<P: Write>(
+pub(crate) fn write_with_deadline<P: Write>(
     port: &mut P,
     write: &[u8],
     deadline: Instant,

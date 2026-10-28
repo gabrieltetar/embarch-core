@@ -30,6 +30,7 @@ use tokio::sync::broadcast;
 
 use crate::api::{internal_err, AppState};
 use crate::exchange::{ExchangeRequest, ExchangeResponse};
+use embarch_topology::hardware::{Ack, InstrumentExchange, InstrumentReply};
 use crate::host_counts::RepeatSpan;
 use crate::study::{JobRegistry, StudyAcceptedResponse, StudyEvent, StudyJob};
 
@@ -53,6 +54,15 @@ pub mod detail {
     pub const EXCHANGE_FAILED: &str = "exchange_failed";
     pub const WAITED: &str = "waited";
     pub const CANCELLED: &str = "cancelled";
+    /// An `Instrument` query got a whole reply line.
+    pub const REPLIED: &str = "replied";
+    /// An `Instrument` set answered the instrument's declared `ack_ok`.
+    pub const ACKNOWLEDGED: &str = "acknowledged";
+    /// An `Instrument` set's reply held neither declared acknowledgement, or nothing came back:
+    /// the set is not known to have been carried out (decision 104).
+    pub const UNACKNOWLEDGED: &str = "unacknowledged";
+    /// An `Instrument` set on an instrument that declares no acknowledgement: written, not read.
+    pub const WRITTEN: &str = "written";
 }
 
 /// Why a backend could not run an exchange at all (nothing, or not all of the line, was written).
@@ -67,6 +77,8 @@ pub enum ExchangeFailure {
 /// What an `Exchange` step runs against. The real one is [`CoreBackend`]; tests script a port.
 pub trait HostBackend {
     fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure>;
+    /// One command to a declared instrument (decision 104).
+    fn instrument(&mut self, name: &str, req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure>;
 }
 
 /// One step as the run recorded it: the study-designer result plus what Core saw.
@@ -199,6 +211,47 @@ fn judge(resp: &ExchangeResponse, refused_on: Option<&str>, timeout_ms: u32) -> 
     )
 }
 
+/// The outcome of an `Instrument` step (decision 104). A query passes on a whole reply line; a
+/// set passes on the declared `ack_ok`, or on the write alone when the instrument declares none.
+/// **An unacknowledged set fails**: the action was not carried out as far as anyone can tell.
+fn judge_instrument(r: &InstrumentReply, timeout_ms: u32) -> (Outcome, &'static str, Option<String>) {
+    if r.query {
+        return if r.terminated {
+            (Outcome::Pass, detail::REPLIED, None)
+        } else if r.reply.is_empty() {
+            (
+                fail("empty reply: the query got nothing back"),
+                detail::EMPTY_REPLY,
+                Some(format!("'{}' was written and nothing came back within {timeout_ms} ms", r.line)),
+            )
+        } else {
+            (
+                Outcome::TimedOut,
+                detail::UNTIL_NOT_SEEN,
+                Some(format!("part of a reply came back but no line end within {timeout_ms} ms")),
+            )
+        };
+    }
+    match r.ack {
+        None => (Outcome::Pass, detail::WRITTEN, None),
+        Some(Ack::Ok) => (Outcome::Pass, detail::ACKNOWLEDGED, None),
+        Some(Ack::Refused) => (
+            fail("refused: the instrument answered its ack_err"),
+            detail::REFUSED,
+            Some(format!("'{}' answered '{}'", r.line, r.reply)),
+        ),
+        Some(Ack::Unacknowledged) => (
+            fail("unacknowledged: the set was not confirmed"),
+            detail::UNACKNOWLEDGED,
+            Some(if r.reply.is_empty() {
+                format!("'{}' got no answer within {timeout_ms} ms", r.line)
+            } else {
+                format!("'{}' answered '{}', which is neither declared acknowledgement", r.line, r.reply)
+            }),
+        ),
+    }
+}
+
 /// Runs one step to a record. `cancel` is `None` in teardown.
 fn run_step<B: HostBackend>(
     step: &HostStep,
@@ -275,6 +328,32 @@ fn run_step<B: HostBackend>(
                     }
                     Err(ExchangeFailure::Failed(msg)) => {
                         rec.result.outcome = fail("the exchange failed before a reply");
+                        rec.detail = detail::EXCHANGE_FAILED;
+                        rec.note = Some(msg);
+                    }
+                }
+            }
+            HostAction::Instrument { instrument, line, query } => {
+                let req = InstrumentExchange { line: line.clone(), query: *query, timeout_ms: step.timeout_ms as u64, port_wait_ms: 0 };
+                match backend.instrument(instrument, req) {
+                    Ok(r) => {
+                        let (outcome, d, note) = judge_instrument(&r, step.timeout_ms);
+                        let (reply, cut) = cap_reply(&r.reply);
+                        rec.result.outcome = outcome;
+                        rec.result.reply = reply;
+                        rec.result.reply_truncated = cut;
+                        rec.detail = d;
+                        rec.note = note;
+                        rec.reply_bytes = r.reply.len();
+                        rec.until_seen = r.terminated;
+                    }
+                    Err(ExchangeFailure::PortUnavailable(msg)) => {
+                        rec.result.outcome = fail("the instrument's port is not available");
+                        rec.detail = detail::PORT_UNAVAILABLE;
+                        rec.note = Some(msg);
+                    }
+                    Err(ExchangeFailure::Failed(msg)) => {
+                        rec.result.outcome = fail("the instrument command failed before a reply");
                         rec.detail = detail::EXCHANGE_FAILED;
                         rec.note = Some(msg);
                     }
@@ -471,19 +550,22 @@ fn flat_steps(study: &HostStudy) -> Vec<(&'static str, String, &HostStep)> {
     out
 }
 
-/// What this Core does not execute yet, by name. `Prompt` and `Instrument` are later units of the
-/// host-study proposal (also inside a `Repeat`); `streams` is accepted for `Text` + `WholeStudy`
-/// taps only.
+/// What this Core does not execute yet, by name. `Prompt` is a later unit of the host-study
+/// proposal (also inside a `Repeat`); `streams` is accepted for `Text` + `WholeStudy` taps only.
 fn unsupported(study: &HostStudy) -> Option<String> {
     flat_steps(study)
         .into_iter()
         .find_map(|(list, pos, s)| {
             let what = match &s.action {
                 HostAction::Prompt { .. } => "Prompt",
-                HostAction::Instrument { .. } => "Instrument",
-                HostAction::Exchange { .. } | HostAction::Wait { .. } | HostAction::Repeat { .. } => return None,
+                HostAction::Exchange { .. } | HostAction::Instrument { .. } | HostAction::Wait { .. } | HostAction::Repeat { .. } => {
+                    return None
+                }
             };
-            Some(format!("{list}[{pos}] '{}' is a {what} step, which this Core does not execute yet (only Exchange, Wait and Repeat)", s.name))
+            Some(format!(
+                "{list}[{pos}] '{}' is a {what} step, which this Core does not execute yet (only Exchange, Instrument, Wait and Repeat)",
+                s.name
+            ))
         })
         .or_else(|| {
             study.streams.iter().find_map(|t| {
@@ -520,12 +602,28 @@ pub fn check_study(study: &HostStudy) -> Result<(), String> {
             };
             crate::exchange::check(&req).map_err(|e| format!("{list}[{pos}] '{}': {e}", s.name))?;
         }
+        if let HostAction::Instrument { query, .. } = &s.action {
+            let probe = substitute(s, "1");
+            let HostAction::Instrument { line: probe_line, .. } = &probe.action else { continue };
+            let req = InstrumentExchange { line: probe_line.clone(), query: *query, timeout_ms: s.timeout_ms as u64, port_wait_ms: 0 };
+            crate::instrument::check(&req).map_err(|e| format!("{list}[{pos}] '{}': {e}", s.name))?;
+        }
     }
     Ok(())
 }
 
-/// Every signal an `Exchange` names must be declared and writable now. Reads enrollment.
+/// Every signal an `Exchange` names must be declared and writable now, and every instrument an
+/// `Instrument` step names must be declared (decision 104). Reads enrollment.
 fn check_signals(study: &HostStudy) -> Result<(), String> {
+    for (list, pos, s) in flat_steps(study) {
+        let HostAction::Instrument { instrument, .. } = &s.action else { continue };
+        if embarch_topology::hardware::instrument::get(instrument)
+            .map_err(|e| format!("could not read the instrument table: {e:#}"))?
+            .is_none()
+        {
+            return Err(format!("{list}[{pos}] '{}': no instrument is declared under the name '{instrument}'", s.name));
+        }
+    }
     for (list, pos, s) in flat_steps(study) {
         let HostAction::Exchange { signal, .. } = &s.action else { continue };
         let link = embarch_topology::hardware::find_signal(signal)
@@ -854,6 +952,17 @@ impl HostBackend for CoreBackend {
             _ => ExchangeFailure::Failed(msg),
         })
     }
+
+    fn instrument(&mut self, name: &str, req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure> {
+        let _guard = self
+            .handle
+            .block_on(crate::api::acquire_hw_lock(&self.state, "POST /host-studies"))
+            .map_err(|(_, msg)| ExchangeFailure::Failed(msg))?;
+        crate::api::run_instrument_exchange(name, req).map_err(|(status, msg)| match status {
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => ExchangeFailure::PortUnavailable(msg),
+            _ => ExchangeFailure::Failed(msg),
+        })
+    }
 }
 
 /// Releases the study lock and the cancel slot when the job's thread ends, however it ends.
@@ -1067,6 +1176,7 @@ mod tests {
         /// Called with the count of exchanges so far, before each runs (to cancel mid-run).
         before: Box<dyn FnMut(usize)>,
         calls: usize,
+        instrument_replies: VecDeque<InstrumentScript>,
     }
 
     struct Port {
@@ -1098,9 +1208,12 @@ mod tests {
 
     impl Script {
         fn new(replies: Vec<Result<Vec<u8>, ExchangeFailure>>) -> Self {
-            Script { replies: replies.into(), written: vec![], before: Box::new(|_| {}), calls: 0 }
+            Script { replies: replies.into(), written: vec![], before: Box::new(|_| {}), calls: 0, instrument_replies: VecDeque::new() }
         }
     }
+
+    /// A scripted instrument answer: `(reply, terminated, ack)`, or a failure.
+    type InstrumentScript = Result<(&'static str, bool, Option<Ack>), ExchangeFailure>;
 
     impl HostBackend for Script {
         fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure> {
@@ -1121,6 +1234,95 @@ mod tests {
             self.written.push(String::from_utf8(port.wrote).unwrap());
             Ok(crate::exchange::response(signal, "FAKE", 115_200, 1, 1, got, || None, || crate::exchange::CoreState::unavailable("test")))
         }
+
+        fn instrument(&mut self, name: &str, req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure> {
+            self.written.push(format!("{name}: {}", req.line));
+            let (reply, terminated, ack) = self.instrument_replies.pop_front().unwrap_or(Ok(("", false, None)))?;
+            Ok(InstrumentReply {
+                instrument: name.into(),
+                port: "FAKE".into(),
+                baud: 9600,
+                line: req.line,
+                query: req.query,
+                reply: reply.into(),
+                terminated,
+                ack,
+                flush_reply: String::new(),
+                paced_ms: 0,
+                elapsed_ms: 1,
+                started_utc_ms: 1,
+            })
+        }
+    }
+
+    fn inst(name: &str, line: &str, query: bool) -> HostStep {
+        HostStep {
+            name: name.into(),
+            action: HostAction::Instrument { instrument: "eload".into(), line: line.into(), query },
+            timeout_ms: 500,
+            continue_on_fail: true,
+            delay_before_ms: 0,
+        }
+    }
+
+    #[test]
+    fn instrument_steps_pass_on_a_reply_or_an_ack_and_fail_unacknowledged() {
+        let s = study(
+            vec![
+                inst("idn", "*IDN?", true),
+                inst("on", "CH1:SW ON", false),
+                inst("bad", "CH1:SW MAYBE", false),
+                inst("refused", "VOLT1:VMAX 999", false),
+                inst("quiet", "MEAS1:ALL?", true),
+                inst("plain", "SYST:LOCA", false),
+                inst("gone", "*IDN?", true),
+            ],
+            vec![],
+        );
+        assert!(check_study(&s).is_ok());
+        let mut b = Script::new(vec![]);
+        b.instrument_replies = VecDeque::from([
+            Ok(("R ET5420A+", true, None)),
+            Ok(("Rexecu success", true, Some(Ack::Ok))),
+            Ok(("Rcmd err", true, Some(Ack::Unacknowledged))),
+            Ok(("Rexecu err", true, Some(Ack::Refused))),
+            Ok(("", false, None)),
+            Ok(("", false, None)),
+            Err(ExchangeFailure::PortUnavailable("instrument 'eload' is not enumerated now".into())),
+        ]);
+        let (_, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        let got: Vec<(&str, bool)> = recs.iter().map(|r| (r.detail, matches!(r.result.outcome, Outcome::Pass))).collect();
+        assert_eq!(
+            got,
+            vec![
+                (detail::REPLIED, true),
+                (detail::ACKNOWLEDGED, true),
+                (detail::UNACKNOWLEDGED, false),
+                (detail::REFUSED, false),
+                (detail::EMPTY_REPLY, false),
+                (detail::WRITTEN, true),
+                (detail::PORT_UNAVAILABLE, false),
+            ]
+        );
+        // The reply is recorded raw, prefix included; nothing is parsed.
+        assert_eq!(recs[0].result.reply, "R ET5420A+");
+        assert!(recs[2].note.as_deref().unwrap().contains("Rcmd err"));
+        assert_eq!(b.written[0], "eload: *IDN?");
+    }
+
+    #[test]
+    fn an_instrument_step_is_checked_at_submission_and_takes_a_value() {
+        let repeat = HostStep {
+            name: "loads".into(),
+            action: HostAction::Repeat { count: None, values: vec!["1".into(), "2".into()], steps: vec![inst("set", "CURR1 {value}", false)] },
+            timeout_ms: 0,
+            continue_on_fail: false,
+            delay_before_ms: 0,
+        };
+        assert!(check_study(&study(vec![repeat], vec![])).is_ok());
+        // Two commands in one line: the study's own check refuses the control character first,
+        // and `instrument::check` would refuse it after.
+        assert!(check_study(&study(vec![inst("two", "A\nB", false)], vec![])).is_err());
     }
 
     fn ex(name: &str, line: &str, until: &str) -> HostStep {
@@ -1387,8 +1589,8 @@ mod tests {
         let ask = HostStep { name: "ask".into(), action: HostAction::Prompt { text: "plug in".into() }, timeout_ms: 1000, continue_on_fail: false, delay_before_ms: 0 };
         let e = check_study(&study(vec![repeat(ask)], vec![])).unwrap_err();
         assert!(e.contains("steps[0.0] 'ask' is a Prompt"), "{e}");
-        let e = check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).unwrap_err();
-        assert!(e.contains("teardown[0]") && e.contains("Instrument"), "{e}");
+        // An Instrument step runs now (decision 104); only Prompt is still refused by name.
+        assert!(check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).is_ok());
         let mut with_counts = study(vec![ex("a", "x", "pd: ")], vec![]);
         with_counts.line_counts.push(embarch_study_designer::host_study::LineCount { name: "n".into(), tap: "t".into(), pattern: "p".into(), kind: Default::default() });
         // A count on a tap the study does not declare is the study's own check.
@@ -1540,6 +1742,10 @@ mod tests {
             let r = cap.exchange(req, || crate::exchange::CoreState::unavailable("test")).map_err(|e| ExchangeFailure::Failed(format!("{e:#}")))?;
             self.replies.push((signal.to_string(), r.text.clone()));
             Ok(r)
+        }
+
+        fn instrument(&mut self, _name: &str, _req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure> {
+            Err(ExchangeFailure::Failed("no instrument in this test".into()))
         }
     }
 

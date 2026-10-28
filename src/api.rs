@@ -170,6 +170,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/signals/{name}", delete(remove_signal_handler))
         .route("/signals/{name}/exchange", post(signal_exchange_handler))
         .route("/signals/{name}/capture", post(start_capture_handler).get(read_capture_handler).delete(stop_capture_handler))
+        .route("/instruments", put(declare_instrument_handler).get(list_instruments_handler))
+        .route("/instruments/{name}", delete(remove_instrument_handler))
+        .route("/instruments/{name}/exchange", post(instrument_exchange_handler))
         .route("/live/mem-read", post(live_mem_read_handler))
         .route("/live/core-state", post(live_core_state_handler))
         .route("/serial-ports", get(serial_ports_handler))
@@ -1643,6 +1646,111 @@ pub(crate) fn run_signal_exchange(
     crate::exchange::run(name, &port, baud, &req, core_state).map_err(internal_err)
 }
 
+// ---- /instruments -------------------------------------------------------------
+
+/// Every declared instrument (decision 104). A plain file read.
+// route: GET /instruments
+async fn list_instruments_handler() -> Result<Json<Vec<embarch_topology::hardware::Instrument>>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(embarch_topology::hardware::instrument::list)
+        .await
+        .map_err(internal_err)?
+        .map(Json)
+        .map_err(internal_err)
+}
+
+/// Declares an instrument, or replaces the one of the same name. `400` for a
+/// declaration `embarch-topology` decision 49 refuses — a malformed name or
+/// terminator, or a port identity one live port could match together with
+/// another instrument's. Takes `hw_lock` as an enrollment-file writer, like
+/// `PUT /bootload/ports`.
+// route: PUT /instruments
+async fn declare_instrument_handler(
+    State(state): State<AppState>,
+    Json(inst): Json<embarch_topology::hardware::Instrument>,
+) -> Result<Json<embarch_topology::hardware::Instrument>, (StatusCode, String)> {
+    inst.check().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let _guard = acquire_hw_lock(&state, "PUT /instruments").await?;
+    let stored = inst.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), (StatusCode, String)> {
+        let others = embarch_topology::hardware::instrument::list().map_err(internal_err)?;
+        embarch_topology::hardware::instrument::check_against(&stored, &others).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        embarch_topology::hardware::instrument::declare(stored).map_err(internal_err)
+    })
+    .await
+    .map_err(internal_err)??;
+    Ok(Json(inst))
+}
+
+/// Retracts one: `204`, or `404` when nothing is declared under `name`.
+// route: DELETE /instruments/{name}
+async fn remove_instrument_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _guard = acquire_hw_lock(&state, "DELETE /instruments/{name}").await?;
+    let what = name.clone();
+    let removed = tokio::task::spawn_blocking(move || embarch_topology::hardware::instrument::remove(&what))
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no instrument is declared under the name '{name}'")))
+    }
+}
+
+/// One command to a declared instrument and its reply (decision 104; see
+/// [`crate::instrument`]). `400` for a request [`crate::instrument::check`]
+/// refuses, before any lock; `409` while a study holds the bench, so a manual
+/// command cannot land between a study's own steps; `404` when nothing is
+/// declared under `name`; `409` when its port is not enumerated, or its
+/// identity matches more than one port. Takes `hw_lock`.
+// route: POST /instruments/{name}/exchange
+async fn instrument_exchange_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<embarch_topology::hardware::InstrumentExchange>,
+) -> Result<Json<embarch_topology::hardware::InstrumentReply>, (StatusCode, String)> {
+    crate::instrument::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if let Some(holder) = state.study_lock.lock().unwrap().clone() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("{holder} holds the bench; an instrument command now would land between its steps"),
+        ));
+    }
+    let _guard = acquire_hw_lock(&state, "POST /instruments/{name}/exchange").await?;
+    tokio::task::spawn_blocking(move || run_instrument_exchange(&name, req))
+        .await
+        .map_err(internal_err)?
+        .map(Json)
+}
+
+/// The instrument route's blocking body, with `hw_lock` already held by the
+/// caller. A host study's `Instrument` step runs through this same function,
+/// so a step and the route cannot disagree about an instrument.
+pub(crate) fn run_instrument_exchange(
+    name: &str,
+    req: embarch_topology::hardware::InstrumentExchange,
+) -> Result<embarch_topology::hardware::InstrumentReply, (StatusCode, String)> {
+    let inst = embarch_topology::hardware::instrument::get(name)
+        .map_err(internal_err)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no instrument is declared under the name '{name}'")))?;
+    let port = crate::instrument::find_port_waiting(&inst, req.port_wait_ms)
+        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "instrument '{name}' ({}) is not enumerated now{}; it is declared, so check it is plugged in and powered",
+                    inst.port,
+                    if req.port_wait_ms > 0 { format!(" after waiting {} ms", req.port_wait_ms) } else { String::new() }
+                ),
+            )
+        })?;
+    crate::instrument::run(&inst, &port, &req).map_err(internal_err)
+}
+
 // ---- /signals/{name}/capture ------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -2834,6 +2942,10 @@ mod tests {
         ("POST", "/signals/{name}/capture", "/signals/console/capture"),
         ("GET", "/signals/{name}/capture", "/signals/console/capture"),
         ("DELETE", "/signals/{name}/capture", "/signals/console/capture"),
+        ("PUT", "/instruments", "/instruments"),
+        ("GET", "/instruments", "/instruments"),
+        ("DELETE", "/instruments/{name}", "/instruments/eload"),
+        ("POST", "/instruments/{name}/exchange", "/instruments/eload/exchange"),
         ("POST", "/live/mem-read", "/live/mem-read"),
         ("POST", "/live/core-state", "/live/core-state"),
         ("GET", "/serial-ports", "/serial-ports"),
@@ -2894,7 +3006,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 38;
+    const DOCUMENTED_ROUTE_COUNT: usize = 41;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {

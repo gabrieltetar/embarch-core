@@ -8,6 +8,7 @@ mod elevate;
 mod exchange;
 mod flash_backend;
 mod hardware;
+mod instrument;
 mod host_counts;
 mod host_study;
 mod lease;
