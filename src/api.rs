@@ -964,11 +964,17 @@ async fn clear_bootload_ports_handler(
 
 #[derive(Deserialize)]
 struct SerialLogQuery {
-    port: String,
-    #[serde(default = "default_baud")]
-    baud: u32,
+    /// A COM/tty name. Exactly one of `port` / `signal` (decision 101).
+    port: Option<String>,
+    /// A declared signal, resolved to its port's current name at request time.
+    signal: Option<String>,
+    /// `port` form: default 115200. `signal` form: the signal's own baud unless given (override).
+    baud: Option<u32>,
     #[serde(default = "default_duration_ms")]
     duration_ms: u64,
+    /// `signal` form only: how long to wait for the port to enumerate (decision 79's wait).
+    #[serde(default)]
+    port_wait_ms: u64,
 }
 
 fn default_baud() -> u32 {
@@ -981,6 +987,7 @@ fn default_duration_ms() -> u64 {
 
 #[derive(Debug, Serialize)]
 struct SerialLogResponse {
+    /// The port actually opened (for `signal`, the name it resolved to).
     port: String,
     lines: Vec<String>,
     /// `true` when the capture hit `serial::serial_log_max_bytes()` before
@@ -989,36 +996,88 @@ struct SerialLogResponse {
     truncated: bool,
 }
 
+/// Request-shape checks for `GET /serial-log`, before `hw_lock` (decision 101).
+fn check_serial_log(q: &SerialLogQuery) -> Result<(), (StatusCode, String)> {
+    let bad = |m: String| Err((StatusCode::BAD_REQUEST, m));
+    if q.port.is_some() == q.signal.is_some() {
+        return bad("give exactly one of `port` (a COM/tty name) or `signal` (a declared signal's name); got ".to_string()
+            + if q.port.is_some() { "both" } else { "neither" });
+    }
+    if q.duration_ms > serial::MAX_DURATION_MS {
+        return bad(format!("duration_ms={} exceeds the cap of {} ms", q.duration_ms, serial::MAX_DURATION_MS));
+    }
+    if q.port_wait_ms > crate::exchange::MAX_TIMEOUT_MS {
+        return bad(format!("port_wait_ms={} is above {}", q.port_wait_ms, crate::exchange::MAX_TIMEOUT_MS));
+    }
+    Ok(())
+}
+
+/// The signal form's rate: an explicit `baud` is an override, else the signal's own.
+fn serial_log_signal_baud(over: Option<u32>, link: &embarch_topology::hardware::SignalLink) -> u32 {
+    over.unwrap_or_else(|| crate::stream_store::signal_baud_for(link))
+}
+
+/// `Ok` when Core may read this signal: a `direct` route whose direction carries bytes toward
+/// the host. A pure `host-to-dut` signal has nothing to read; a `via-dev-bench` route has no
+/// port Core opens (decision 101).
+fn check_signal_readable(name: &str, link: &embarch_topology::hardware::SignalLink) -> Result<(), (StatusCode, String)> {
+    use embarch_topology::hardware::{Route, SignalDirection};
+    if matches!(link.route, Route::ViaDevBench { .. }) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("signal '{name}' is on a via-dev-bench route; Core reads only a direct signal's port"),
+        ));
+    }
+    if link.direction == SignalDirection::HostToDut {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("signal '{name}' is declared host-to-dut; there is nothing to read on it (dut-to-host or bidirectional only)"),
+        ));
+    }
+    Ok(())
+}
+
 // route: GET /serial-log
 async fn serial_log_handler(
     State(state): State<AppState>,
     Query(q): Query<SerialLogQuery>,
 ) -> Result<Json<SerialLogResponse>, (StatusCode, String)> {
-    if q.duration_ms > serial::MAX_DURATION_MS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "duration_ms={} exceeds the cap of {} ms",
-                q.duration_ms,
-                serial::MAX_DURATION_MS
-            ),
-        ));
-    }
+    check_serial_log(&q)?;
 
     let _guard = acquire_hw_lock(&state, "GET /serial-log").await?;
 
-    let port = q.port.clone();
-    let baud = q.baud;
     let duration_ms = q.duration_ms;
     let max_bytes = serial::serial_log_max_bytes();
+    let captures = state.captures.clone();
 
-    let result = tokio::task::spawn_blocking(move || serial::read_log(&port, baud, duration_ms, max_bytes))
-        .await
-        .map_err(internal_err)?
-        .map_err(internal_err)?;
+    let (port, result) = tokio::task::spawn_blocking(move || {
+        let (port, baud) = match (q.port, q.signal) {
+            (Some(port), _) => (port, q.baud.unwrap_or_else(default_baud)),
+            (None, Some(name)) => {
+                let link = embarch_topology::hardware::find_signal(&name)
+                    .map_err(internal_err)?
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
+                check_signal_readable(&name, &link)?;
+                if captures.running(&name).is_some() {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("a capture is running on signal '{name}' and owns its port; read it with GET /signals/{name}/capture"),
+                    ));
+                }
+                let detected = crate::exchange::resolve_port_waiting(&name, q.port_wait_ms)
+                    .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+                (detected.port_name, serial_log_signal_baud(q.baud, &link))
+            }
+            (None, None) => unreachable!("check_serial_log refuses neither"),
+        };
+        let result = serial::read_log(&port, baud, duration_ms, max_bytes).map_err(internal_err)?;
+        Ok((port, result))
+    })
+    .await
+    .map_err(internal_err)??;
 
     Ok(Json(SerialLogResponse {
-        port: q.port,
+        port,
         lines: result.lines,
         truncated: result.truncated,
     }))
@@ -2189,14 +2248,96 @@ mod tests {
         // matter.
         let state = AppState::new("t".to_string());
         let q = SerialLogQuery {
-            port: "COM_NONEXISTENT".to_string(),
-            baud: default_baud(),
+            port: Some("COM_NONEXISTENT".to_string()),
+            signal: None,
+            baud: None,
             duration_ms: serial::MAX_DURATION_MS + 1,
+            port_wait_ms: 0,
         };
         let err = serial_log_handler(State(state), Query(q)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains(&serial::MAX_DURATION_MS.to_string()));
         assert!(err.1.contains(&(serial::MAX_DURATION_MS + 1).to_string()));
+    }
+
+    fn slq(port: Option<&str>, signal: Option<&str>) -> SerialLogQuery {
+        SerialLogQuery {
+            port: port.map(String::from),
+            signal: signal.map(String::from),
+            baud: None,
+            duration_ms: 100,
+            port_wait_ms: 0,
+        }
+    }
+
+    #[test]
+    fn serial_log_both_or_neither_of_port_and_signal_is_a_bad_request_naming_both() {
+        for q in [slq(Some("COM1"), Some("s")), slq(None, None)] {
+            let e = check_serial_log(&q).unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            assert!(e.1.contains("`port`") && e.1.contains("`signal`"), "{}", e.1);
+        }
+        assert!(check_serial_log(&slq(Some("COM1"), None)).is_ok());
+        assert!(check_serial_log(&slq(None, Some("s"))).is_ok());
+    }
+
+    #[test]
+    fn serial_log_port_wait_above_the_cap_is_a_bad_request() {
+        let mut q = slq(None, Some("s"));
+        q.port_wait_ms = crate::exchange::MAX_TIMEOUT_MS;
+        assert!(check_serial_log(&q).is_ok());
+        q.port_wait_ms += 1;
+        let e = check_serial_log(&q).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1.contains("port_wait_ms"));
+    }
+
+    #[tokio::test]
+    async fn serial_log_signal_with_nothing_declared_is_404_naming_it() {
+        // Reads the enrollment dir; an unlikely-to-exist name is undeclared on any machine.
+        let state = AppState::new("t".to_string());
+        let mut q = slq(None, Some("no-such-signal-zz9"));
+        q.port_wait_ms = 0;
+        let e = serial_log_handler(State(state), Query(q)).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        assert!(e.1.contains("no-such-signal-zz9"));
+    }
+
+    fn link(direction: embarch_topology::hardware::SignalDirection, direct: bool) -> embarch_topology::hardware::SignalLink {
+        use embarch_topology::hardware::Route;
+        let route = if direct {
+            Route::Direct { port_serial: "S".to_string(), interface: None }
+        } else {
+            Route::ViaDevBench { rx_pin: "P0".to_string(), tx_pin: "P1".to_string() }
+        };
+        embarch_topology::hardware::SignalLink {
+            name: "s".to_string(),
+            origin_role: "dut".to_string(),
+            direction,
+            route,
+            baud: None,
+        }
+    }
+
+    #[test]
+    fn signal_readable_needs_a_direct_route_and_a_direction_toward_the_host() {
+        use embarch_topology::hardware::SignalDirection::*;
+        assert!(check_signal_readable("s", &link(DutToHost, true)).is_ok());
+        assert!(check_signal_readable("s", &link(Bidirectional, true)).is_ok());
+        let e = check_signal_readable("s", &link(HostToDut, true)).unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.contains("host-to-dut"));
+        let e = check_signal_readable("s", &link(DutToHost, false)).unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.contains("via-dev-bench"));
+    }
+
+    #[test]
+    fn serial_log_baud_override_wins_over_the_signals_own() {
+        let mut l = link(embarch_topology::hardware::SignalDirection::DutToHost, true);
+        l.baud = Some(921_600);
+        assert_eq!(serial_log_signal_baud(None, &l), 921_600);
+        assert_eq!(serial_log_signal_baud(Some(9600), &l), 9600);
     }
 
     #[tokio::test]
@@ -2206,9 +2347,11 @@ mod tests {
         // behavior this change must not disturb.
         let state = AppState::new("t".to_string());
         let q = SerialLogQuery {
-            port: "COM_NONEXISTENT".to_string(),
-            baud: default_baud(),
+            port: Some("COM_NONEXISTENT".to_string()),
+            signal: None,
+            baud: None,
             duration_ms: serial::MAX_DURATION_MS,
+            port_wait_ms: 0,
         };
         let err = serial_log_handler(State(state), Query(q)).await.unwrap_err();
         // Not the cap's own message — it got past validation and failed
