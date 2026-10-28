@@ -130,14 +130,6 @@ const SCB_ICSR: u64 = 0xE000_ED04;
 const DWT_PCSR: u64 = 0xE000_101C;
 const S_HALT: u32 = 1 << 17;
 
-/// How many halts the identity gate makes before this request's own. The gate reads an STM32G0's
-/// UID with the core halted, and only when it found the core running (`embarch-topology`
-/// `hardware_id.rs`, `read_halted`); every other family reads its ID without halting. Mirrors
-/// topology's `Stm32G0Uid` arm by chip prefix: assumed, not asked of topology (decision 97).
-pub fn gate_halts(chip: &str, found: RunState) -> u32 {
-    u32::from(chip.to_ascii_lowercase().starts_with("stm32g0") && found == RunState::Running)
-}
-
 /// Refuses a request before any hardware is touched.
 pub fn check(req: &MemReadRequest) -> Result<(), String> {
     if req.ranges.is_empty() || req.ranges.len() > MAX_RANGES {
@@ -208,15 +200,16 @@ pub fn read_ranges(core: &mut impl CoreAccess, req: &MemReadRequest) -> Result<R
 }
 
 /// Opens the role's probe behind the identity gate and the guarded attach, and hands the core to
-/// `f` together with the number of halts the gate made.
+/// `f` together with the number of halts the gate made (`Validation.halts`, topology decision 47).
 fn with_core<T>(
     chip: &str,
     probe_serial: &str,
     owner: &str,
-    f: impl FnOnce(&mut probe_rs::Core<'_>, &dyn Fn(RunState) -> u32) -> Result<T>,
+    f: impl FnOnce(&mut probe_rs::Core<'_>, u32) -> Result<T>,
 ) -> Result<T> {
-    embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip)
-        .context("board-identity gate refused this read")?;
+    let gate_halts = embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip)
+        .context("board-identity gate refused this read")?
+        .halts;
     let mut probe = crate::hardware::open_probe(Some(probe_serial), owner)?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't read")?;
     // Guarded attach (decision 80): probe-rs's own ARMv6 STM32 sequence would read-modify-write
@@ -224,16 +217,14 @@ fn with_core<T>(
     let mut session = embarch_topology::hardware::attach::attach(probe, chip, Permissions::default())
         .with_context(|| format!("failed to attach to target '{chip}'"))?;
     let mut core = session.core(0).context("failed to select core 0")?;
-    let chip = chip.to_string();
-    f(&mut core, &move |found| gate_halts(&chip, found))
+    f(&mut core, gate_halts)
 }
 
 /// The read itself, behind the same board-identity gate as `/flash` and `/reset`.
 pub fn run(chip: &str, probe_serial: &str, role: &str, req: &MemReadRequest) -> Result<MemReadResponse> {
     let (out, gate) = with_core(chip, probe_serial, "mem-read", |core, gate| {
         let out = read_ranges(core, req)?;
-        let g = gate(out.found);
-        Ok((out, g))
+        Ok((out, gate))
     })?;
     Ok(MemReadResponse {
         role: role.to_string(),
@@ -351,8 +342,7 @@ pub struct CoreStateResponse {
     pub probe_serial: String,
     pub found: RunState,
     pub left: RunState,
-    /// Every halt this request made, the identity gate's included; 0 in the default mode on a
-    /// non-STM32G0 or an already-halted core.
+    /// Every halt this request made, the identity gate's (`Validation.halts`) included.
     pub halt_count: u32,
     /// How long this request's own halt lasted; 0 when it made none.
     pub halted_us: u64,
@@ -374,22 +364,21 @@ pub struct CoreStateResponse {
 
 /// Where the core is. Default: `DHCSR`, then `DWT_PCSR` samples, no halt. `halt`: one halt (none
 /// when the core was already halted), the registers and `SCB_ICSR`, then back to the state found.
-/// `gate` is how many halts the identity gate made.
+/// `gate` is how many halts the identity gate made (`Validation.halts`).
 pub fn read_core_state(
     core: &mut impl CoreAccess,
     req: &CoreStateRequest,
-    gate: impl FnOnce(RunState) -> u32,
+    gate: u32,
 ) -> Result<CoreStateResponse> {
     let dhcsr = Dhcsr::decode(core.read_word(DHCSR).context("failed to read DHCSR")?);
     let found = RunState::of(dhcsr.s_halt);
-    let gate_halts = gate(found);
     let mut out = CoreStateResponse {
         role: req.role.clone(),
         chip: String::new(),
         probe_serial: String::new(),
         found,
         left: found,
-        halt_count: gate_halts,
+        halt_count: gate,
         halted_us: 0,
         dhcsr,
         dhcsr_after: None,
@@ -590,7 +579,7 @@ mod tests {
     #[test]
     fn default_mode_never_halts_and_samples_the_pc() {
         let mut core = Fake::new(false);
-        let out = read_core_state(&mut core, &state_req(false, 3), |f| gate_halts("stm32g0b1ve", f)).unwrap();
+        let out = read_core_state(&mut core, &state_req(false, 3), 1).unwrap();
         assert_eq!((core.halts, core.runs), (0, 0));
         assert_eq!((out.found, out.left), (RunState::Running, RunState::Running));
         assert_eq!(out.pc_samples, vec![Some(0x0800_1234), Some(0x0800_1236), None]);
@@ -599,14 +588,23 @@ mod tests {
         // the gate's halt on an STM32G0 is the only one, and the response says so
         assert_eq!(out.halt_count, 1);
         assert!(out.registers.is_none() && out.scb_icsr.is_none());
-        let nrf = read_core_state(&mut Fake::new(false), &state_req(false, 1), |f| gate_halts("nrf54l15", f)).unwrap();
+        let nrf = read_core_state(&mut Fake::new(false), &state_req(false, 1), 0).unwrap();
         assert_eq!(nrf.halt_count, 0);
+    }
+
+    #[test]
+    fn whatever_the_gate_reports_reaches_halt_count() {
+        // a family the old chip-prefix inference never covered (Nordic last-resort halted read)
+        let out = read_core_state(&mut Fake::new(false), &state_req(false, 1), 1).unwrap();
+        assert_eq!(out.halt_count, 1);
+        let out = read_core_state(&mut Fake::new(false), &state_req(true, 1), 1).unwrap();
+        assert_eq!(out.halt_count, 2);
     }
 
     #[test]
     fn default_mode_on_a_halted_core_samples_nothing() {
         let mut core = Fake::new(true);
-        let out = read_core_state(&mut core, &state_req(false, 4), |f| gate_halts("stm32g0b1ve", f)).unwrap();
+        let out = read_core_state(&mut core, &state_req(false, 4), 0).unwrap();
         assert_eq!((out.found, out.left, out.halt_count), (RunState::Halted, RunState::Halted, 0));
         assert!(out.pc_samples.is_empty() && out.pc_note.unwrap().contains("halted"));
         assert_eq!(out.dhcsr.state, "halted");
@@ -616,14 +614,14 @@ mod tests {
     fn a_part_without_pc_sampling_says_so() {
         let mut core = Fake::new(false);
         core.pcsr_err = true;
-        let out = read_core_state(&mut core, &state_req(false, 4), |_| 0).unwrap();
+        let out = read_core_state(&mut core, &state_req(false, 4), 0).unwrap();
         assert!(out.pc_samples.is_empty() && out.pc_note.unwrap().contains("DWT_PCSR"));
     }
 
     #[test]
     fn running_halted_let_run_counts_the_gate_and_the_read() {
         let mut core = Fake::new(false);
-        let out = read_core_state(&mut core, &state_req(true, 1), |f| gate_halts("STM32G0B1VE", f)).unwrap();
+        let out = read_core_state(&mut core, &state_req(true, 1), 1).unwrap();
         assert_eq!(core.log, vec!["halt", "run"]);
         assert_eq!((out.found, out.left), (RunState::Running, RunState::Running));
         assert_eq!(out.halt_count, 2);
@@ -637,7 +635,7 @@ mod tests {
     #[test]
     fn found_halted_is_left_halted_without_a_resume() {
         let mut core = Fake::new(true);
-        let out = read_core_state(&mut core, &state_req(true, 1), |f| gate_halts("stm32g0b1ve", f)).unwrap();
+        let out = read_core_state(&mut core, &state_req(true, 1), 0).unwrap();
         assert_eq!((core.halts, core.runs), (0, 0));
         assert_eq!((out.found, out.left, out.halt_count, out.halted_us), (RunState::Halted, RunState::Halted, 0, 0));
         assert!(out.registers.is_some());
@@ -647,7 +645,7 @@ mod tests {
     fn a_failed_register_read_still_lets_the_core_run() {
         let mut core = Fake::new(false);
         core.fail_reg = Some(5);
-        let err = read_core_state(&mut core, &state_req(true, 1), |_| 0).unwrap_err();
+        let err = read_core_state(&mut core, &state_req(true, 1), 0).unwrap_err();
         assert!(format!("{err:#}").contains("R5"));
         assert_eq!(core.log, vec!["halt", "run"]);
     }
