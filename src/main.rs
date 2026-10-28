@@ -41,7 +41,11 @@ pub(crate) const DEFAULT_PORT: u16 = 4884;
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1";
 
 #[derive(Parser)]
-#[command(name = "embarch-core", version)]
+// `--version` names the commit this binary was built from (decision 100); the
+// stamp is `build.rs`, shared with `embarch-api` and `embarch-umbrella`
+// (`embarch-umbrella` decision 57). The crate version stays the first field
+// after the name, which is what `embarch doctor` reads.
+#[command(name = "embarch-core", version = env!("EMBARCH_BUILD_VERSION"))]
 #[command(about = "EmbArch Core — the OS-level service that talks to debug/flash hardware")]
 struct Cli {
     #[command(subcommand)]

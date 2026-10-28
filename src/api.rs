@@ -387,9 +387,10 @@ struct StatusResponse {
     /// processes undetected — which is exactly the failure the split was
     /// made to prevent.
     study_designer_schema_version: u32,
-    /// This Core binary's own crate version — `CARGO_PKG_VERSION`, the same
-    /// string `embarch-core --version` prints, resolved at compile time
-    /// (decision 13, amended 2026-09-03).
+    /// This Core binary's own crate version — `CARGO_PKG_VERSION`, the
+    /// version field of `embarch-core --version`'s line (which also names the
+    /// commit since decision 100; this field does not), resolved at compile
+    /// time (decision 13, amended 2026-09-03).
     ///
     /// **Mechanical on purpose.** The version was reachable only by running
     /// the binary, so nothing talking to Core *over HTTP* could say which
