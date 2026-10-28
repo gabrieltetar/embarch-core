@@ -179,6 +179,11 @@ pub struct StudyJobResponse {
     pub total_steps: Option<u32>,
     pub result: Option<serde_json::Value>,
     pub reason: Option<String>,
+    /// A running host study's unanswered `Prompt` (decision 105), absent otherwise. Here as well
+    /// as on the event stream because the stream keeps no replay: a subscriber that connects after
+    /// `PromptPending` was sent finds the prompt only here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_prompt: Option<crate::host_study::PendingPrompt>,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,6 +391,22 @@ pub enum StudyEvent {
         started_utc_ms: u64,
         ended_utc_ms: u64,
         delay_before_ms: u32,
+    },
+    /// A host study's `Prompt` step is waiting for a person (decision 105). Also readable as
+    /// `pending_prompt` on `GET /study/{id}`, because this stream keeps no replay.
+    PromptPending {
+        study_id: String,
+        #[serde(flatten)]
+        prompt: crate::host_study::PendingPrompt,
+    },
+    /// The pending prompt ended: `answer` is `confirmed`, `cancelled`, `timed_out` or
+    /// `study_cancelled`, and `answered_by` names the surface for the first two.
+    PromptResolved {
+        study_id: String,
+        prompt_id: u32,
+        answer: &'static str,
+        answered_by: Option<crate::host_study::AnsweredBy>,
+        resolved_utc_ms: u64,
     },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
@@ -3446,12 +3467,14 @@ pub async fn get_study_handler(
         None
     };
 
+    let pending_prompt = crate::host_study::pending_prompt(&state.host_prompt, &study_id);
     Ok(Json(StudyJobResponse {
         status: job.status,
         current_step: job.current_step,
         total_steps: job.total_steps,
         result,
         reason: job.reason,
+        pending_prompt,
     }))
 }
 
@@ -3514,6 +3537,7 @@ fn study_response_from_dir(
         total_steps: None,
         result,
         reason,
+        pending_prompt: None,
     }))
 }
 
@@ -3596,6 +3620,8 @@ fn event_study_id(event: &StudyEvent) -> &str {
         | StudyEvent::OutpostRows { study_id, .. }
         | StudyEvent::StructChartValue { study_id, .. }
         | StudyEvent::HostStepCompleted { study_id, .. }
+        | StudyEvent::PromptPending { study_id, .. }
+        | StudyEvent::PromptResolved { study_id, .. }
         | StudyEvent::StatusChanged { study_id, .. } => study_id,
     }
 }
@@ -5452,6 +5478,7 @@ mod tests {
             total_steps: job.total_steps,
             result: None,
             reason: None,
+            pending_prompt: None,
         })
         .unwrap();
         assert_eq!(body["current_step"], serde_json::json!(1));

@@ -282,6 +282,9 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     // Counts lines of files already on disk: no port, no hardware (core/116).
     ("GET", "/study/{study_id}/line-counts"),
     ("POST", "/study/{study_id}/line-counts"),
+    // A person's answer to a prompt, from whichever surface is in front of them; the prompt id,
+    // not the lease, keeps a stale answer off a later prompt (decision 105).
+    ("POST", "/study/{study_id}/prompt"),
     ("POST", "/lease"),
     ("GET", "/lease"),
     ("PUT", "/lease"),

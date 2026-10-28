@@ -1,5 +1,9 @@
-//! `POST /host-studies`, `POST /study/{id}/cancel`: a study Core runs itself, one `Exchange` or
-//! `Wait` step at a time (decision 95).
+//! `POST /host-studies`, `POST /study/{id}/cancel`, `POST /study/{id}/prompt`: a study Core runs
+//! itself, one `Exchange`, `Instrument`, `Wait` or `Prompt` step at a time (decisions 95, 104, 105).
+//!
+//! **A `Prompt` waits for a person and nothing else** (decision 105): it publishes the prompt
+//! (`PromptPending`, and `pending_prompt` on `GET /study/{id}` since SSE keeps no replay), and the
+//! step ends on an answer from `POST /study/{id}/prompt`, its deadline, or a cancel of the study.
 //!
 //! **A host study is the same bytes as the exchange route, in a sequence.** An `Exchange` step
 //! goes through [`crate::api::run_signal_exchange`], the body of `POST /signals/{name}/exchange`,
@@ -20,7 +24,7 @@ use embarch_study_designer::{
     limits::{MAX_FAIL_REASON_LEN, MAX_HOST_REPLY_LEN},
     HostAction, HostList, HostStep, HostStepResult, HostStudy, IterationMarker, IterationRef, Outcome, VALUE_PLACEHOLDER,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +67,177 @@ pub mod detail {
     pub const UNACKNOWLEDGED: &str = "unacknowledged";
     /// An `Instrument` set on an instrument that declares no acknowledgement: written, not read.
     pub const WRITTEN: &str = "written";
+    /// A `Prompt` a person confirmed (decision 105).
+    pub const CONFIRMED: &str = "confirmed";
+    /// A `Prompt` a person cancelled: the step fails, so the study stops unless `continue_on_fail`.
+    pub const PROMPT_CANCELLED: &str = "prompt_cancelled";
+    /// A `Prompt` nobody answered by its deadline.
+    pub const PROMPT_TIMED_OUT: &str = "prompt_timed_out";
+}
+
+/// The longest a `Prompt` may wait: one hour (decision 105). **Reasoned, not measured**: the
+/// field's longest gap between two confirmations was minutes, and a prompt holds `study_lock`, so
+/// a forgotten one has to end on its own. The step's own `timeout_ms` is the deadline; there is
+/// no default, because the designer already requires every step to state one.
+pub const MAX_PROMPT_TIMEOUT_MS: u32 = 60 * 60 * 1000;
+
+/// A person's answer to a `Prompt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAnswer {
+    Confirmed,
+    Cancelled,
+}
+
+/// Which surface relayed an answer. Recorded in the step's `answered_by`; never used to decide
+/// anything, since every surface relays the same person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnsweredBy {
+    Ui,
+    Mcp,
+    Cli,
+}
+
+impl AnsweredBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnsweredBy::Ui => "ui",
+            AnsweredBy::Mcp => "mcp",
+            AnsweredBy::Cli => "cli",
+        }
+    }
+}
+
+/// How a prompt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptEnd {
+    Answered(PromptAnswer, AnsweredBy),
+    /// Nobody answered by the deadline.
+    TimedOut,
+    /// The study was cancelled while the prompt waited.
+    StudyCancelled,
+}
+
+impl PromptEnd {
+    /// `PromptResolved.answer`: `confirmed`, `cancelled`, `timed_out` or `study_cancelled`.
+    pub fn answer_str(self) -> &'static str {
+        match self {
+            PromptEnd::Answered(PromptAnswer::Confirmed, _) => "confirmed",
+            PromptEnd::Answered(PromptAnswer::Cancelled, _) => "cancelled",
+            PromptEnd::TimedOut => "timed_out",
+            PromptEnd::StudyCancelled => "study_cancelled",
+        }
+    }
+
+    fn answered_by(self) -> Option<AnsweredBy> {
+        match self {
+            PromptEnd::Answered(_, by) => Some(by),
+            _ => None,
+        }
+    }
+}
+
+/// What a `Prompt` step asks its backend for.
+#[derive(Debug, Clone)]
+pub struct PromptRequest {
+    pub list: HostList,
+    pub step_index: u32,
+    pub step_name: String,
+    pub text: String,
+    pub timeout_ms: u32,
+}
+
+/// What the backend says about a prompt it ran: how it ended, and the id and deadline it was
+/// published under, which the step's record keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptRun {
+    pub end: PromptEnd,
+    pub prompt_id: u32,
+    pub deadline_utc_ms: u64,
+}
+
+/// The prompt a host study is waiting on, as `PromptPending` and `GET /study/{id}` show it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingPrompt {
+    /// 1-based within the study. An answer names it, so an answer meant for a prompt that has
+    /// already ended can never be taken for the next one.
+    pub prompt_id: u32,
+    pub list: HostList,
+    /// Position in `list`; for a prompt inside a `Repeat`, the `Repeat`'s position.
+    pub step_index: u32,
+    pub step_name: String,
+    pub text: String,
+    pub opened_utc_ms: u64,
+    pub deadline_utc_ms: u64,
+}
+
+/// The one prompt slot: what is pending and, once a person has answered, the answer, which the
+/// executor picks up within [`CANCEL_POLL`].
+#[derive(Debug, Clone)]
+pub struct PromptSlot {
+    pub study_id: String,
+    pub pending: PendingPrompt,
+    pub answer: Option<(PromptAnswer, AnsweredBy)>,
+}
+
+/// Shared by the executor and `POST /study/{id}/prompt`. One at a time, like `study_lock`.
+pub type HostPrompt = Arc<StdMutex<Option<PromptSlot>>>;
+
+/// Waits on `slot` for an answer to `prompt_id` until `timeout`, looking every [`CANCEL_POLL`] so
+/// a cancel of the study is seen within it. The slot is cleared **under the same lock as the last
+/// look**, so an answer either lands before the clear and counts, or finds no prompt and is
+/// refused `409`: never accepted and then lost.
+pub fn wait_for_answer(slot: &HostPrompt, prompt_id: u32, timeout: Duration, cancel: Option<&AtomicBool>) -> PromptEnd {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let mut g = slot.lock().unwrap();
+            let ours = g.as_ref().is_some_and(|s| s.pending.prompt_id == prompt_id);
+            let answered = g.as_ref().filter(|_| ours).and_then(|s| s.answer);
+            let end = match answered {
+                Some((answer, by)) => Some(PromptEnd::Answered(answer, by)),
+                None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => Some(PromptEnd::StudyCancelled),
+                None if Instant::now() >= deadline => Some(PromptEnd::TimedOut),
+                None => None,
+            };
+            if let Some(end) = end {
+                if ours {
+                    *g = None;
+                }
+                return end;
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(CANCEL_POLL.min(left).max(Duration::from_millis(1)));
+    }
+}
+
+/// `POST /study/{id}/prompt`'s body.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptAnswerBody {
+    pub prompt_id: u32,
+    pub answer: PromptAnswer,
+    pub answered_by: AnsweredBy,
+}
+
+/// Records `body` against `study_id`'s pending prompt. `Ok(false)` when that study has no prompt
+/// pending; `Err` (a `409`) for an answer to another prompt or to one already answered.
+pub fn record_answer(slot: &HostPrompt, study_id: &str, body: &PromptAnswerBody) -> Result<bool, String> {
+    let mut g = slot.lock().unwrap();
+    let Some(s) = g.as_mut().filter(|s| s.study_id == study_id) else { return Ok(false) };
+    if s.pending.prompt_id != body.prompt_id {
+        return Err(format!(
+            "prompt {} is not the one waiting: prompt {} is ('{}'), so this answer was meant for a prompt that already ended",
+            body.prompt_id, s.pending.prompt_id, s.pending.text
+        ));
+    }
+    if let Some((answer, by)) = s.answer {
+        return Err(format!("prompt {} was already answered ({answer:?}, from {})", body.prompt_id, by.as_str()));
+    }
+    s.answer = Some((body.answer, body.answered_by));
+    Ok(true)
 }
 
 /// Why a backend could not run an exchange at all (nothing, or not all of the line, was written).
@@ -79,6 +254,9 @@ pub trait HostBackend {
     fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure>;
     /// One command to a declared instrument (decision 104).
     fn instrument(&mut self, name: &str, req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure>;
+    /// One `Prompt`: publish it, then wait for a person's answer until its deadline or a cancel of
+    /// the study (`cancel`, `None` in the teardown), and say how it ended (decision 105).
+    fn prompt(&mut self, req: PromptRequest, cancel: Option<&AtomicBool>) -> PromptRun;
 }
 
 /// One step as the run recorded it: the study-designer result plus what Core saw.
@@ -105,6 +283,12 @@ pub struct StepRecord {
     pub started_utc_ms: u64,
     pub ended_utc_ms: u64,
     pub delay_before_ms: u32,
+    /// A `Prompt`'s id and deadline (decision 105); absent on every other step. Who answered is
+    /// the result's own `answered_by`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_deadline_utc_ms: Option<u64>,
 }
 
 /// How a run ended. `completed` is whether every step ran and none stopped the study.
@@ -286,6 +470,8 @@ fn run_step<B: HostBackend>(
         started_utc_ms: started,
         ended_utc_ms: started,
         delay_before_ms: step.delay_before_ms,
+        prompt_id: None,
+        prompt_deadline_utc_ms: None,
     };
     if !delayed {
         rec.result.outcome = fail("cancelled before the step ran");
@@ -359,7 +545,30 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            // Refused at submission; reaching here is a bug, said as a failure rather than a skip.
+            HostAction::Prompt { text } => {
+                let req = PromptRequest { list, step_index: index, step_name: step.name.clone(), text: text.clone(), timeout_ms: step.timeout_ms };
+                let run = backend.prompt(req, cancel);
+                rec.prompt_id = Some(run.prompt_id);
+                rec.prompt_deadline_utc_ms = Some(run.deadline_utc_ms);
+                rec.result.answered_by = run.end.answered_by().map(|by| by.as_str().to_string());
+                match run.end {
+                    PromptEnd::Answered(PromptAnswer::Confirmed, _) => rec.detail = detail::CONFIRMED,
+                    PromptEnd::Answered(PromptAnswer::Cancelled, _) => {
+                        rec.result.outcome = fail("the operator cancelled the prompt");
+                        rec.detail = detail::PROMPT_CANCELLED;
+                    }
+                    PromptEnd::TimedOut => {
+                        rec.result.outcome = Outcome::TimedOut;
+                        rec.detail = detail::PROMPT_TIMED_OUT;
+                    }
+                    PromptEnd::StudyCancelled => {
+                        rec.result.outcome = fail("cancelled while the prompt waited");
+                        rec.detail = detail::CANCELLED;
+                    }
+                }
+            }
+            // A `Repeat` is walked by `walk`, never run as one step; reaching here is a bug, said
+            // as a failure rather than a skip.
             other => {
                 rec.result.outcome = fail("this action is not executed by this Core");
                 rec.detail = detail::EXCHANGE_FAILED;
@@ -550,34 +759,18 @@ fn flat_steps(study: &HostStudy) -> Vec<(&'static str, String, &HostStep)> {
     out
 }
 
-/// What this Core does not execute yet, by name. `Prompt` is a later unit of the host-study
-/// proposal (also inside a `Repeat`); `streams` is accepted for `Text` + `WholeStudy` taps only.
+/// What this Core does not execute, by name. Every action runs since decision 105 (`Prompt`, also
+/// inside a `Repeat`); `streams` is accepted for `Text` + `WholeStudy` taps only.
 fn unsupported(study: &HostStudy) -> Option<String> {
-    flat_steps(study)
-        .into_iter()
-        .find_map(|(list, pos, s)| {
-            let what = match &s.action {
-                HostAction::Prompt { .. } => "Prompt",
-                HostAction::Exchange { .. } | HostAction::Instrument { .. } | HostAction::Wait { .. } | HostAction::Repeat { .. } => {
-                    return None
-                }
-            };
-            Some(format!(
-                "{list}[{pos}] '{}' is a {what} step, which this Core does not execute yet (only Exchange, Instrument, Wait and Repeat)",
-                s.name
-            ))
-        })
-        .or_else(|| {
-            study.streams.iter().find_map(|t| {
-                if !matches!(t.encoding, embarch_study_designer::StreamEncoding::Text) {
-                    Some(format!("streams[{}] '{}': only a `Text` tap is captured in a host study (decision 98)", t.id, t.name))
-                } else if !matches!(t.scope, embarch_study_designer::StreamScope::WholeStudy) {
-                    Some(format!("streams[{}] '{}': only a `WholeStudy` tap is captured in a host study (decision 98)", t.id, t.name))
-                } else {
-                    None
-                }
-            })
-        })
+    study.streams.iter().find_map(|t| {
+        if !matches!(t.encoding, embarch_study_designer::StreamEncoding::Text) {
+            Some(format!("streams[{}] '{}': only a `Text` tap is captured in a host study (decision 98)", t.id, t.name))
+        } else if !matches!(t.scope, embarch_study_designer::StreamScope::WholeStudy) {
+            Some(format!("streams[{}] '{}': only a `WholeStudy` tap is captured in a host study (decision 98)", t.id, t.name))
+        } else {
+            None
+        }
+    })
 }
 
 /// Everything checkable with no topology and no lock: the study's own rules, then what this Core
@@ -588,6 +781,12 @@ pub fn check_study(study: &HostStudy) -> Result<(), String> {
         return Err(msg);
     }
     for (list, pos, s) in flat_steps(study) {
+        if matches!(s.action, HostAction::Prompt { .. }) && s.timeout_ms > MAX_PROMPT_TIMEOUT_MS {
+            return Err(format!(
+                "{list}[{pos}] '{}': a Prompt waits at most {MAX_PROMPT_TIMEOUT_MS} ms (decision 105); this one asks for {} ms",
+                s.name, s.timeout_ms
+            ));
+        }
         if let HostAction::Exchange { until, match_after_echo, .. } = &s.action {
             // A `{value}` is checked as the first thing it will become.
             let probe = substitute(s, "1");
@@ -935,10 +1134,14 @@ pub fn run_job<B: HostBackend>(
     let _ = events_tx.send(StudyEvent::StatusChanged { study_id: study_id.to_string(), status: "completed".to_string(), reason });
 }
 
-/// The real backend: `hw_lock` for each `Exchange` step, then the exchange route's own body.
+/// The real backend: `hw_lock` for each `Exchange` step, then the exchange route's own body; for a
+/// `Prompt`, the shared prompt slot and the study's event channel, and no hardware at all.
 struct CoreBackend {
     state: AppState,
     handle: tokio::runtime::Handle,
+    study_id: String,
+    /// Prompts published so far; the next one's id is this plus one.
+    prompts: u32,
 }
 
 impl HostBackend for CoreBackend {
@@ -963,16 +1166,46 @@ impl HostBackend for CoreBackend {
             _ => ExchangeFailure::Failed(msg),
         })
     }
+
+    /// No `hw_lock`: a prompt touches no hardware, and holding the lock while a person walks to
+    /// the bench would refuse every flash for that long.
+    fn prompt(&mut self, req: PromptRequest, cancel: Option<&AtomicBool>) -> PromptRun {
+        self.prompts += 1;
+        let opened = now_ms();
+        let pending = PendingPrompt {
+            prompt_id: self.prompts,
+            list: req.list,
+            step_index: req.step_index,
+            step_name: req.step_name,
+            text: req.text,
+            opened_utc_ms: opened,
+            deadline_utc_ms: opened + req.timeout_ms as u64,
+        };
+        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.study_id.clone(), pending: pending.clone(), answer: None });
+        let _ = self.state.study_events.send(StudyEvent::PromptPending { study_id: self.study_id.clone(), prompt: pending.clone() });
+        let end = wait_for_answer(&self.state.host_prompt, pending.prompt_id, Duration::from_millis(req.timeout_ms as u64), cancel);
+        let _ = self.state.study_events.send(StudyEvent::PromptResolved {
+            study_id: self.study_id.clone(),
+            prompt_id: pending.prompt_id,
+            answer: end.answer_str(),
+            answered_by: end.answered_by(),
+            resolved_utc_ms: now_ms(),
+        });
+        PromptRun { end, prompt_id: pending.prompt_id, deadline_utc_ms: pending.deadline_utc_ms }
+    }
 }
 
-/// Releases the study lock and the cancel slot when the job's thread ends, however it ends.
+/// Releases the study lock, the cancel slot and the prompt slot when the job's thread ends,
+/// however it ends.
 struct JobHold {
     lock: crate::study::StudyLock,
     cancel: HostCancel,
+    prompt: HostPrompt,
 }
 
 impl Drop for JobHold {
     fn drop(&mut self) {
+        *self.prompt.lock().unwrap() = None;
         *self.cancel.lock().unwrap() = None;
         *self.lock.lock().unwrap() = None;
     }
@@ -989,7 +1222,7 @@ pub async fn post_host_study_handler(
 
     let study_id = crate::study::generate_study_id();
     crate::study::take_study_lock(&state, &study_id)?;
-    let hold = JobHold { lock: state.study_lock.clone(), cancel: state.host_cancel.clone() };
+    let hold = JobHold { lock: state.study_lock.clone(), cancel: state.host_cancel.clone(), prompt: state.host_prompt.clone() };
 
     let for_signals = study.clone();
     match tokio::task::spawn_blocking(move || check_signals(&for_signals)).await {
@@ -1023,7 +1256,7 @@ pub async fn post_host_study_handler(
         let id_for_panic = id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let _hold = hold;
-            let mut backend = CoreBackend { state, handle };
+            let mut backend = CoreBackend { state, handle, study_id: id.clone(), prompts: 0 };
             run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx, taps);
         })
         .await;
@@ -1131,6 +1364,57 @@ pub async fn line_counts_rerender_handler(
 }
 
 #[derive(Debug, Serialize)]
+pub struct PromptAnswerResponse {
+    study_id: String,
+    prompt_id: u32,
+    answer: PromptAnswer,
+    answered_by: AnsweredBy,
+    status: &'static str,
+}
+
+/// `POST /study/{id}/prompt`: a person's answer to the host study's pending `Prompt`, relayed by
+/// the UI, an MCP tool or the CLI (decision 105). `200` once recorded; the step ends within
+/// [`CANCEL_POLL`]. `409` for an answer naming a prompt that is not the one waiting, one already
+/// answered, a running study with no prompt waiting, or a study not running; `404` for an id Core
+/// has never seen. **Not lease-gated**: the person at the bench answers from whichever surface is
+/// in front of them, and the prompt id is what keeps a stale answer from landing on a later prompt.
+// route: POST /study/{study_id}/prompt
+pub async fn answer_prompt_handler(
+    State(state): State<AppState>,
+    Path(study_id): Path<String>,
+    Json(body): Json<PromptAnswerBody>,
+) -> Result<Json<PromptAnswerResponse>, (StatusCode, String)> {
+    match record_answer(&state.host_prompt, &study_id, &body) {
+        Ok(true) => {
+            return Ok(Json(PromptAnswerResponse {
+                study_id,
+                prompt_id: body.prompt_id,
+                answer: body.answer,
+                answered_by: body.answered_by,
+                status: "recorded",
+            }))
+        }
+        Err(msg) => return Err((StatusCode::CONFLICT, msg)),
+        Ok(false) => {}
+    }
+    let job = state.study_jobs.lock().unwrap().get(&study_id).cloned();
+    match job {
+        Some(j) if j.status == "running" => Err((
+            StatusCode::CONFLICT,
+            format!("study '{study_id}' has no prompt waiting: it was answered, it timed out, or the study is a bench study"),
+        )),
+        Some(j) => Err((StatusCode::CONFLICT, format!("study '{study_id}' is not running (status: {}); there is no prompt to answer", j.status))),
+        None => Err((StatusCode::NOT_FOUND, format!("no study '{study_id}' is known to this Core"))),
+    }
+}
+
+/// The pending prompt of `study_id` for `GET /study/{id}`, or `None`. One already answered and
+/// not yet picked up by the executor (at most [`CANCEL_POLL`]) is not shown.
+pub fn pending_prompt(slot: &HostPrompt, study_id: &str) -> Option<PendingPrompt> {
+    slot.lock().unwrap().as_ref().filter(|s| s.study_id == study_id && s.answer.is_none()).map(|s| s.pending.clone())
+}
+
+#[derive(Debug, Serialize)]
 pub struct CancelResponse {
     study_id: String,
     status: &'static str,
@@ -1177,6 +1461,10 @@ mod tests {
         before: Box<dyn FnMut(usize)>,
         calls: usize,
         instrument_replies: VecDeque<InstrumentScript>,
+        /// How each `Prompt` ends, in order; an unscripted one times out.
+        prompt_ends: VecDeque<PromptEnd>,
+        /// What each `Prompt` asked.
+        prompts: Vec<PromptRequest>,
     }
 
     struct Port {
@@ -1208,7 +1496,15 @@ mod tests {
 
     impl Script {
         fn new(replies: Vec<Result<Vec<u8>, ExchangeFailure>>) -> Self {
-            Script { replies: replies.into(), written: vec![], before: Box::new(|_| {}), calls: 0, instrument_replies: VecDeque::new() }
+            Script {
+                replies: replies.into(),
+                written: vec![],
+                before: Box::new(|_| {}),
+                calls: 0,
+                instrument_replies: VecDeque::new(),
+                prompt_ends: VecDeque::new(),
+                prompts: vec![],
+            }
         }
     }
 
@@ -1252,6 +1548,16 @@ mod tests {
                 elapsed_ms: 1,
                 started_utc_ms: 1,
             })
+        }
+
+        fn prompt(&mut self, req: PromptRequest, cancel: Option<&AtomicBool>) -> PromptRun {
+            self.prompts.push(req);
+            let end = match self.prompt_ends.pop_front() {
+                Some(end) => end,
+                None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => PromptEnd::StudyCancelled,
+                None => PromptEnd::TimedOut,
+            };
+            PromptRun { end, prompt_id: self.prompts.len() as u32, deadline_utc_ms: 1_000 * self.prompts.len() as u64 }
         }
     }
 
@@ -1337,6 +1643,174 @@ mod tests {
 
     fn wait(name: &str, ms: u32) -> HostStep {
         HostStep { name: name.into(), action: HostAction::Wait { ms }, timeout_ms: 0, continue_on_fail: false, delay_before_ms: 0 }
+    }
+
+    fn ask(name: &str, timeout_ms: u32) -> HostStep {
+        HostStep { name: name.into(), action: HostAction::Prompt { text: format!("{name}: plug in the pack") }, timeout_ms, continue_on_fail: false, delay_before_ms: 0 }
+    }
+
+    // ---- prompts (decision 105) ----
+
+    #[test]
+    fn a_confirmed_prompt_passes_and_records_who_answered_and_the_deadline() {
+        let s = study(vec![ask("plug", 5_000), wait("w", 1)], vec![]);
+        let mut b = Script::new(vec![]);
+        b.prompt_ends.push_back(PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert!(end.completed, "{:?}", end.reason);
+        assert_eq!(recs[0].result.outcome, Outcome::Pass);
+        assert_eq!(recs[0].detail, detail::CONFIRMED);
+        assert_eq!(recs[0].result.answered_by.as_deref(), Some("ui"));
+        assert_eq!((recs[0].prompt_id, recs[0].prompt_deadline_utc_ms), (Some(1), Some(1_000)));
+        assert_eq!(b.prompts[0].text, "plug: plug in the pack");
+        assert_eq!((b.prompts[0].list, b.prompts[0].step_index, b.prompts[0].timeout_ms), (HostList::Steps, 0, 5_000));
+        // Not a prompt: no prompt fields in the record.
+        assert_eq!(recs[1].prompt_id, None);
+        let row = serde_json::to_value(&recs[1]).unwrap();
+        assert!(row.get("prompt_id").is_none() && row.get("prompt_deadline_utc_ms").is_none());
+    }
+
+    #[test]
+    fn a_cancelled_prompt_fails_the_step_stops_the_study_and_runs_the_teardown() {
+        let s = study(vec![ask("plug", 5_000), wait("never", 1)], vec![ex("safe", "pd sink 5", "pd: ")]);
+        let mut b = Script::new(vec![ok_reply("pd sink 5", "pd: ok")]);
+        b.prompt_ends.push_back(PromptEnd::Answered(PromptAnswer::Cancelled, AnsweredBy::Mcp));
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert!(!end.completed);
+        assert!(end.reason.as_deref().unwrap().contains("'plug' failed"), "{:?}", end.reason);
+        assert!(matches!(recs[0].result.outcome, Outcome::Fail { .. }));
+        assert_eq!(recs[0].detail, detail::PROMPT_CANCELLED);
+        assert_eq!(recs[0].result.answered_by.as_deref(), Some("mcp"));
+        assert_eq!(recs.iter().map(|r| (r.list, r.index)).collect::<Vec<_>>(), [(HostList::Steps, 0), (HostList::Teardown, 0)]);
+    }
+
+    #[test]
+    fn an_unanswered_prompt_times_out_and_continue_on_fail_walks_past_it() {
+        let mut lenient = ask("plug", 5_000);
+        lenient.continue_on_fail = true;
+        let s = study(vec![lenient, ask("strict", 5_000), wait("never", 1)], vec![]);
+        let mut b = Script::new(vec![]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert_eq!(recs.len(), 2);
+        assert!(recs.iter().all(|r| r.result.outcome == Outcome::TimedOut && r.detail == detail::PROMPT_TIMED_OUT));
+        assert!(recs.iter().all(|r| r.result.answered_by.is_none()));
+        assert_eq!(recs[1].prompt_id, Some(2));
+        assert!(end.reason.as_deref().unwrap().contains("'strict' timed out (prompt_timed_out)"), "{:?}", end.reason);
+    }
+
+    #[test]
+    fn a_study_cancelled_under_a_prompt_ends_it_and_a_teardown_prompt_still_asks() {
+        let s = study(vec![ask("plug", 5_000)], vec![ask("unplug", 5_000)]);
+        let mut b = Script::new(vec![]);
+        b.prompt_ends.extend([PromptEnd::StudyCancelled, PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Cli)]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert_eq!(recs[0].detail, detail::CANCELLED);
+        assert!(end.reason.as_deref().unwrap().contains("cancelled during step 'plug'"), "{:?}", end.reason);
+        // The teardown's own prompt ran, and was asked with no cancel flag to see.
+        assert_eq!((recs[1].list, recs[1].detail), (HostList::Teardown, detail::CONFIRMED));
+        assert_eq!(recs[1].result.answered_by.as_deref(), Some("cli"));
+        assert_eq!(end.teardown_failures, 0);
+    }
+
+    fn slot_with(study_id: &str, prompt_id: u32) -> HostPrompt {
+        let pending = PendingPrompt {
+            prompt_id,
+            list: HostList::Steps,
+            step_index: 0,
+            step_name: "plug".into(),
+            text: "plug in".into(),
+            opened_utc_ms: 1,
+            deadline_utc_ms: 2,
+        };
+        Arc::new(StdMutex::new(Some(PromptSlot { study_id: study_id.into(), pending, answer: None })))
+    }
+
+    fn body(prompt_id: u32, answer: PromptAnswer) -> PromptAnswerBody {
+        PromptAnswerBody { prompt_id, answer, answered_by: AnsweredBy::Ui }
+    }
+
+    #[test]
+    fn an_answer_is_recorded_once_and_only_against_the_prompt_it_names() {
+        let slot = slot_with("h1", 3);
+        assert_eq!(record_answer(&slot, "other", &body(3, PromptAnswer::Confirmed)), Ok(false));
+        let e = record_answer(&slot, "h1", &body(2, PromptAnswer::Confirmed)).unwrap_err();
+        assert!(e.contains("prompt 3 is ('plug in')"), "{e}");
+        assert_eq!(record_answer(&slot, "h1", &body(3, PromptAnswer::Cancelled)), Ok(true));
+        let e = record_answer(&slot, "h1", &body(3, PromptAnswer::Confirmed)).unwrap_err();
+        assert!(e.contains("already answered"), "{e}");
+        // An answered prompt is no longer shown as pending.
+        assert_eq!(pending_prompt(&slot, "h1"), None);
+        assert_eq!(wait_for_answer(&slot, 3, Duration::from_secs(5), None), PromptEnd::Answered(PromptAnswer::Cancelled, AnsweredBy::Ui));
+        assert!(slot.lock().unwrap().is_none(), "the executor clears the slot it picked the answer from");
+    }
+
+    #[test]
+    fn the_wait_ends_on_an_answer_from_another_thread_a_deadline_or_a_cancel() {
+        let slot = slot_with("h1", 1);
+        assert!(pending_prompt(&slot, "h1").is_some() && pending_prompt(&slot, "h2").is_none());
+        let answerer = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                record_answer(&slot, "h1", &body(1, PromptAnswer::Confirmed))
+            })
+        };
+        let t0 = Instant::now();
+        assert_eq!(wait_for_answer(&slot, 1, Duration::from_secs(10), None), PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(answerer.join().unwrap(), Ok(true));
+
+        let slot = slot_with("h1", 1);
+        assert_eq!(wait_for_answer(&slot, 1, Duration::from_millis(50), None), PromptEnd::TimedOut);
+        assert!(slot.lock().unwrap().is_none());
+        // After the deadline cleared the slot, a late answer finds no prompt rather than being lost.
+        assert_eq!(record_answer(&slot, "h1", &body(1, PromptAnswer::Confirmed)), Ok(false));
+
+        let slot = slot_with("h1", 1);
+        let cancel = AtomicBool::new(true);
+        assert_eq!(wait_for_answer(&slot, 1, Duration::from_secs(10), Some(&cancel)), PromptEnd::StudyCancelled);
+    }
+
+    #[test]
+    fn prompt_events_and_the_status_body_carry_the_prompt_flat() {
+        let pending = slot_with("h1", 4).lock().unwrap().clone().unwrap().pending;
+        let ev = serde_json::to_value(StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() }).unwrap();
+        assert_eq!(ev["kind"], "PromptPending");
+        assert_eq!((ev["prompt_id"].as_u64(), ev["text"].as_str(), ev["list"].as_str()), (Some(4), Some("plug in"), Some("Steps")));
+        assert_eq!(ev["deadline_utc_ms"], 2);
+        let ev = serde_json::to_value(StudyEvent::PromptResolved {
+            study_id: "h1".into(),
+            prompt_id: 4,
+            answer: PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Mcp).answer_str(),
+            answered_by: Some(AnsweredBy::Mcp),
+            resolved_utc_ms: 9,
+        })
+        .unwrap();
+        assert_eq!((ev["answer"].as_str(), ev["answered_by"].as_str()), (Some("confirmed"), Some("mcp")));
+        let b: PromptAnswerBody = serde_json::from_str(r#"{"prompt_id":4,"answer":"cancelled","answered_by":"cli"}"#).unwrap();
+        assert_eq!((b.answer, b.answered_by), (PromptAnswer::Cancelled, AnsweredBy::Cli));
+        assert!(serde_json::from_str::<PromptAnswerBody>(r#"{"prompt_id":4,"answer":"yes","answered_by":"cli"}"#).is_err());
+        assert!(serde_json::from_str::<PromptAnswerBody>(r#"{"prompt_id":4,"answer":"confirmed","answered_by":"agent"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_prompt_route_records_an_answer_or_says_why_not() {
+        let state = AppState::new("t".into());
+        *state.host_prompt.lock().unwrap() = slot_with("h1", 1).lock().unwrap().clone();
+        let ok = answer_prompt_handler(State(state.clone()), Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap();
+        assert_eq!(ok.0.status, "recorded");
+        let e = answer_prompt_handler(State(state.clone()), Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        *state.host_prompt.lock().unwrap() = None;
+        state.study_jobs.lock().unwrap().insert("r1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: None, reason: None });
+        state.study_jobs.lock().unwrap().insert("d1".into(), StudyJob { status: "completed".into(), current_step: None, total_steps: None, reason: None });
+        let e = answer_prompt_handler(State(state.clone()), Path("r1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.contains("no prompt waiting"), "{}", e.1);
+        let e = answer_prompt_handler(State(state.clone()), Path("d1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        let e = answer_prompt_handler(State(state), Path("nope".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     fn study(steps: Vec<HostStep>, teardown: Vec<HostStep>) -> HostStudy {
@@ -1581,15 +2055,17 @@ mod tests {
     fn what_this_core_does_not_run_is_refused_by_name_at_submission() {
         let s = study(vec![ex("a", "x", "pd: ")], vec![]);
         assert!(check_study(&s).is_ok());
-        let prompt = HostStep { name: "ask".into(), action: HostAction::Prompt { text: "plug in".into() }, timeout_ms: 1000, continue_on_fail: false, delay_before_ms: 0 };
-        let e = check_study(&study(vec![ex("a", "x", "pd: "), prompt], vec![])).unwrap_err();
-        assert!(e.contains("steps[1] 'ask' is a Prompt step"), "{e}");
+        // A Prompt runs since decision 105, at top level, inside a Repeat and in the teardown; one
+        // asking to wait longer than an hour is refused by step.
+        let prompt = ask("ask", 1000);
+        assert!(check_study(&study(vec![ex("a", "x", "pd: "), prompt.clone()], vec![prompt.clone()])).is_ok());
         let repeat = |inner: HostStep| HostStep { name: "loop".into(), action: HostAction::Repeat { count: Some(2), values: vec![], steps: vec![inner] }, timeout_ms: 0, continue_on_fail: false, delay_before_ms: 0 };
         assert!(check_study(&study(vec![repeat(ex("i", "x {value}", "pd: "))], vec![])).is_ok());
-        let ask = HostStep { name: "ask".into(), action: HostAction::Prompt { text: "plug in".into() }, timeout_ms: 1000, continue_on_fail: false, delay_before_ms: 0 };
-        let e = check_study(&study(vec![repeat(ask)], vec![])).unwrap_err();
-        assert!(e.contains("steps[0.0] 'ask' is a Prompt"), "{e}");
-        // An Instrument step runs now (decision 104); only Prompt is still refused by name.
+        assert!(check_study(&study(vec![repeat(prompt)], vec![])).is_ok());
+        let e = check_study(&study(vec![repeat(ask("forever", MAX_PROMPT_TIMEOUT_MS + 1))], vec![])).unwrap_err();
+        assert!(e.contains("steps[0.0] 'forever'") && e.contains("decision 105"), "{e}");
+        assert!(check_study(&study(vec![ask("hour", MAX_PROMPT_TIMEOUT_MS)], vec![])).is_ok());
+        // An Instrument step runs too (decision 104).
         assert!(check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).is_ok());
         let mut with_counts = study(vec![ex("a", "x", "pd: ")], vec![]);
         with_counts.line_counts.push(embarch_study_designer::host_study::LineCount { name: "n".into(), tap: "t".into(), pattern: "p".into(), kind: Default::default() });
@@ -1746,6 +2222,10 @@ mod tests {
 
         fn instrument(&mut self, _name: &str, _req: InstrumentExchange) -> Result<InstrumentReply, ExchangeFailure> {
             Err(ExchangeFailure::Failed("no instrument in this test".into()))
+        }
+
+        fn prompt(&mut self, _req: PromptRequest, _cancel: Option<&AtomicBool>) -> PromptRun {
+            PromptRun { end: PromptEnd::TimedOut, prompt_id: 1, deadline_utc_ms: 0 }
         }
     }
 
