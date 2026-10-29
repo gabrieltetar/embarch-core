@@ -53,14 +53,15 @@ pub fn check(req: &InstrumentExchange) -> Result<(), String> {
     Ok(())
 }
 
-/// When each instrument was last written, process-wide: the route and a host
-/// study's steps share it, so pacing holds across both.
+/// When each instrument's last exchange ended (not when it was last written),
+/// process-wide: the route and a host study's steps share it, so pacing holds
+/// across both.
 fn last_sent() -> &'static Mutex<HashMap<String, Instant>> {
     static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     LAST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How long until `min_interval` has passed since the last write to `name`.
+/// How long until `min_interval` has X
 fn pace_left(name: &str, min_interval: Duration) -> Duration {
     match last_sent().lock().unwrap().get(name) {
         Some(at) => min_interval.saturating_sub(at.elapsed()),
@@ -77,7 +78,8 @@ fn pace(name: &str, min_interval: Duration) -> Duration {
     left
 }
 
-fn mark_sent(name: &str) {
+/// Stamps the end of an exchange with `name`: the instant pacing runs from.
+fn mark_exchanged(name: &str) {
     last_sent().lock().unwrap().insert(name.to_string(), Instant::now());
 }
 
@@ -114,7 +116,7 @@ pub(crate) fn talk<P: Read + Write>(
     let rt = inst.read_terminator.as_str();
     let flush = exchange_with(port, inst.write_terminator.as_bytes(), Some(rt), false, FLUSH_WAIT, MAX_READ_BYTES, &mut set_timeout)
         .context("error sending the flush line: the command was not sent")?;
-    mark_sent(&inst.name);
+    mark_exchanged(&inst.name);
     let (flush_reply, _) = reply_line(&flush.bytes, rt);
     paced += pace(&inst.name, min);
 
@@ -129,7 +131,7 @@ pub(crate) fn talk<P: Read + Write>(
         port.flush().context("error flushing the instrument's port (the line was written, so it may have gone out)")?;
         (String::new(), false)
     };
-    mark_sent(&inst.name);
+    mark_exchanged(&inst.name);
     Ok(Talked { reply, terminated, flush_reply, paced })
 }
 
