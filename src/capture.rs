@@ -777,8 +777,8 @@ mod tests {
         assert_eq!(r.lines.iter().map(|l| l.offset).collect::<Vec<_>>(), [0, 6, 13]);
         let dt = r.lines[1].rx_ms - r.lines[0].rx_ms;
         // Both stamps bracket the sleep (the first is taken before `wait` returns, the second after
-        // the feed), so 200 ms is a hard floor; the ceiling is only a scheduler-stall allowance.
-        assert!((200..=10_000).contains(&dt), "two lines 200 ms apart were {dt} ms apart");
+        // the feed), so 200 ms is the floor (less 1 ms for each stamp's truncation); the ceiling is only a scheduler-stall allowance.
+        assert!((199..=10_000).contains(&dt), "two lines 200 ms apart were {dt} ms apart");
         assert!(r.lines[2].rx_ms >= r.lines[1].rx_ms);
         assert!(r.started_utc_ms > 1_700_000_000_000);
         // A range returns only the lines that start inside it.
