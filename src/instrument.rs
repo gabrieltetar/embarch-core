@@ -61,7 +61,8 @@ fn last_sent() -> &'static Mutex<HashMap<String, Instant>> {
     LAST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How long until `min_interval` has X
+/// How long until `min_interval` has passed since the last exchange with
+/// `name` ended (the reply read, or the write flushed when nothing is read).
 fn pace_left(name: &str, min_interval: Duration) -> Duration {
     match last_sent().lock().unwrap().get(name) {
         Some(at) => min_interval.saturating_sub(at.elapsed()),
