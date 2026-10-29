@@ -36,6 +36,23 @@ pub fn install(bind: &str) -> Result<()> {
              auto-generated machine-wide token file instead."
         );
     }
+    #[cfg(windows)]
+    if windows_service_registered(SERVICE_LABEL) {
+        // Decision 106: a registered service is rewritten in place, not refused.
+        let _ = mgr.stop(ServiceStopCtx { label: label.clone() });
+        let kept = rewrite_windows_registration(SERVICE_LABEL, &exe, bind, explicit_token.as_deref())
+            .context("failed to rewrite the registered embarch-core service in place")?;
+        eprintln!(
+            "embarch-core service already registered; rewrote its command line (--bind {bind}). \
+             Environment kept: [{}]",
+            kept.join(", ")
+        );
+        apply_windows_failure_actions(SERVICE_LABEL)?;
+        mgr.start(ServiceStartCtx { label })
+            .context("service reconfigured, but failed to start")?;
+        return Ok(());
+    }
+
     let environment = explicit_token
         .clone()
         .map(|token| vec![("EMBARCH_TOKEN".to_string(), token)]);
@@ -50,17 +67,23 @@ pub fn install(bind: &str) -> Result<()> {
         environment,
         autostart: true,
         restart_policy: RestartPolicy::OnFailure {
-            delay_secs: Some(5),
-            max_retries: Some(5),
-            reset_after_secs: Some(3600),
+            delay_secs: Some(RESTART_DELAY_SECS),
+            max_retries: Some(RESTART_RETRIES),
+            reset_after_secs: Some(RESTART_RESET_SECS),
         },
     })
     .context("failed to install embarch-core as a service")?;
 
     #[cfg(windows)]
-    if let Some(token) = explicit_token {
-        set_windows_service_environment(SERVICE_LABEL, &token)
-            .context("failed to set the installed service's Windows registry environment")?;
+    {
+        if let Some(token) = explicit_token {
+            let existing = read_windows_environment(SERVICE_LABEL);
+            let merged = merge_environment(existing, Some(&token));
+            write_windows_environment(SERVICE_LABEL, &merged)
+                .context("failed to set the installed service's Windows registry environment")?;
+        }
+        // `service_manager`'s sc backend ignores `restart_policy` (it warns so).
+        apply_windows_failure_actions(SERVICE_LABEL)?;
     }
 
     mgr.start(ServiceStartCtx { label })
@@ -69,32 +92,123 @@ pub fn install(bind: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes the `Environment` `REG_MULTI_SZ` value under this service's own
-/// registry key (`HKLM\SYSTEM\CurrentControlSet\Services\<service_name>`),
-/// since `sc.rs` (the Windows backend behind `ServiceManager`) never reads
-/// `ServiceInstallCtx.environment` — unlike `systemd.rs`/`launchd.rs`, which
-/// already honor that field on Linux/macOS. Only called when an explicit
-/// `EMBARCH_TOKEN` was set at install time; an installed service with none
-/// set just uses `token_store`'s auto-generated machine-wide file like any
-/// other invocation.
-#[cfg(windows)]
-fn set_windows_service_environment(service_name: &str, token: &str) -> Result<()> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
+const RESTART_DELAY_SECS: u32 = 5;
+const RESTART_RETRIES: u32 = 5;
+const RESTART_RESET_SECS: u32 = 3600;
 
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+/// The service's command line as SCM stores it in `ImagePath`: the exe path
+/// quoted (it may hold spaces), then `run --bind <bind>`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_command_line(exe: &Path, bind: &str) -> String {
+    format!("\"{}\" run --bind {}", exe.display(), bind)
+}
+
+/// Merges an existing `Environment` value with an explicit token: every
+/// existing entry is kept (signal baud etc.), `EMBARCH_TOKEN` is replaced
+/// when one is given, and absent otherwise stays untouched.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn merge_environment(existing: Vec<String>, token: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = match token {
+        Some(_) => existing.into_iter().filter(|e| !e.starts_with("EMBARCH_TOKEN=")).collect(),
+        None => existing,
+    };
+    if let Some(t) = token {
+        out.push(format!("EMBARCH_TOKEN={t}"));
+    }
+    out
+}
+
+/// Entries for display: names only, so a token never reaches the terminal.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn environment_names(entries: &[String]) -> Vec<String> {
+    entries.iter().map(|e| e.split('=').next().unwrap_or("").to_string()).collect()
+}
+
+/// `sc failure` arguments for the restart policy `install` has always claimed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn failure_args(service: &str) -> Vec<String> {
+    let step = format!("restart/{}", RESTART_DELAY_SECS * 1000);
+    let actions = vec![step; RESTART_RETRIES as usize].join("/");
+    vec![
+        "failure".into(),
+        service.into(),
+        "reset=".into(),
+        RESTART_RESET_SECS.to_string(),
+        "actions=".into(),
+        actions,
+    ]
+}
+
+#[cfg(windows)]
+fn service_key(service_name: &str) -> Result<winreg::RegKey> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
     let (services, _) = hklm
         .create_subkey("SYSTEM\\CurrentControlSet\\Services")
         .context("failed to open HKLM\\SYSTEM\\CurrentControlSet\\Services")?;
-    let (service_key, _) = services
+    let (key, _) = services
         .create_subkey(service_name)
         .with_context(|| format!("failed to open the {service_name} service registry key"))?;
+    Ok(key)
+}
 
-    let entries = vec![format!("EMBARCH_TOKEN={token}")];
-    service_key
-        .set_value("Environment", &entries)
+#[cfg(windows)]
+fn windows_service_registered(service_name: &str) -> bool {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(format!("SYSTEM\\CurrentControlSet\\Services\\{service_name}"))
+        .is_ok()
+}
+
+#[cfg(windows)]
+fn read_windows_environment(service_name: &str) -> Vec<String> {
+    service_key(service_name)
+        .ok()
+        .and_then(|k| k.get_value::<Vec<String>, _>("Environment").ok())
+        .unwrap_or_default()
+}
+
+/// Rewrites `ImagePath` and merges `Environment`; returns the kept entry names.
+#[cfg(windows)]
+fn rewrite_windows_registration(
+    service_name: &str,
+    exe: &Path,
+    bind: &str,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    let key = service_key(service_name)?;
+    key.set_value("ImagePath", &windows_command_line(exe, bind))
+        .context("failed to write the ImagePath registry value")?;
+    let merged = merge_environment(read_windows_environment(service_name), token);
+    if !merged.is_empty() {
+        write_windows_environment(service_name, &merged)?;
+    }
+    Ok(environment_names(&merged))
+}
+
+#[cfg(windows)]
+fn apply_windows_failure_actions(service_name: &str) -> Result<()> {
+    let out = std::process::Command::new("sc.exe")
+        .args(failure_args(service_name))
+        .output()
+        .context("could not run sc.exe failure")?;
+    if !out.status.success() {
+        bail!(
+            "sc failure failed: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Writes the `Environment` `REG_MULTI_SZ` value under this service's own
+/// registry key, since `sc.rs` (the Windows backend behind `ServiceManager`)
+/// never reads `ServiceInstallCtx.environment`. Callers pass the merged list.
+#[cfg(windows)]
+fn write_windows_environment(service_name: &str, entries: &[String]) -> Result<()> {
+    service_key(service_name)?
+        .set_value("Environment", &entries.to_vec())
         .context("failed to write the Environment registry value")?;
-
     Ok(())
 }
 
@@ -378,5 +492,32 @@ pub mod windows {
         ))?;
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_quotes_the_exe() {
+        let c = windows_command_line(Path::new("C:\\Program Files\\e.exe"), "0.0.0.0");
+        assert_eq!(c, "\"C:\\Program Files\\e.exe\" run --bind 0.0.0.0");
+    }
+
+    #[test]
+    fn merge_keeps_existing_and_replaces_token() {
+        let ex = vec!["EMBARCH_SIGNAL_BAUD=460800".to_string(), "EMBARCH_TOKEN=old".to_string()];
+        let m = merge_environment(ex.clone(), Some("new"));
+        assert_eq!(m, vec!["EMBARCH_SIGNAL_BAUD=460800", "EMBARCH_TOKEN=new"]);
+        assert_eq!(merge_environment(ex.clone(), None), ex);
+        assert_eq!(environment_names(&m), vec!["EMBARCH_SIGNAL_BAUD", "EMBARCH_TOKEN"]);
+    }
+
+    #[test]
+    fn failure_args_are_five_restarts() {
+        let a = failure_args("x");
+        assert_eq!(a[3], "3600");
+        assert_eq!(a[5].matches("restart/5000").count(), 5);
     }
 }
