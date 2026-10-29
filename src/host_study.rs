@@ -2278,17 +2278,13 @@ mod tests {
         // Output the consoles print between steps, while nothing is exchanging.
         pd.feed(b"pd: PPS timeout\r\npd: hard reset\r\n");
         wait_for(|| captures.running("pd").unwrap().read(0, 0).total_bytes > 0);
-        let feeder = {
-            let dut = dut.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(60));
-                dut.feed(b"dut: attach\ndut: contract 9V\n");
-            })
-        };
+        // The dut console prints too, and the test waits until the tap holds it, so the output is
+        // before the first dut exchange by construction, not by a sleep racing the 150 ms wait step.
+        dut.feed(b"dut: attach\ndut: contract 9V\n");
+        wait_for(|| captures.running("dut").unwrap().read(0, 0).total_bytes == 29);
         let mut b = ViaCapture { captures: captures.clone(), replies: vec![] };
         let mut recs = vec![];
         let end = execute(&s, &mut b, &AtomicBool::new(false), StudyClock::new(), |r| recs.push(r));
-        feeder.join().unwrap();
         assert!(end.completed, "{end:?}");
         assert!(recs.iter().all(|r| matches!(r.result.outcome, Outcome::Pass)), "{recs:?}");
         // Opened once each, though pd was exchanged on twice.
