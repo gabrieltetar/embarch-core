@@ -4,6 +4,8 @@
 //! **A `Prompt` waits for a person and nothing else** (decision 105): it publishes the prompt
 //! (`PromptPending`, and `pending_prompt` on `GET /study/{id}` since SSE keeps no replay), and the
 //! step ends on an answer from `POST /study/{id}/prompt`, its deadline, or a cancel of the study.
+//! A prompt that names a bench configuration (`bench_config`, decision 107) carries the name on
+//! both and into the step's record, unchanged: Core knows no bench, so it resolves nothing.
 //!
 //! **A host study is the same bytes as the exchange route, in a sequence.** An `Exchange` step
 //! goes through [`crate::api::run_signal_exchange`], the body of `POST /signals/{name}/exchange`,
@@ -145,6 +147,8 @@ pub struct PromptRequest {
     pub step_index: u32,
     pub step_name: String,
     pub text: String,
+    /// The step's `bench_config`, as the study wrote it (decision 107).
+    pub bench_config: Option<String>,
     pub timeout_ms: u32,
 }
 
@@ -168,6 +172,11 @@ pub struct PendingPrompt {
     pub step_index: u32,
     pub step_name: String,
     pub text: String,
+    /// The bench configuration the step names, forwarded as the study wrote it (decision 107).
+    /// Core resolves nothing: the surface showing the prompt looks it up in the bench live there,
+    /// and a name that bench lacks is still shown. Absent when the step names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench_config: Option<String>,
     pub opened_utc_ms: u64,
     pub deadline_utc_ms: u64,
 }
@@ -289,6 +298,10 @@ pub struct StepRecord {
     pub prompt_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_deadline_utc_ms: Option<u64>,
+    /// The bench configuration a `Prompt` named, unresolved (decision 107), so the record says
+    /// which config was confirmed beside who confirmed it and when. Absent when it named none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench_config: Option<String>,
 }
 
 /// How a run ended. `completed` is whether every step ran and none stopped the study.
@@ -472,6 +485,7 @@ fn run_step<B: HostBackend>(
         delay_before_ms: step.delay_before_ms,
         prompt_id: None,
         prompt_deadline_utc_ms: None,
+        bench_config: None,
     };
     if !delayed {
         rec.result.outcome = fail("cancelled before the step ran");
@@ -545,11 +559,19 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            HostAction::Prompt { text } => {
-                let req = PromptRequest { list, step_index: index, step_name: step.name.clone(), text: text.clone(), timeout_ms: step.timeout_ms };
+            HostAction::Prompt { text, bench_config } => {
+                let req = PromptRequest {
+                    list,
+                    step_index: index,
+                    step_name: step.name.clone(),
+                    text: text.clone(),
+                    bench_config: bench_config.clone(),
+                    timeout_ms: step.timeout_ms,
+                };
                 let run = backend.prompt(req, cancel);
                 rec.prompt_id = Some(run.prompt_id);
                 rec.prompt_deadline_utc_ms = Some(run.deadline_utc_ms);
+                rec.bench_config = bench_config.clone();
                 rec.result.answered_by = run.end.answered_by().map(|by| by.as_str().to_string());
                 match run.end {
                     PromptEnd::Answered(PromptAnswer::Confirmed, _) => rec.detail = detail::CONFIRMED,
@@ -1178,6 +1200,7 @@ impl HostBackend for CoreBackend {
             step_index: req.step_index,
             step_name: req.step_name,
             text: req.text,
+            bench_config: req.bench_config,
             opened_utc_ms: opened,
             deadline_utc_ms: opened + req.timeout_ms as u64,
         };
@@ -1646,7 +1669,19 @@ mod tests {
     }
 
     fn ask(name: &str, timeout_ms: u32) -> HostStep {
-        HostStep { name: name.into(), action: HostAction::Prompt { text: format!("{name}: plug in the pack") }, timeout_ms, continue_on_fail: false, delay_before_ms: 0 }
+        HostStep {
+            name: name.into(),
+            action: HostAction::Prompt { text: format!("{name}: plug in the pack"), bench_config: None },
+            timeout_ms,
+            continue_on_fail: false,
+            delay_before_ms: 0,
+        }
+    }
+
+    fn ask_for(name: &str, bench_config: &str) -> HostStep {
+        let mut step = ask(name, 5_000);
+        step.action = HostAction::Prompt { text: format!("{name}: re-cable"), bench_config: Some(bench_config.into()) };
+        step
     }
 
     // ---- prompts (decision 105) ----
@@ -1719,6 +1754,7 @@ mod tests {
             step_index: 0,
             step_name: "plug".into(),
             text: "plug in".into(),
+            bench_config: None,
             opened_utc_ms: 1,
             deadline_utc_ms: 2,
         };
@@ -1791,6 +1827,73 @@ mod tests {
         assert_eq!((b.answer, b.answered_by), (PromptAnswer::Cancelled, AnsweredBy::Cli));
         assert!(serde_json::from_str::<PromptAnswerBody>(r#"{"prompt_id":4,"answer":"yes","answered_by":"cli"}"#).is_err());
         assert!(serde_json::from_str::<PromptAnswerBody>(r#"{"prompt_id":4,"answer":"confirmed","answered_by":"agent"}"#).is_err());
+    }
+
+    // ---- a prompt naming a bench configuration (decision 107) ----
+
+    #[test]
+    fn a_named_bench_config_reaches_the_backend_and_the_record_unresolved() {
+        // A name no bench here has: Core checks it against nothing, so the study is accepted.
+        let s = study(vec![ask_for("swap", "analyzer in line"), ask("plug", 5_000)], vec![ask_for("restore", "direct")]);
+        assert!(check_study(&s).is_ok());
+        let mut b = Script::new(vec![]);
+        b.prompt_ends.extend([
+            PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui),
+            PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Cli),
+            PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui),
+        ]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert!(end.completed, "{:?}", end.reason);
+        let asked: Vec<Option<&str>> = b.prompts.iter().map(|p| p.bench_config.as_deref()).collect();
+        assert_eq!(asked, [Some("analyzer in line"), None, Some("direct")]);
+        // The record says which config was confirmed, beside who confirmed it and when.
+        let row = serde_json::to_value(&recs[0]).unwrap();
+        assert_eq!(row["bench_config"], "analyzer in line");
+        assert_eq!((row["answered_by"].as_str(), row["prompt_id"].as_u64()), (Some("ui"), Some(1)));
+        assert_eq!((recs[2].list, recs[2].bench_config.as_deref()), (HostList::Teardown, Some("direct")));
+        // A prompt that names none records no key, as before the field existed.
+        let row = serde_json::to_value(&recs[1]).unwrap();
+        assert!(row.get("bench_config").is_none(), "{row}");
+    }
+
+    #[test]
+    fn the_event_and_the_status_body_carry_bench_config_flat_only_when_named() {
+        let mut pending = slot_with("h1", 4).lock().unwrap().clone().unwrap().pending;
+        let ev = serde_json::to_value(StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() }).unwrap();
+        assert!(ev.get("bench_config").is_none(), "{ev}");
+        assert!(serde_json::to_value(&pending).unwrap().get("bench_config").is_none());
+        pending.bench_config = Some("analyzer in line".into());
+        let ev = serde_json::to_value(StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() }).unwrap();
+        assert_eq!((ev["kind"].as_str(), ev["bench_config"].as_str()), (Some("PromptPending"), Some("analyzer in line")));
+        assert_eq!(serde_json::to_value(&pending).unwrap()["bench_config"], "analyzer in line");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_backend_publishes_bench_config_on_the_slot_and_the_event() {
+        let state = AppState::new("t".into());
+        let mut events = state.study_events.subscribe();
+        let mut backend = CoreBackend { state: state.clone(), handle: tokio::runtime::Handle::current(), study_id: "h1".into(), prompts: 0 };
+        let req = PromptRequest {
+            list: HostList::Steps,
+            step_index: 3,
+            step_name: "swap".into(),
+            text: "move the analyzer in line".into(),
+            bench_config: Some("analyzer in line".into()),
+            timeout_ms: 10_000,
+        };
+        let asker = std::thread::spawn(move || backend.prompt(req, None));
+        let pending = loop {
+            if let Some(p) = pending_prompt(&state.host_prompt, "h1") {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(pending.bench_config.as_deref(), Some("analyzer in line"));
+        let ev = serde_json::to_value(events.recv().await.unwrap()).unwrap();
+        assert_eq!((ev["kind"].as_str(), ev["bench_config"].as_str()), (Some("PromptPending"), Some("analyzer in line")));
+        assert_eq!(record_answer(&state.host_prompt, "h1", &body(pending.prompt_id, PromptAnswer::Confirmed)), Ok(true));
+        let run = tokio::task::spawn_blocking(move || asker.join().unwrap()).await.unwrap();
+        assert_eq!(run.end, PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
     }
 
     #[tokio::test]
