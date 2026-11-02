@@ -3798,6 +3798,17 @@ pub struct StudyStepEntryResponse {
     pub reply_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    /// A host study's `Prompt` row only (decisions 105, 107): the id it was published under, its
+    /// deadline, the surface that relayed the answer (absent when nobody answered), and the bench
+    /// configuration the step named, unresolved (absent when it named none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_deadline_utc_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3849,6 +3860,15 @@ struct EventsFileStep {
     reply_bytes: Option<usize>,
     #[serde(default)]
     elapsed_ms: Option<u64>,
+    // A host study's `Prompt` rows only (decisions 105, 107).
+    #[serde(default)]
+    prompt_id: Option<u32>,
+    #[serde(default)]
+    prompt_deadline_utc_ms: Option<u64>,
+    #[serde(default)]
+    answered_by: Option<String>,
+    #[serde(default)]
+    bench_config: Option<String>,
 }
 
 /// Splits [`Outcome`]'s serialized form into a name and, for a `Fail`, the
@@ -3933,6 +3953,10 @@ fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
                 reply_truncated: s.reply_truncated,
                 reply_bytes: s.reply_bytes,
                 elapsed_ms: s.elapsed_ms,
+                prompt_id: s.prompt_id,
+                prompt_deadline_utc_ms: s.prompt_deadline_utc_ms,
+                answered_by: s.answered_by,
+                bench_config: s.bench_config,
             }
         })
         .collect();

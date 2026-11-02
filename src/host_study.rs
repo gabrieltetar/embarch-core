@@ -2219,6 +2219,33 @@ mod tests {
         assert_eq!(kinds, ["step", "step", "step", "status"]);
     }
 
+    #[test]
+    fn a_prompt_row_reads_back_through_the_steps_route_with_who_when_and_which_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lenient = ask("plain", 5_000);
+        lenient.continue_on_fail = true;
+        let s = study(vec![ask_for("swap", "analyzer in line"), lenient, ex("a", "x", "pd: ")], vec![]);
+        let mut b = Script::new(vec![ok_reply("x", "pd: ok")]);
+        // The first prompt is confirmed from the UI; the second is never answered and times out.
+        b.prompt_ends.push_back(PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
+        let jobs: JobRegistry = Default::default();
+        jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(3), reason: None });
+        let (tx, _rx) = broadcast::channel(16);
+        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None);
+        let resp = crate::study::steps_for_test(&String::from_utf8(std::fs::read(dir.path().join("events.json")).unwrap()).unwrap());
+        let rows: Vec<serde_json::Value> = resp.steps.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        assert_eq!((rows[0]["prompt_id"].as_u64(), rows[0]["prompt_deadline_utc_ms"].as_u64()), (Some(1), Some(1_000)));
+        assert_eq!((rows[0]["answered_by"].as_str(), rows[0]["bench_config"].as_str()), (Some("ui"), Some("analyzer in line")));
+        assert_eq!(rows[0]["detail"], detail::CONFIRMED);
+        // Unanswered, naming no config: id and deadline, and neither of the other two keys.
+        assert_eq!((rows[1]["prompt_id"].as_u64(), rows[1]["detail"].as_str()), (Some(2), Some(detail::PROMPT_TIMED_OUT)));
+        assert!(rows[1].get("answered_by").is_none() && rows[1].get("bench_config").is_none(), "{}", rows[1]);
+        // Not a prompt: none of the four.
+        for key in ["prompt_id", "prompt_deadline_utc_ms", "answered_by", "bench_config"] {
+            assert!(rows[2].get(key).is_none(), "{key}: {}", rows[2]);
+        }
+    }
+
     #[tokio::test]
     async fn a_second_study_is_refused_409_while_any_study_holds_the_lock() {
         let state = AppState::new("t".into());
