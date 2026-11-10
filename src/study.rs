@@ -463,6 +463,12 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // or saved study can. Computed by the crate, not restated (core decision 90).
     study.validate_wait_budgets().map_err(|e| e.to_string())?;
 
+    // `embarch-study-designer` decision 89: a GattMonitorAll/GattMonitorSelected
+    // step inside a window a GattMonitorStart opened and nothing closed is
+    // refused by dev-bench at run time (dev-bench decision 55). Computed by the
+    // crate, not restated (core decision 90).
+    study.validate_monitor_windows().map_err(|e| e.to_string())?;
+
     let recomputed = steps_crc(&study.steps)
         .map_err(|_| "failed to recompute steps_crc (a step's encoding is unexpectedly large)".to_string())?;
     if recomputed != study.steps_crc {
@@ -5087,6 +5093,35 @@ mod tests {
             assert!(err.contains(kind) && err.contains('1'), "{err}");
             assert!(validate_study(&with_op(nonzero)).is_ok());
         }
+    }
+
+    /// study-designer decision 89 / core decision 90: a one-shot monitor
+    /// inside an open window is refused naming both steps; outside every
+    /// window (before it, or after its Stop) it passes.
+    #[test]
+    fn validate_study_refuses_a_one_shot_monitor_inside_an_open_window() {
+        let with_actions = |actions: &[Action]| {
+            let mut study = study_with_steps(&vec![1_000; actions.len()]);
+            for (i, a) in actions.iter().enumerate() {
+                study.steps[i].action = a.clone();
+            }
+            study.steps_crc = steps_crc(&study.steps).unwrap();
+            study
+        };
+        let err = validate_study(&with_actions(&[
+            Action::GattMonitorStart {},
+            Action::GattMonitorAll {},
+        ]))
+        .unwrap_err();
+        assert!(err.contains("step 1") && err.contains("step 0"), "{err}");
+
+        assert!(validate_study(&with_actions(&[
+            Action::GattMonitorAll {},
+            Action::GattMonitorStart {},
+            Action::GattMonitorStop {},
+            Action::GattMonitorAll {},
+        ]))
+        .is_ok());
     }
 
     #[test]
