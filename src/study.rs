@@ -884,7 +884,17 @@ fn next_deadline(study: &Study, next_expected: usize, now: Instant) -> Instant {
 pub struct HelloAckInfo {
     pub schema_version: u32,
     pub compatible: bool,
-    pub firmware_version: String,
+    /// The **bench's** own build, as its `HelloAck.firmware_version` reports
+    /// it — the value a `Study`'s `requires.dev_bench_version` is compared
+    /// against, and named for that field rather than for the wire's.
+    ///
+    /// Served as `dev_bench_version`, not `firmware_version`, since decision
+    /// 108 (`tasks/suite/037`): on this route the old name collided with
+    /// `requires.firmware_version`, which is the **DUT's**, so a caller
+    /// matching name to name pinned a DUT requirement to the bench's build.
+    /// Only this struct's name moves; the wire field keeps its spelling
+    /// (`embarch-study-designer` decision 74).
+    pub dev_bench_version: String,
     /// What the bench says its own chip ID is (`embarch-study-designer`
     /// schema v10, §3 decision 35) — empty when its build cannot answer.
     ///
@@ -1092,7 +1102,7 @@ async fn open_and_handshake(
                 let info = HelloAckInfo {
                     schema_version,
                     compatible,
-                    firmware_version: firmware_version.to_string(),
+                    dev_bench_version: firmware_version.to_string(),
                     self_reported_hardware_id: hardware_id.to_string(),
                     link_identity: describe_identity(identity).to_string(),
                     probe_hardware_id: probe_hardware_id_text.clone(),
@@ -1226,11 +1236,12 @@ fn describe_identity(identity: embarch_topology::hardware::SelfReportedIdentity)
 // ---- GET /dev-bench/hello ---------------------------------------------------
 
 /// Opens the dev-bench link just long enough to run the `Hello`/`HelloAck`
-/// handshake and report `firmware_version`, then closes it — no `Study` is
-/// sent. This is the "existing `GET /dev-bench/port`-adjacent connection"
-/// `embarch-umbrella` decision 19 names as check 13's data
-/// source: `doctor` compares the `firmware_version` this returns against the
-/// local `embarch-dev-bench` checkout's own `git describe`.
+/// handshake and report the bench's build as `dev_bench_version` (decision
+/// 108), then closes it — no `Study` is sent. This is the "existing
+/// `GET /dev-bench/port`-adjacent connection" `embarch-umbrella` decision 19
+/// names as check 13's data source: `doctor` compares the
+/// `dev_bench_version` this returns against the local `embarch-dev-bench`
+/// checkout's own `git describe`.
 ///
 /// Rejects with `409` if a study is already in flight — the dev-bench link
 /// is a single serial port, and this call would otherwise race
@@ -1495,7 +1506,7 @@ pub async fn post_study_handler(
     let protocols_crc_value = study.protocols_crc;
     let requires = study.requires.clone();
     let dev_bench_log_level = study.dev_bench_log_level;
-    let reported = hello.firmware_version.clone();
+    let reported = hello.dev_bench_version.clone();
     let run_for_gate = run.clone();
 
     // Decision 31's gate and the `StudyStart` send, in that order and in one
@@ -1558,7 +1569,7 @@ pub async fn post_study_handler(
     // Assembled after the gate rather than before it, because `overrides` is
     // the gate's own output and a provenance built ahead of it could only
     // ever have claimed the requirements were met.
-    let provenance = provenance_for(&study, &hello.firmware_version, &run, overrides);
+    let provenance = provenance_for(&study, &hello.dev_bench_version, &run, overrides);
 
     let total_steps = study.steps.len() as u32;
     {
@@ -7107,6 +7118,39 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), all.len());
+    }
+
+    /// `GET /dev-bench/hello`'s body, key for key — the Core-side half of the
+    /// mirror `embarch-core-client`'s `HelloAckResponse` pins from the other
+    /// side. Decision 108's rename is the regression this guards: the bench's
+    /// build is served as `dev_bench_version`, and no key on this route may be
+    /// called `firmware_version` again, because on a `Study` that name is the
+    /// DUT's.
+    #[test]
+    fn hello_ack_info_serves_the_bench_build_as_dev_bench_version() {
+        let info = HelloAckInfo {
+            schema_version: 10,
+            compatible: true,
+            dev_bench_version: "g1a2b3c".to_string(),
+            self_reported_hardware_id: "AAAABBBB".to_string(),
+            link_identity: "undeclared".to_string(),
+            probe_hardware_id: "BBBBAAAA".to_string(),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "compatible",
+                "dev_bench_version",
+                "link_identity",
+                "probe_hardware_id",
+                "schema_version",
+                "self_reported_hardware_id",
+            ]
+        );
+        assert_eq!(json["dev_bench_version"], "g1a2b3c");
     }
 
     // ---- generate_study_id ----
