@@ -17,8 +17,11 @@ on:
 env:
   BIN: embarch-core
 
+# Build jobs only read: they hand their archive on as a workflow artifact and
+# never hold `contents: write` or `id-token: write`. Both are granted to the
+# one `sign-and-publish` job below.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # embarch-umbrella decisions 27/29: no release may build a binary whose
@@ -192,8 +195,70 @@ jobs:
             echo "asset=embarch-core/dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload release asset
+      # The archive is uploaded as a workflow artifact, not a release asset:
+      # the signing job downloads every target's archive and publishes asset
+      # and bundle together. `working-directory` does not apply to `uses:`,
+      # so the path keeps its `embarch-core/` prefix.
+      - name: Upload archive as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  # Signs every archive and publishes it with its bundle. The signing step
+  # sits in this file, not a reusable workflow: the certificate's identity is
+  # the workflow that ran the step (`job_workflow_ref`), and
+  # embarch-umbrella's suite assembly verifies this repo's bundles against
+  # exactly
+  # https://github.com/gabrieltetar/embarch-core/.github/workflows/release.yml@refs/tags/<tag>
+  # The `release` environment (owner-reviewed, tag runs only) makes it one
+  # approval per release; `id-token: write` is on this job alone.
+  sign-and-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download every target's archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      # cosign 3.0.4 or later: earlier releases carry GHSA-whqx-f9j3-ch6m
+      # (a bundle could verify although its log entry did not match the
+      # artifact).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+        with:
+          cosign-release: v3.0.4
+
+      - name: Sign every archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          count=0
+          for asset in *.zip *.tar.gz; do
+            [ -e "$asset" ] || continue
+            cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+            count=$((count + 1))
+          done
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 archives to sign, found $count"
+            exit 1
+          fi
+          ls -l
+
+      - name: Upload release assets and bundles
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.asset }}
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sigstore.json
           fail_on_unmatched_files: true
