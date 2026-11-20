@@ -17,21 +17,93 @@ pub fn local_data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from("/var/lib/embarch"))
 }
 
-/// The canonical machine-wide token file path: `local_data_dir()/token`.
+/// The agent's machine-wide token file: `local_data_dir()/token`. The one
+/// file every existing caller discovers (`embarch-token.md` §2).
 fn token_file_path() -> Result<PathBuf> {
     Ok(local_data_dir()?.join("token"))
 }
 
-/// Resolves the token used to authenticate incoming requests: an explicit
-/// `EMBARCH_TOKEN` env var takes precedence and leaves the token file
-/// untouched; otherwise the machine-wide token file is reused if present, or
-/// generated on first use.
-pub fn resolve_token() -> Result<String> {
-    if let Ok(token) = std::env::var("EMBARCH_TOKEN") {
-        return Ok(token);
-    }
+/// The person's token file, beside the agent's: `local_data_dir()/person-token`.
+fn person_token_file_path() -> Result<PathBuf> {
+    Ok(local_data_dir()?.join("person-token"))
+}
 
-    resolve_token_at_path(&token_file_path()?)
+/// Which of the two tokens authenticated a request (decision 109). Core is
+/// unattested today, so nothing is refused by scope: it is recorded, for a
+/// later handler to stamp onto a note, an adoption or a publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Agent,
+    Person,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Agent => "agent",
+            Scope::Person => "person",
+        }
+    }
+}
+
+/// A handler takes `scope: Scope` to read what `auth_middleware` recorded.
+/// A request that reached a handler has been authenticated, so the extension
+/// is always present; its absence is a router wired without the middleware.
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Scope {
+    type Rejection = (axum::http::StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts.extensions.get::<Scope>().copied().ok_or((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "request carries no scope: auth_middleware did not run",
+        ))
+    }
+}
+
+/// The two tokens Core authenticates with.
+#[derive(Clone, Debug)]
+pub struct Tokens {
+    pub agent: String,
+    pub person: String,
+}
+
+impl Tokens {
+    /// The scope a bearer value matches, or `None`. The agent is checked
+    /// first; `resolve_tokens` refuses two equal tokens, so the order never
+    /// decides a real request.
+    pub fn scope_of(&self, bearer: &str) -> Option<Scope> {
+        if bearer == self.agent {
+            Some(Scope::Agent)
+        } else if bearer == self.person {
+            Some(Scope::Person)
+        } else {
+            None
+        }
+    }
+}
+
+/// Resolves both tokens. The agent's: `EMBARCH_TOKEN` if set (file left
+/// untouched), else the machine-wide file, generated on first use. The
+/// person's: `EMBARCH_PERSON_TOKEN` if set, else its own file beside the
+/// agent's, generated on first use with the same permissions. Equal tokens
+/// are refused, since a scope that cannot be told apart is no scope.
+pub fn resolve_tokens() -> Result<Tokens> {
+    let agent = match std::env::var("EMBARCH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => resolve_token_at_path(&token_file_path()?)?,
+    };
+    let person = match std::env::var("EMBARCH_PERSON_TOKEN") {
+        Ok(t) => t,
+        Err(_) => resolve_token_at_path(&person_token_file_path()?)?,
+    };
+    anyhow::ensure!(
+        agent != person,
+        "the agent and person tokens are equal; a request's scope could not be told apart"
+    );
+    Ok(Tokens { agent, person })
 }
 
 fn resolve_token_at_path(path: &Path) -> Result<String> {
@@ -175,6 +247,35 @@ mod tests {
 
         let reused = resolve_token_at_path(&path).expect("should reuse the existing token");
         assert_eq!(generated, reused);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_files_hold_two_distinct_tokens_and_a_restart_reuses_both() {
+        let dir = temp_path("pair");
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent_path = dir.join("token");
+        let person_path = dir.join("person-token");
+
+        let a = resolve_token_at_path(&agent_path).unwrap();
+        let p = resolve_token_at_path(&person_path).unwrap();
+        assert_ne!(a, p);
+        assert!(agent_path.exists() && person_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&person_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert_eq!(resolve_token_at_path(&agent_path).unwrap(), a);
+        assert_eq!(resolve_token_at_path(&person_path).unwrap(), p);
+
+        let t = Tokens { agent: a.clone(), person: p.clone() };
+        assert_eq!(t.scope_of(&a), Some(Scope::Agent));
+        assert_eq!(t.scope_of(&p), Some(Scope::Person));
+        assert_eq!(t.scope_of("other"), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -27,7 +27,9 @@ use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, serial, s
 /// `hw_lock`; `hw_lock` never waits on `study_lock` (`decisions/platform.md`).
 #[derive(Clone)]
 pub struct AppState {
-    pub token: String,
+    /// The agent's token, and the person's (decision 109); either
+    /// authenticates, and `auth_middleware` records which one matched.
+    pub tokens: crate::token_store::Tokens,
     pub hw_lock: Arc<Mutex<()>>,
     /// The route currently holding `hw_lock`, or `None` when it's free.
     /// Kept in a plain `std::sync::Mutex` rather than folded into `hw_lock`
@@ -66,12 +68,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Tests: `token` is the agent's, and the person's is `person-<token>`.
+    #[cfg(test)]
+    pub fn new(token: String) -> Self {
+        let person = format!("person-{token}");
+        Self::with_tokens(crate::token_store::Tokens { agent: token, person })
+    }
+
     /// Constructs the `/study*`-only fields fresh — kept here so
     /// `main.rs`'s `serve` doesn't need to know any of their internals.
-    pub fn new(token: String) -> Self {
+    pub fn with_tokens(tokens: crate::token_store::Tokens) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         Self {
-            token,
+            tokens,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
             host_cancel: Arc::new(StdMutex::new(None)),
@@ -200,27 +209,31 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Simple bearer-token check. This is deliberately not OAuth or anything
+/// Simple bearer-token check, against two tokens: the match is recorded as
+/// a `token_store::Scope` request extension for every handler to take
+/// (decision 109). Nothing is refused by scope. This is deliberately not OAuth or anything
 /// fancy — Core may end up reachable over a real network (WSL-to-Windows,
 /// or a LAN if Core moves to a Pi), so "open to whoever can see the port"
 /// isn't good enough even at single-engineer scale.
 async fn auth_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let expected = format!("Bearer {}", state.token);
-    let ok = req
+    let scope = req
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .map(|h| h == expected)
-        .unwrap_or(false);
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(|bearer| state.tokens.scope_of(bearer));
 
-    if ok {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+    match scope {
+        Some(scope) => {
+            tracing::debug!(scope = scope.as_str(), path = req.uri().path(), "authenticated");
+            req.extensions_mut().insert(scope);
+            Ok(next.run(req).await)
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -3097,6 +3110,58 @@ mod tests {
                 "{method} {path} (sent as {uri}) answered a request carrying the wrong \
                  bearer token"
             );
+        }
+    }
+
+    // ---- the two tokens, and the scope each one records (decision 109) ----
+
+    /// A one-route router behind the real `auth_middleware`, whose handler
+    /// answers with the `Scope` extractor's value: what a later handler sees.
+    fn scope_probe_router() -> Router {
+        let state = AppState::new("agent-tok".to_string());
+        Router::new()
+            .route("/probe", get(|scope: crate::token_store::Scope| async move { scope.as_str() }))
+            .layer(middleware::from_fn_with_state(state, auth_middleware))
+    }
+
+    async fn probe(bearer: Option<&str>) -> (StatusCode, String) {
+        let mut b = Request::builder().uri("/probe");
+        if let Some(t) = bearer {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        let r = scope_probe_router().oneshot(b.body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let status = r.status();
+        let body = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn each_token_records_its_own_scope_and_neither_is_refused_by_it() {
+        assert_eq!(probe(Some("agent-tok")).await, (StatusCode::OK, "agent".to_string()));
+        assert_eq!(probe(Some("person-agent-tok")).await, (StatusCode::OK, "person".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_call_with_neither_token_is_refused() {
+        assert_eq!(probe(None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(probe(Some("nope")).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn both_tokens_reach_a_real_route() {
+        // `GET /lease` with none live is 404: past auth, no hardware touched.
+        for tok in ["test-token", "person-test-token"] {
+            let r = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/lease")
+                        .header("authorization", format!("Bearer {tok}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{tok}");
         }
     }
 

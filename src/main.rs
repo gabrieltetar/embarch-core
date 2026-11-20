@@ -409,9 +409,9 @@ pub(crate) async fn serve(
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let token = token_store::resolve_token()?;
+    let tokens = token_store::resolve_tokens()?;
 
-    let state = api::AppState::new(token);
+    let state = api::AppState::with_tokens(tokens);
 
     let app = api::build_router(state);
 
