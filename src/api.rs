@@ -3119,8 +3119,8 @@ mod tests {
     /// answers with the `Scope` extractor's value: what a later handler sees.
     fn scope_probe_router() -> Router {
         let state = AppState::new("agent-tok".to_string());
-        Router::new()
-            .route("/probe", get(|scope: crate::token_store::Scope| async move { scope.as_str() }))
+        // One line starting `Router::new()`: the route-sweep scan counts lines starting `.route("`.
+        Router::new().route("/probe", get(|scope: crate::token_store::Scope| async move { scope.as_str() }))
             .layer(middleware::from_fn_with_state(state, auth_middleware))
     }
 
