@@ -165,7 +165,7 @@ fn resolve_token_at_path(path: &Path) -> Result<String> {
 /// same reason — no name resolution left for any of the three principals to
 /// get wrong.
 #[cfg(windows)]
-fn restrict_token_file_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_token_file_permissions(path: &Path) -> Result<()> {
     const SID_SYSTEM: &str = "S-1-5-18";
     const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
 

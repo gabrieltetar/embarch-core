@@ -16,6 +16,7 @@ mod live;
 mod logs;
 mod serial;
 mod service;
+mod signing;
 mod outpost_load;
 mod outpost_manifest;
 mod outpost_preflight;
@@ -411,7 +412,7 @@ pub(crate) async fn serve(
 ) -> anyhow::Result<()> {
     let tokens = token_store::resolve_tokens()?;
 
-    let state = api::AppState::with_tokens(tokens);
+    let state = api::AppState::with_tokens(tokens, signing::Sealer::resolve()?);
 
     let app = api::build_router(state);
 

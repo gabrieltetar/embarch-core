@@ -96,6 +96,14 @@ toml = "1.1"
 tracing = "0.1.44"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3.23"
+# `signing.rs` (decision 110): Core's Ed25519 key signs each study run's DSSE
+# record. No `rand_core` feature: the key's seed comes from `rand` (already
+# here) through `SigningKey::from_bytes`, so dalek's own `rand_core` 0.6 stays
+# out. It depends on `sha2` 0.10, a second copy beside this crate's 0.11.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+# DSSE `payload` and `sig` are standard base64. 0.22, the copy dalek-free
+# dependents already resolve; `cargo tree -i base64` also shows a 0.23.
+base64 = "0.22"
 
 [target."cfg(windows)".dependencies]
 windows-service = "0.8.1"

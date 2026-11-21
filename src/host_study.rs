@@ -1094,6 +1094,7 @@ pub fn run_job<B: HostBackend>(
     jobs: &JobRegistry,
     events_tx: &broadcast::Sender<StudyEvent>,
     taps: Option<StudyTaps>,
+    seal: Option<&crate::signing::SealJob>,
 ) {
     let mut writer = match HostEventsWriter::start(dir, &study.name) {
         Ok(w) => w,
@@ -1142,6 +1143,13 @@ pub fn run_job<B: HostBackend>(
     if let Err(e) = writer.finish(&end, &streams) {
         crate::study::fail_job(jobs, events_tx, study_id, format!("failed to finalize events.json: {e:#}"));
         return;
+    }
+    // Signed before the job reads as completed (decision 110).
+    if let Some(seal) = seal {
+        if let Err(e) = seal.sealer.seal(seal, dir, study_id, crate::study::current_utc_ms()) {
+            crate::study::fail_job(jobs, events_tx, study_id, format!("failed to sign the run record: {e:#}"));
+            return;
+        }
     }
     let reason = match (&end.reason, end.teardown_failures) {
         (Some(r), 0) => Some(r.clone()),
@@ -1239,9 +1247,12 @@ impl Drop for JobHold {
 // route: POST /host-studies
 pub async fn post_host_study_handler(
     State(state): State<AppState>,
+    axum::extract::Query(build): axum::extract::Query<crate::signing::BuildClaimParams>,
     Json(study): Json<HostStudy>,
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     check_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let build = build.claims().map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "host", build };
 
     let study_id = crate::study::generate_study_id();
     crate::study::take_study_lock(&state, &study_id)?;
@@ -1280,7 +1291,7 @@ pub async fn post_host_study_handler(
         let outcome = tokio::task::spawn_blocking(move || {
             let _hold = hold;
             let mut backend = CoreBackend { state, handle, study_id: id.clone(), prompts: 0 };
-            run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx, taps);
+            run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx, taps, Some(&seal));
         })
         .await;
         if let Err(e) = outcome {
@@ -1335,7 +1346,8 @@ fn render_counts_for(
 ) -> Result<LineCountsResponse, (StatusCode, String)> {
     let study: HostStudy = std::fs::read(dir.join(STUDY_FILE))
         .map_err(|_| (StatusCode::NOT_FOUND, format!("study '{study_id}' has no {STUDY_FILE}: it is not a host study this Core ran, or was run before Core kept the submitted study")))
-        .and_then(|b| serde_json::from_slice(&b).map_err(internal_err))?;
+        // A device study keeps its own `Study` under this name (decision 110).
+        .and_then(|b| serde_json::from_slice(&b).map_err(|_| (StatusCode::NOT_FOUND, format!("study '{study_id}' is not a host study"))))?;
     let events: serde_json::Value = std::fs::read(dir.join("events.json"))
         .map_err(|_| (StatusCode::CONFLICT, format!("study '{study_id}' has not finished: counts are rendered over a finished run")))
         .and_then(|b| serde_json::from_slice(&b).map_err(internal_err))?;
@@ -2181,6 +2193,26 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_host_run_is_sealed_before_it_reads_completed_and_names_its_study_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = study(vec![ex("a", "x", "pd: ")], vec![]);
+        let mut b = Script::new(vec![ok_reply("x", "pd: ok")]);
+        let jobs: JobRegistry = Default::default();
+        jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(1), reason: None });
+        let (tx, _rx) = broadcast::channel(16);
+        let seal = crate::signing::SealJob { sealer: crate::signing::Sealer::ephemeral(), kind: "host", build: None };
+        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None, Some(&seal));
+        assert_eq!(jobs.lock().unwrap().get("id1").unwrap().status, "completed");
+        let env: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(crate::signing::RECORD_FILE)).unwrap()).unwrap();
+        assert_eq!(env["payloadType"], crate::signing::PAYLOAD_TYPE);
+        use base64::Engine as _;
+        let st: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap()).unwrap()).unwrap();
+        let names: Vec<&str> = st["subject"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"events.json") && names.contains(&STUDY_FILE), "{names:?}");
+        assert_eq!(st["predicate"]["kind"], "host");
+    }
+
+    #[test]
     fn the_record_on_disk_reads_back_through_the_steps_route_shape() {
         let dir = tempfile::tempdir().unwrap();
         let s = study(vec![ex("a", "x", "pd: "), ex("b", "y", "pd: ")], vec![ex("safe", "s", "pd: ")]);
@@ -2188,7 +2220,7 @@ mod tests {
         let jobs: JobRegistry = Default::default();
         jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(2), reason: None });
         let (tx, mut rx) = broadcast::channel(16);
-        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None);
+        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None, None);
         let job = jobs.lock().unwrap().get("id1").cloned().unwrap();
         assert_eq!(job.status, "completed");
         assert!(job.reason.unwrap().contains("step 'b' failed"));
@@ -2231,7 +2263,7 @@ mod tests {
         let jobs: JobRegistry = Default::default();
         jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(3), reason: None });
         let (tx, _rx) = broadcast::channel(16);
-        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None);
+        run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None, None);
         let resp = crate::study::steps_for_test(&String::from_utf8(std::fs::read(dir.path().join("events.json")).unwrap()).unwrap());
         let rows: Vec<serde_json::Value> = resp.steps.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
         assert_eq!((rows[0]["prompt_id"].as_u64(), rows[0]["prompt_deadline_utc_ms"].as_u64()), (Some(1), Some(1_000)));
@@ -2251,14 +2283,14 @@ mod tests {
         let state = AppState::new("t".into());
         *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
         let s = study(vec![ex("a", "x", "pd: ")], vec![]);
-        let err = post_host_study_handler(State(state.clone()), Json(s.clone())).await.unwrap_err();
+        let err = post_host_study_handler(State(state.clone()), Default::default(), Json(s.clone())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("study-abc"), "{}", err.1);
         // The refused call did not disturb the holder.
         assert_eq!(state.study_lock.lock().unwrap().as_deref(), Some("study-abc"));
         // A bad study is a 400 before the lock is looked at.
         let bad = study(vec![], vec![]);
-        assert_eq!(post_host_study_handler(State(state), Json(bad)).await.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(post_host_study_handler(State(state), Default::default(), Json(bad)).await.unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

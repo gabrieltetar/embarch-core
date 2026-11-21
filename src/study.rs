@@ -792,7 +792,7 @@ pub(crate) fn generate_study_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn current_utc_ms() -> u64 {
+pub(crate) fn current_utc_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1412,9 +1412,12 @@ pub(crate) fn take_study_lock(state: &AppState, study_id: &str) -> Result<(), (S
 pub async fn post_study_handler(
     State(state): State<AppState>,
     Query(run): Query<StudyRunParams>,
+    Query(build): Query<crate::signing::BuildClaimParams>,
     Json(study): Json<Study>,
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let build = build.claims().map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build };
 
     // A tap on a signal a decision 92 capture holds open would be refused by
     // the OS only after the flash and reset (core decision 102).
@@ -1608,6 +1611,7 @@ pub async fn post_study_handler(
                 manifest_slot,
                 tap_ports,
                 study_start_utc_ms,
+                seal,
             )
         })
         .await;
@@ -1728,6 +1732,7 @@ fn run_study_to_completion(
     manifest_slot: crate::outpost_manifest::ManifestSlot,
     tap_ports: TapPorts,
     study_start_utc_ms: u64,
+    seal: crate::signing::SealJob,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -1754,6 +1759,22 @@ fn run_study_to_completion(
     if let Ok(root) = study_results_root() {
         if let Err(e) = stream_store::sweep_study_results(&root, stream_store::study_results_keep()) {
             tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
+        }
+    }
+
+    // The submitted study, kept as Core received it, so the run's signed record
+    // can name it by hash (decision 110). Written whole, not streamed: a study
+    // is small, and the record is signed only after the run ends.
+    match serde_json::to_vec_pretty(&study) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(results_dir.join(crate::host_study::STUDY_FILE), bytes) {
+                fail_job(&jobs, &events_tx, &study_id, format!("failed to keep the submitted study: {e:?}"));
+                return;
+            }
+        }
+        Err(e) => {
+            fail_job(&jobs, &events_tx, &study_id, format!("failed to serialise the submitted study: {e:?}"));
+            return;
         }
     }
 
@@ -2243,7 +2264,7 @@ fn run_study_to_completion(
     render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
 
     match outcome {
-        Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer),
+        Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer, Some(&seal)),
         Err(reason) => fail_job(&jobs, &events_tx, &study_id, reason),
     }
 }
@@ -3416,7 +3437,13 @@ impl EventsJsonWriter {
 /// (a study that stopped early on a failing step with `continue_on_fail:
 /// false`) is still a normal protocol completion, not a watchdog/connection
 /// failure — `"failed"` status is reserved for those.
-fn finish_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, writer: EventsJsonWriter) {
+fn finish_job(
+    jobs: &JobRegistry,
+    events_tx: &broadcast::Sender<StudyEvent>,
+    study_id: &str,
+    writer: EventsJsonWriter,
+    seal: Option<&crate::signing::SealJob>,
+) {
     if let Err(e) = writer.finish() {
         // Every step already made it to the `.partial` file — only the
         // finalize-and-rename step failed, so this is reported as a failure
@@ -3424,6 +3451,18 @@ fn finish_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, stu
         // never got its final name.
         fail_job(jobs, events_tx, study_id, format!("failed to finalize events.json: {e:?}"));
         return;
+    }
+
+    // The signed record is written before the job reads as completed, so a
+    // reader that sees `completed` finds it (decision 110). A run whose
+    // record cannot be signed fails rather than completes unsigned.
+    if let Some(seal) = seal {
+        let sealed = study_results_dir(study_id)
+            .and_then(|dir| seal.sealer.seal(seal, &dir, study_id, current_utc_ms()));
+        if let Err(e) = sealed {
+            fail_job(jobs, events_tx, study_id, format!("failed to sign the run record: {e:?}"));
+            return;
+        }
     }
 
     update_job(jobs, study_id, |job| job.status = "completed".to_string());
@@ -6105,7 +6144,7 @@ mod tests {
         let mut writer = EventsJsonWriter::start(&dir, "test-study", &provenance_for(&study_with_steps(&[1_000]), "gbench1", &no_run_params(), Default::default())).unwrap();
         writer.write_step(&test_step_result("step-0"), 0, 0, 0).unwrap();
 
-        finish_job(&jobs, &events_tx, "abc", writer);
+        finish_job(&jobs, &events_tx, "abc", writer, None);
 
         let job = jobs.lock().unwrap().get("abc").unwrap().clone();
         assert_eq!(job.status, "completed");
@@ -7332,7 +7371,7 @@ mod tests {
             StreamSource::Signal { name: heapless::String::try_from(sig).unwrap() },
             embarch_study_designer::StreamEncoding::Text,
         )]);
-        let Err(err) = post_study_handler(State(state.clone()), Query(StudyRunParams::default()), Json(tapped("console"))).await
+        let Err(err) = post_study_handler(State(state.clone()), Query(StudyRunParams::default()), Default::default(), Json(tapped("console"))).await
         else { panic!("must be refused") };
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("'console'") && err.1.contains("capture"), "got: {}", err.1);
@@ -7386,6 +7425,7 @@ mod tests {
         let err = post_study_handler(
             State(state.clone()),
             Query(StudyRunParams::default()),
+            Default::default(),
             Json(study_with_steps(&[1000])),
         )
         .await;

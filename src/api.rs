@@ -65,6 +65,8 @@ pub struct AppState {
     pub lease: lease::LeaseSlot,
     /// The last image Core flashed per chip, for `GET /status` (decision 93).
     pub images: lease::ImageLog,
+    /// Core's signing key and the ledger of who declared what (`signing.rs`, decision 110).
+    pub sealer: crate::signing::Sealer,
 }
 
 impl AppState {
@@ -72,15 +74,16 @@ impl AppState {
     #[cfg(test)]
     pub fn new(token: String) -> Self {
         let person = format!("person-{token}");
-        Self::with_tokens(crate::token_store::Tokens { agent: token, person })
+        Self::with_tokens(crate::token_store::Tokens { agent: token, person }, crate::signing::Sealer::ephemeral())
     }
 
     /// Constructs the `/study*`-only fields fresh — kept here so
     /// `main.rs`'s `serve` doesn't need to know any of their internals.
-    pub fn with_tokens(tokens: crate::token_store::Tokens) -> Self {
+    pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         Self {
             tokens,
+            sealer,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
             host_cancel: Arc::new(StdMutex::new(None)),
@@ -155,11 +158,12 @@ pub(crate) async fn acquire_hw_lock(state: &AppState, route: &'static str) -> Re
     }
 }
 
-/// Every route requires the bearer token — there is no unauthenticated
-/// route left (there used to be exactly one, `GET /enroll`'s static HTML/JS
-/// page; retired 2026-08-24 in favor of `embarch-ui`'s Enroll tab,
-/// `embarch-ui` decision 1 — `POST /probes/enroll`
-/// itself is unaffected and still lives below).
+/// Every route requires the bearer token except `POST /auth/challenge`
+/// (`signing.rs`, decision 110), which signs a fixed frame so a client can
+/// check which Core answers before it sends a token. (There used to be
+/// exactly one other, `GET /enroll`'s static HTML/JS page; retired
+/// 2026-08-24 in favor of `embarch-ui`'s Enroll tab, `embarch-ui` decision 1
+/// — `POST /probes/enroll` itself is unaffected and still lives below).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/status", get(status_handler))
@@ -206,7 +210,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
         .layer(middleware::from_fn_with_state(state.clone(), lease_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .with_state(state)
+        .with_state(state.clone())
+        // The one route with no token: a client has Core sign a challenge before it
+        // sends one (decision 110). It sits outside the sweep above on purpose.
+        .merge(crate::signing::challenge_router().with_state(state))
 }
 
 /// Simple bearer-token check, against two tokens: the match is recorded as
@@ -931,6 +938,7 @@ struct DeclareBootloadPortsRequest {
 // route: PUT /bootload/ports
 async fn declare_bootload_ports_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Json(req): Json<DeclareBootloadPortsRequest>,
 ) -> Result<Json<embarch_topology::hardware::BootloadPorts>, (StatusCode, String)> {
     let ports = embarch_topology::hardware::BootloadPorts {
@@ -946,6 +954,7 @@ async fn declare_bootload_ports_handler(
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
+    state.sealer.declarations().record("bootload_ports", embarch_topology::hardware::DUT_ROLE, scope);
     Ok(Json(ports))
 }
 
@@ -974,6 +983,7 @@ async fn clear_bootload_ports_handler(
             .map_err(internal_err)?
             .map_err(internal_err)?;
     if removed {
+        state.sealer.declarations().forget("bootload_ports", embarch_topology::hardware::DUT_ROLE);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "no bootload ports are declared for the DUT".to_string()))
@@ -1223,6 +1233,7 @@ fn enroll_response(
 // route: POST /probes/enroll
 async fn enroll_probe_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Json(req): Json<EnrollProbeRequest>,
 ) -> Result<Json<EnrollProbeResponse>, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /probes/enroll").await?;
@@ -1231,6 +1242,7 @@ async fn enroll_probe_handler(
     let chip = req.chip;
     let probe_serial = req.probe_serial;
     let name = req.name.unwrap_or_default();
+    let declared_as = if role == embarch_topology::hardware::NO_ROLE { name.clone() } else { role.clone() };
 
     // **A bench board is named or it is nothing** (decision 83). It holds
     // no role, so its name is the only thing a human reads to tell it from
@@ -1271,6 +1283,7 @@ async fn enroll_probe_handler(
     .map_err(internal_err)?
     .map_err(internal_err)?;
 
+    state.sealer.declarations().record("role", &declared_as, scope);
     Ok(Json(enroll_response(board, up)))
 }
 
@@ -1327,6 +1340,7 @@ struct SetRoleBoardRequest {
 async fn set_role_board_handler(
     State(state): State<AppState>,
     axum::extract::Path(role): axum::extract::Path<String>,
+    scope: crate::token_store::Scope,
     Json(req): Json<SetRoleBoardRequest>,
 ) -> Result<Json<embarch_topology::hardware::EnrolledBoard>, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "PUT /probes/enrolled/{role}/board").await?;
@@ -1354,6 +1368,7 @@ async fn set_role_board_handler(
     .map_err(internal_err)?
     .map_err(internal_err)?;
 
+    state.sealer.declarations().record("role", &row.role, scope);
     Ok(Json(row))
 }
 
@@ -1384,13 +1399,17 @@ async fn unenroll_probe_handler(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "DELETE /probes/enrolled/{role}").await?;
 
+    let forgotten = role.clone();
     let removed = tokio::task::spawn_blocking(move || embarch_topology::hardware::unenroll(&role))
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
 
     match removed {
-        Some(_) => Ok(StatusCode::NO_CONTENT),
+        Some(_) => {
+            state.sealer.declarations().forget("role", &forgotten);
+            Ok(StatusCode::NO_CONTENT)
+        }
         None => Err((StatusCode::NOT_FOUND, "no board enrolled under that role".to_string())),
     }
 }
@@ -1416,7 +1435,11 @@ async fn unenroll_by_probe_handler(
             .map_err(internal_err)?;
 
     match removed {
-        Some(_) => Ok(StatusCode::NO_CONTENT),
+        Some(_) => {
+            // Which role the probe served is not read back, so none is vouched for.
+            state.sealer.declarations().forget_all("role");
+            Ok(StatusCode::NO_CONTENT)
+        }
         None => Err((StatusCode::NOT_FOUND, "no board enrolled through that probe".to_string())),
     }
 }
@@ -1452,6 +1475,7 @@ struct SetDevBenchLinkRequest {
 // route: POST /dev-bench/link
 async fn set_dev_bench_link_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Json(req): Json<SetDevBenchLinkRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /dev-bench/link").await?;
@@ -1477,6 +1501,7 @@ async fn set_dev_bench_link_handler(
     .map_err(internal_err)?
     .map_err(internal_err)?;
 
+    state.sealer.declarations().record("dev_bench_link", "dev-bench", scope);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1505,9 +1530,11 @@ async fn set_dev_bench_link_handler(
 // route: POST /signals
 async fn declare_signal_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Json(link): Json<embarch_topology::hardware::SignalLink>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /signals").await?;
+    let declared = link.name.clone();
 
     tokio::task::spawn_blocking(move || embarch_topology::hardware::declare_signal(link))
         .await
@@ -1518,6 +1545,7 @@ async fn declare_signal_handler(
         // broke".
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:?}")))?;
 
+    state.sealer.declarations().record("signal", &declared, scope);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1562,12 +1590,14 @@ async fn remove_signal_handler(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "DELETE /signals/{name}").await?;
 
+    let forgotten = name.clone();
     let removed = tokio::task::spawn_blocking(move || embarch_topology::hardware::remove_signal(&name))
         .await
         .map_err(internal_err)?
         .map_err(internal_err)?;
 
     if removed {
+        state.sealer.declarations().forget("signal", &forgotten);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "no signal is declared under that name".to_string()))
@@ -1683,6 +1713,7 @@ async fn list_instruments_handler() -> Result<Json<Vec<embarch_topology::hardwar
 // route: PUT /instruments
 async fn declare_instrument_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Json(inst): Json<embarch_topology::hardware::Instrument>,
 ) -> Result<Json<embarch_topology::hardware::Instrument>, (StatusCode, String)> {
     inst.check().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -1695,6 +1726,7 @@ async fn declare_instrument_handler(
     })
     .await
     .map_err(internal_err)??;
+    state.sealer.declarations().record("instrument", &inst.name, scope);
     Ok(Json(inst))
 }
 
@@ -1711,6 +1743,7 @@ async fn remove_instrument_handler(
         .map_err(internal_err)?
         .map_err(internal_err)?;
     if removed {
+        state.sealer.declarations().forget("instrument", &name);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, format!("no instrument is declared under the name '{name}'")))
