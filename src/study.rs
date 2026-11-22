@@ -4869,6 +4869,7 @@ mod tests {
             protocols_crc: 0,
             dev_bench_log_level: Default::default(),
             record_checks: Default::default(),
+            measurements: Default::default(),
         }
     }
 
