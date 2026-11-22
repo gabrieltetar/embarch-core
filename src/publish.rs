@@ -412,8 +412,9 @@ fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) 
 // ---- fetching what Core produced ---------------------------------------------
 
 /// A file of a revision, by the name the zip gives it: one of Core's four
-/// publish files, or any file the revision's signed manifest names. Nothing
-/// else is served, so the route cannot read outside what was published.
+/// publish files, or any file the revision's signed manifest names; at the
+/// pending revision (opened by `report-data`, no manifest yet), the run's own
+/// Core files. Nothing else is served, so the route cannot read outside the run.
 // route: GET /study/{study_id}/publish/{revision}/files/{*name}
 pub async fn file_handler(
     State(state): State<AppState>,
@@ -424,16 +425,33 @@ pub async fn file_handler(
     let path = if PUBLISH_FILES.contains(&name.as_str()) {
         rdir.join(&name)
     } else {
-        let env: serde_json::Value = std::fs::read(rdir.join(MANIFEST_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .ok_or_else(not_found)?;
-        let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
-        let manifest: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
-        if !manifest["subject"].as_array().is_some_and(|s| s.iter().any(|x| x["name"] == name.as_str())) {
+        let run_dir = state.run_log.run_dir(&study_id);
+        let manifest = std::fs::read(rdir.join(MANIFEST_FILE)).ok();
+        let named = match manifest {
+            Some(bytes) => {
+                let env: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| not_found())?;
+                let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
+                let manifest: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
+                manifest["subject"].as_array().is_some_and(|s| s.iter().any(|x| x["name"] == name.as_str()))
+            }
+            // No manifest yet: only the pending revision, once `report-data` has
+            // opened it, serves the run's own files, the ones the manifest will sign.
+            None => {
+                let (sid, rd) = (study_id.clone(), rdir.join(REPORT_DATA_FILE));
+                let st = state.clone();
+                let pending = tokio::task::spawn_blocking(move || -> Result<bool, Failure> {
+                    let lines = st.run_log.lines().map_err(internal)?;
+                    Ok(revision == revision_of(&lines, &sid) && rd.is_file())
+                })
+                .await
+                .map_err(internal)??;
+                pending && core_run_files(&run_dir)?.contains(&name)
+            }
+        };
+        if !named {
             return Err(not_found());
         }
-        state.run_log.run_dir(&study_id).join(&name)
+        run_dir.join(&name)
     };
     let bytes = tokio::fs::read(&path).await.map_err(|_| not_found())?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
@@ -660,6 +678,43 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         // A file the manifest does not name is not served.
         let (s, _) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/study.json"), "agent", "").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_pending_revision_serves_the_runs_own_files_and_nothing_else() {
+        let state = AppState::new("agent".to_string());
+        finished_run(&state, "completed", r#""Pass""#, Scope::Agent);
+        let url = |r: u64, n: &str| format!("/study/{ID}/publish/{r}/files/{n}");
+        // Before report-data opens the revision, nothing of the run is served.
+        let (s, _) = send(&state, "GET", &url(1, "events.json"), "agent", "").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        let mut served = Vec::new();
+        for n in ["events.json", "record.dsse.json", "streams/tap.bin"] {
+            let (s, b) = send(&state, "GET", &url(1, n), "agent", "").await;
+            assert_eq!(s, StatusCode::OK, "{n}");
+            served.push((n, sha256_hex(&b)));
+        }
+        // Not a Core file of the run, and not the pending revision.
+        for n in ["../run-log.jsonl", "run-log.jsonl", "nothing.json", "streams", "manifest.dsse.json"] {
+            let (s, _) = send(&state, "GET", &url(1, n), "agent", "").await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{n}");
+        }
+        for r in [0, 2] {
+            let (s, _) = send(&state, "GET", &url(r, "events.json"), "agent", "").await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "revision {r}");
+        }
+        // The bytes are the ones the manifest then signs.
+        send(&state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
+        let (_, env) = send(&state, "GET", &url(1, "manifest.dsse.json"), "agent", "").await;
+        let st = dsse_payload(&env, &state.sealer.key().public_key_hex());
+        for (n, sha) in served {
+            let subject = st["subject"].as_array().unwrap().iter().find(|x| x["name"] == n).unwrap();
+            assert_eq!(subject["digest"]["sha256"], sha.as_str(), "{n}");
+        }
+        // Revision 1 is published, so revision 2 is pending but not yet opened.
+        let (s, _) = send(&state, "GET", &url(2, "events.json"), "agent", "").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
