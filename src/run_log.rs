@@ -390,7 +390,7 @@ pub async fn publish_handler(
 }
 
 /// Deletes a run's captures and records it; the agent's token is refused on a
-/// run that did not end clean or that a publish rests on (decision 111).
+/// run that did not end clean or that a publish rests on (decision 112).
 // route: POST /study/{study_id}/discard
 pub async fn discard_handler(State(state): State<AppState>, UrlPath(study_id): UrlPath<String>, scope: Scope) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if state.study_jobs.lock().unwrap().get(&study_id).is_some_and(|j| j.status == "running") {
@@ -409,7 +409,7 @@ pub async fn discard_handler(State(state): State<AppState>, UrlPath(study_id): U
             StatusCode::FORBIDDEN,
             format!(
                 "refused: {why}, and only the person's token may discard its captures. Nothing was deleted. \
-                 Ask the person to discard it, or to run it with the person token (decision 111)."
+                 Ask the person to discard it, or to run it with the person token (decision 112)."
             ),
         )),
         Err(DiscardError::Failed(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
