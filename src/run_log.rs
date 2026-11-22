@@ -54,8 +54,11 @@ pub fn installed() -> Option<&'static RunLog> {
 
 /// Study ids whose captures retention must leave alone: runs the log knows
 /// that have not been published and whose captures have not been discarded.
-pub fn protected_ids() -> HashSet<String> {
-    installed().map(|l| l.unpublished_ids()).unwrap_or_default()
+///
+/// `Err` when the log cannot be read or does not verify: the set is then
+/// unknown, and the caller must not treat it as empty (decision 111).
+pub fn protected_ids() -> Result<HashSet<String>> {
+    installed().map(|l| l.unpublished_ids()).unwrap_or_else(|| Ok(HashSet::new()))
 }
 
 #[derive(Debug, PartialEq)]
@@ -197,10 +200,12 @@ impl RunLog {
             .find(|l| l["entry"]["type"] == kind && l["entry"]["study_id"] == study_id))
     }
 
-    /// Runs the log knows that are neither published nor discarded.
-    pub fn unpublished_ids(&self) -> HashSet<String> {
+    /// Runs the log knows that are neither published nor discarded. A log that
+    /// cannot be read, parsed or verified is an error, never an empty set.
+    pub fn unpublished_ids(&self) -> Result<HashSet<String>> {
         let mut out = HashSet::new();
-        for l in self.lines().unwrap_or_default() {
+        self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
+        for l in self.lines()? {
             let e = &l["entry"];
             let Some(id) = e["study_id"].as_str() else { continue };
             match e["type"].as_str() {
@@ -213,7 +218,7 @@ impl RunLog {
                 _ => {}
             }
         }
-        out
+        Ok(out)
     }
 
     /// Records the hash of the manifest a run was published under.
@@ -550,12 +555,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = RunLog::at(dir.path().to_path_buf());
         run_with(&log, ID, "completed", "Pass");
-        assert!(log.unpublished_ids().contains(ID));
+        assert!(log.unpublished_ids().unwrap().contains(ID));
         let fixture = "9f".repeat(32);
         let line = log.publish(ID, &fixture, Scope::Person).unwrap();
         assert_eq!(line["entry"]["manifest_sha256"], fixture.as_str());
         assert_eq!(line["entry"]["study_id"], ID);
-        assert!(!log.unpublished_ids().contains(ID));
+        assert!(!log.unpublished_ids().unwrap().contains(ID));
         assert_eq!(log.verify().unwrap().unwrap().0.unwrap(), line["hash"].as_str().unwrap());
         assert!(log.publish("ghost", &fixture, Scope::Person).is_err());
     }
@@ -646,5 +651,24 @@ mod tests {
         assert!(root.path().join(&unpub).exists(), "an unpublished run's captures stay");
         assert!(!root.path().join(&pubd).exists());
         assert!(root.path().join(&newer).exists());
+    }
+
+    #[test]
+    fn an_unreadable_or_broken_log_is_an_error_not_an_empty_protected_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::at(dir.path().to_path_buf());
+        run_with(&log, "a", "completed", "Pass");
+        assert!(log.unpublished_ids().unwrap().contains("a"));
+        // a corrupted line
+        let good = std::fs::read_to_string(log.path()).unwrap();
+        std::fs::write(log.path(), format!("{good}not json\n")).unwrap();
+        assert!(log.unpublished_ids().is_err());
+        // a tampered but parseable line
+        std::fs::write(log.path(), good.replace("completed", "failed")).unwrap();
+        assert!(log.unpublished_ids().is_err());
+        // a directory in the log's place
+        std::fs::remove_file(log.path()).unwrap();
+        std::fs::create_dir(log.path()).unwrap();
+        assert!(log.unpublished_ids().is_err());
     }
 }

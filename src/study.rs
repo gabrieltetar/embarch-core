@@ -1761,9 +1761,7 @@ fn run_study_to_completion(
     // being one out. A sweep that fails is logged and ignored — losing disk
     // hygiene is not a reason to lose a capture.
     if let Ok(root) = study_results_root() {
-        if let Err(e) = stream_store::sweep_study_results(&root, stream_store::study_results_keep(), &crate::run_log::protected_ids()) {
-            tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
-        }
+        retention_sweep(&root, stream_store::study_results_keep(), crate::run_log::protected_ids());
     }
 
     // The submitted study, kept as Core received it, so the run's signed record
@@ -4313,6 +4311,25 @@ fn study_status_from_disk(events: EventsFileState) -> &'static str {
     }
 }
 
+/// Runs the retention sweep with the run log's answer. An unreadable or
+/// unverified log leaves the set of unpublished runs unknown, so nothing is
+/// swept and the reason is logged at `error` (decision 111).
+fn retention_sweep(root: &FsPath, keep: usize, protected: anyhow::Result<std::collections::HashSet<String>>) -> usize {
+    match protected {
+        Ok(protected) => match stream_store::sweep_study_results(root, keep, &protected) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
+                0
+            }
+        },
+        Err(e) => {
+            tracing::error!("retention swept nothing: the run log cannot be read, so unpublished runs are unknown: {e:?}");
+            0
+        }
+    }
+}
+
 /// Every study still on disk, newest first, bounded by the retention count
 /// already in force — so this lists exactly what the sweep keeps, never a
 /// row that is about to vanish or a study the sweep would have spared.
@@ -4327,8 +4344,15 @@ pub async fn studies_handler(
     State(state): State<AppState>,
 ) -> Result<Json<StudiesResponse>, (StatusCode, String)> {
     let root = study_results_root().map_err(internal_err)?;
-    let keep = stream_store::study_results_keep();
-    let protected = state.run_log.unpublished_ids();
+    // The sweep deletes nothing while the run log is unreadable, so the listing
+    // bounds nothing either: every study on disk is shown (decision 111).
+    let (keep, protected) = match state.run_log.unpublished_ids() {
+        Ok(p) => (stream_store::study_results_keep(), p),
+        Err(e) => {
+            tracing::error!("GET /studies lists every study: the run log cannot be read: {e:?}");
+            (0, std::collections::HashSet::new())
+        }
+    };
 
     let disk: Vec<(String, StudyDiskSummary)> =
         tokio::task::spawn_blocking(move || read_studies(&root, keep, &protected, studies_cache()))
@@ -4688,6 +4712,29 @@ async fn serve_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retention_sweeps_nothing_when_the_run_log_cannot_be_read() {
+        let root = tempfile::tempdir().unwrap();
+        for (i, c) in ['a', 'b', 'c'].iter().enumerate() {
+            let d = root.path().join(c.to_string().repeat(32));
+            std::fs::create_dir_all(&d).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(300 - i as u64 * 100);
+            std::fs::File::open(&d).unwrap().set_modified(t).unwrap();
+        }
+        let data = tempfile::tempdir().unwrap();
+        let log = crate::run_log::RunLog::at(data.path().to_path_buf());
+        // a corrupted line, then a directory where the file should be
+        std::fs::write(data.path().join("run-log.jsonl"), "not json\n").unwrap();
+        assert_eq!(retention_sweep(root.path(), 1, log.unpublished_ids()), 0);
+        std::fs::remove_file(data.path().join("run-log.jsonl")).unwrap();
+        std::fs::create_dir(data.path().join("run-log.jsonl")).unwrap();
+        assert_eq!(retention_sweep(root.path(), 1, log.unpublished_ids()), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+        // a readable (empty) log sweeps by count again
+        std::fs::remove_dir(data.path().join("run-log.jsonl")).unwrap();
+        assert_eq!(retention_sweep(root.path(), 1, log.unpublished_ids()), 2);
+    }
+
 
     /// Checks `verify_records` against a real capture rather than a
     /// constructed one, when `EMBARCH_RECORDS_FIXTURE` names one.
