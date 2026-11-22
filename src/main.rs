@@ -14,6 +14,7 @@ mod host_study;
 mod lease;
 mod live;
 mod logs;
+mod measurements;
 mod serial;
 mod service;
 mod run_log;

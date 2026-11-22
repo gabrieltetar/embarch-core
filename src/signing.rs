@@ -249,6 +249,11 @@ impl Declarations {
         self.0.lock().unwrap().entries.insert((what.to_string(), name.to_string()), (scope, now));
     }
 
+    /// The scope that made the declaration, `None` when this Core did not watch it made.
+    pub fn scope_of(&self, what: &str, name: &str) -> Option<Scope> {
+        self.0.lock().unwrap().entries.get(&(what.to_string(), name.to_string())).map(|(scope, _)| *scope)
+    }
+
     pub fn forget(&self, what: &str, name: &str) {
         self.0.lock().unwrap().entries.remove(&(what.to_string(), name.to_string()));
     }
@@ -287,6 +292,10 @@ pub struct SealJob {
     /// `device` or `host`.
     pub kind: &'static str,
     pub build: Option<BuildClaims>,
+    /// The scope of the token that submitted the study: what a measurement's
+    /// `study_value` declaration was made with (decision 113). `None` for a host
+    /// study, which declares none.
+    pub submitted_by: Option<Scope>,
 }
 
 impl Sealer {
@@ -491,7 +500,7 @@ mod tests {
     }
 
     fn job(sealer: &Sealer, build: Option<BuildClaims>) -> SealJob {
-        SealJob { sealer: sealer.clone(), kind: "device", build }
+        SealJob { sealer: sealer.clone(), kind: "device", build, submitted_by: None }
     }
 
     /// A DSSE check written from the DSSE v1 text alone, not through this

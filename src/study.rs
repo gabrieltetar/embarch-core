@@ -435,6 +435,13 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // close. Computed by the crate, not restated.
     validate_record_checks(&study.record_checks).map_err(|e| e.to_string())?;
 
+    // `embarch-study-designer` decisions 99 and 100: a declaration Core could
+    // not compute, or would compute over the wrong numbers, is refused here
+    // rather than as a `measurements.json` that says `parse_failed` at the end.
+    // After `validate_taps`: a tap's struct layout is looked up by the id that
+    // one checks.
+    embarch_study_designer::validate_measurements(study).map_err(|e| e.to_string())?;
+
     // `embarch-study-designer` decision 40: both requirements
     // are mandatory and `"any"` is an explicit legal value, so a *blank* one
     // is the nobody-thought-about-it case and is rejected here. An omitted
@@ -1414,13 +1421,14 @@ pub(crate) fn take_study_lock(state: &AppState, study_id: &str) -> Result<(), (S
 // route: POST /study
 pub async fn post_study_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Query(run): Query<StudyRunParams>,
     Query(build): Query<crate::signing::BuildClaimParams>,
     Json(study): Json<Study>,
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let build = build.claims().map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build };
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build, submitted_by: Some(scope) };
 
     // A tap on a signal a decision 92 capture holds open would be refused by
     // the OS only after the flash and reset (core decision 102).
@@ -2259,14 +2267,19 @@ fn run_study_to_completion(
     // Whatever happened, Core's own ports close and the capture's `streams`
     // are sealed into the writer before the job's status is decided.
     stop_signal_taps(&mut signal_taps);
-    finish_streams(&capture, &mut writer, &results_dir);
+    let refs = finish_streams(&capture, &mut writer, &results_dir);
     // On the failure path too: a study that stopped early still captured
     // whatever ran before it did, and a trace of the run that went wrong is
     // the one most worth reading.
     render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
 
     match outcome {
-        Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer, Some(&seal)),
+        Ok(()) => match write_measurements(&capture, &refs, &results_dir, &study_id, Some(&seal)) {
+            // A run whose declared measurements cannot be computed fails
+            // rather than completes without them, as an unsignable one does.
+            Err(e) => fail_job(&jobs, &events_tx, &study_id, format!("failed to write measurements.json: {e:?}")),
+            Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer, Some(&seal)),
+        },
         Err(reason) => fail_job(&jobs, &events_tx, &study_id, reason),
     }
 }
@@ -2275,10 +2288,47 @@ fn run_study_to_completion(
 /// path, including a failure: a failed study's `.partial` file is a
 /// diagnostic artifact, and a diagnostic that omits what the capture
 /// actually produced is worth less than one that includes it.
-fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter, results_dir: &FsPath) {
+fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter, results_dir: &FsPath) -> Vec<StreamRef> {
     let mut refs = capture.store.lock().unwrap().refs();
     verify_declared_records(results_dir, &capture.study.record_checks, &mut refs);
-    writer.set_streams(refs);
+    writer.set_streams(refs.clone());
+    refs
+}
+
+/// Computes the study's declared measurements over its closed captures and
+/// writes `measurements.json`, before the record is signed so it is a subject
+/// of it (decision 113). A study that declares none writes nothing.
+fn write_measurements(
+    capture: &Capture,
+    refs: &[StreamRef],
+    results_dir: &FsPath,
+    study_id: &str,
+    seal: Option<&crate::signing::SealJob>,
+) -> anyhow::Result<()> {
+    if capture.study.measurements.is_empty() {
+        return Ok(());
+    }
+    let fallback = crate::signing::Declarations::new();
+    let signal_origin = |name: &str| {
+        let link = embarch_topology::hardware::find_signal(name).ok().flatten()?;
+        Some(match link.origin() {
+            embarch_topology::hardware::SignalOrigin::Role(role) => crate::measurements::SignalOrigin::Role(role.to_string()),
+            embarch_topology::hardware::SignalOrigin::Board { probe_serial } => {
+                crate::measurements::SignalOrigin::Board(probe_serial.to_string())
+            }
+        })
+    };
+    crate::measurements::write(&crate::measurements::Ended {
+        study: &capture.study,
+        results_dir,
+        refs,
+        run_id: study_id,
+        submitted_by: seal.and_then(|s| s.submitted_by).unwrap_or(crate::token_store::Scope::Agent),
+        ended_utc_ms: current_utc_ms(),
+        declarations: seal.map_or(&fallback, |s| s.sealer.declarations()),
+        signal_origin: &signal_origin,
+    })
+    .map(|_| ())
 }
 
 /// Runs every `Study.record_checks` entry against the capture it names and
@@ -7425,7 +7475,7 @@ mod tests {
             StreamSource::Signal { name: heapless::String::try_from(sig).unwrap() },
             embarch_study_designer::StreamEncoding::Text,
         )]);
-        let Err(err) = post_study_handler(State(state.clone()), Query(StudyRunParams::default()), Default::default(), Json(tapped("console"))).await
+        let Err(err) = post_study_handler(State(state.clone()), crate::token_store::Scope::Agent, Query(StudyRunParams::default()), Default::default(), Json(tapped("console"))).await
         else { panic!("must be refused") };
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("'console'") && err.1.contains("capture"), "got: {}", err.1);
@@ -7471,6 +7521,25 @@ mod tests {
         assert!(unbound.contains("role 'dut', which holds no probe"), "{unbound}");
     }
 
+    /// A declaration Core could not compute is refused at submission, beside
+    /// `record_checks` (decision 113).
+    #[test]
+    fn a_measurement_declaration_core_could_not_compute_is_refused_at_submission() {
+        let mut study = study_with_steps(&[1000]);
+        let decl = embarch_study_designer::MeasurementDecl {
+            name: heapless::String::try_from("n").unwrap(),
+            reducer: heapless::String::try_from("count").unwrap(),
+            tap: 9,
+            field: None,
+            unit: None,
+            window: Default::default(),
+            declared: None,
+        };
+        study.measurements.push(decl).unwrap();
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("measurements[0]") && err.contains("tap 9"), "got: {err}");
+    }
+
     /// While hello holds the link, a study is refused `409` naming hello.
     #[tokio::test]
     async fn a_study_is_refused_409_naming_hello_while_hello_holds_the_link() {
@@ -7478,6 +7547,7 @@ mod tests {
         *state.study_lock.lock().unwrap() = Some(HELLO_HOLDER.to_string());
         let err = post_study_handler(
             State(state.clone()),
+            crate::token_store::Scope::Agent,
             Query(StudyRunParams::default()),
             Default::default(),
             Json(study_with_steps(&[1000])),
