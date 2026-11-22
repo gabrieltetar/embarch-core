@@ -1250,6 +1250,7 @@ impl Drop for JobHold {
 // route: POST /host-studies
 pub async fn post_host_study_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     axum::extract::Query(build): axum::extract::Query<crate::signing::BuildClaimParams>,
     Json(study): Json<HostStudy>,
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
@@ -1278,7 +1279,7 @@ pub async fn post_host_study_handler(
 
     let cancel = Arc::new(AtomicBool::new(false));
     *state.host_cancel.lock().unwrap() = Some((study_id.clone(), cancel.clone()));
-    state.run_log.begin(&study_id, "host");
+    state.run_log.begin(&study_id, "host", scope);
     state.study_jobs.lock().unwrap().insert(
         study_id.clone(),
         StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(study.steps.len() as u32), reason: None },
@@ -2287,14 +2288,14 @@ mod tests {
         let state = AppState::new("t".into());
         *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
         let s = study(vec![ex("a", "x", "pd: ")], vec![]);
-        let err = post_host_study_handler(State(state.clone()), Default::default(), Json(s.clone())).await.unwrap_err();
+        let err = post_host_study_handler(State(state.clone()), crate::token_store::Scope::Agent, Default::default(), Json(s.clone())).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("study-abc"), "{}", err.1);
         // The refused call did not disturb the holder.
         assert_eq!(state.study_lock.lock().unwrap().as_deref(), Some("study-abc"));
         // A bad study is a 400 before the lock is looked at.
         let bad = study(vec![], vec![]);
-        assert_eq!(post_host_study_handler(State(state), Default::default(), Json(bad)).await.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(post_host_study_handler(State(state), crate::token_store::Scope::Agent, Default::default(), Json(bad)).await.unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

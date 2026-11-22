@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, run_log, serial, study};
+use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, publish, run_log, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -208,6 +208,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
         .route("/study/{study_id}/discard", post(run_log::discard_handler))
+        .route("/study/{study_id}/adopt", post(publish::adopt_handler))
+        .route("/study/{study_id}/report-data", post(publish::report_data_handler))
+        .route("/study/{study_id}/publish", post(publish::publish_handler))
+        .route("/study/{study_id}/publish/{revision}/files/{*name}", get(publish::file_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
@@ -3020,6 +3024,10 @@ mod tests {
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
         ("POST", "/study/{study_id}/discard", "/study/abc/discard"),
+        ("POST", "/study/{study_id}/adopt", "/study/abc/adopt"),
+        ("POST", "/study/{study_id}/report-data", "/study/abc/report-data"),
+        ("POST", "/study/{study_id}/publish", "/study/abc/publish"),
+        ("GET", "/study/{study_id}/publish/{revision}/files/{*name}", "/study/abc/publish/1/files/report-data.json"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
@@ -3068,7 +3076,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 46;
+    const DOCUMENTED_ROUTE_COUNT: usize = 50;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3273,10 +3281,16 @@ mod tests {
     /// `api.rs` (bare name) or `study.rs` (`study::`-prefixed name) or `host_study.rs` (`host_study::`). `None`
     /// if the handler has no such comment immediately above its definition.
     fn handler_declared_route(handler_name: &str) -> Option<(String, String)> {
-        let (source, bare_name) = match (handler_name.strip_prefix("study::"), handler_name.strip_prefix("host_study::"), handler_name.strip_prefix("run_log::")) {
-            (Some(stripped), _, _) => (include_str!("study.rs"), stripped),
-            (_, Some(stripped), _) => (include_str!("host_study.rs"), stripped),
-            (_, _, Some(stripped)) => (include_str!("run_log.rs"), stripped),
+        let (source, bare_name) = match (
+            handler_name.strip_prefix("study::"),
+            handler_name.strip_prefix("host_study::"),
+            handler_name.strip_prefix("run_log::"),
+            handler_name.strip_prefix("publish::"),
+        ) {
+            (Some(stripped), _, _, _) => (include_str!("study.rs"), stripped),
+            (_, Some(stripped), _, _) => (include_str!("host_study.rs"), stripped),
+            (_, _, Some(stripped), _) => (include_str!("run_log.rs"), stripped),
+            (_, _, _, Some(stripped)) => (include_str!("publish.rs"), stripped),
             _ => (include_str!("api.rs"), handler_name),
         };
         let lines: Vec<&str> = source.lines().collect();

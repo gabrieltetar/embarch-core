@@ -1587,7 +1587,7 @@ pub async fn post_study_handler(
 
     let total_steps = study.steps.len() as u32;
     {
-        state.run_log.begin(&study_id, "device");
+        state.run_log.begin(&study_id, "device", scope);
         let mut jobs = state.study_jobs.lock().unwrap();
         jobs.insert(
             study_id.clone(),

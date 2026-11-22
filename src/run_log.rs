@@ -36,7 +36,7 @@ pub struct RunLog {
     data_dir: PathBuf,
     /// The kind (`device` or `host`) of each run in flight, by study id. A run
     /// is entered into the log when it ends, once, and only if it began here.
-    pending: Arc<StdMutex<HashMap<String, &'static str>>>,
+    pending: Arc<StdMutex<HashMap<String, (&'static str, Scope)>>>,
     write: Arc<StdMutex<()>>,
 }
 
@@ -110,17 +110,18 @@ impl RunLog {
         self.data_dir.join(RUN_LOG_FILE)
     }
 
-    fn run_dir(&self, study_id: &str) -> PathBuf {
+    pub(crate) fn run_dir(&self, study_id: &str) -> PathBuf {
         self.data_dir.join("study_results").join(study_id)
     }
 
-    /// A run has started: it will be entered when it ends.
-    pub fn begin(&self, study_id: &str, kind: &'static str) {
-        self.pending.lock().unwrap().insert(study_id.to_string(), kind);
+    /// A run has started: it will be entered when it ends, with the scope of
+    /// the token that gave the go (`go_by`, decision 116).
+    pub fn begin(&self, study_id: &str, kind: &'static str, go_by: Scope) {
+        self.pending.lock().unwrap().insert(study_id.to_string(), (kind, go_by));
     }
 
     /// Every line, parsed; a missing file is an empty log.
-    fn lines(&self) -> Result<Vec<serde_json::Value>> {
+    pub(crate) fn lines(&self) -> Result<Vec<serde_json::Value>> {
         let text = match std::fs::read_to_string(self.path()) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -158,8 +159,13 @@ impl RunLog {
 
     /// Chains `body` onto the head and appends it. Refuses to extend a chain
     /// that does not verify: a broken log stays as it is, for someone to read.
-    fn append(&self, mut body: serde_json::Value) -> Result<serde_json::Value> {
+    fn append(&self, body: serde_json::Value) -> Result<serde_json::Value> {
         let _w = self.write.lock().unwrap();
+        self.append_locked(body)
+    }
+
+    /// `append` for a caller already holding the write lock.
+    fn append_locked(&self, mut body: serde_json::Value) -> Result<serde_json::Value> {
         let (head, len) = self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
         body["prev"] = head.unwrap_or_else(|| GENESIS.to_string()).into();
         body["seq"] = len.into();
@@ -176,7 +182,7 @@ impl RunLog {
     /// `record.dsse.json` when it was signed, and the hash of every capture
     /// file, which a later discard leaves in place (decision 111).
     pub fn end(&self, study_id: &str, status: &str, reason: Option<&str>) {
-        let Some(kind) = self.pending.lock().unwrap().remove(study_id) else { return };
+        let Some((kind, go_by)) = self.pending.lock().unwrap().remove(study_id) else { return };
         let dir = self.run_dir(study_id);
         let record = crate::signing::sha256_of_file(&dir.join(crate::signing::RECORD_FILE)).ok();
         let captures = capture_hashes(&dir).unwrap_or_default();
@@ -184,6 +190,7 @@ impl RunLog {
         let body = serde_json::json!({
             "type": "run", "study_id": study_id, "kind": kind, "status": status, "reason": reason,
             "clean": clean, "ended_utc_ms": now_ms(), "record_sha256": record, "captures": captures,
+            "go_by": go_by.as_str(),
         });
         if let Err(e) = self.append(body) {
             // The run stays on disk and unprotected from the sweep; say so loudly.
@@ -192,7 +199,7 @@ impl RunLog {
     }
 
     /// The latest entry of `kind` for `study_id`, by line.
-    fn latest(&self, study_id: &str, kind: &str) -> Result<Option<serde_json::Value>> {
+    pub(crate) fn latest(&self, study_id: &str, kind: &str) -> Result<Option<serde_json::Value>> {
         Ok(self
             .lines()?
             .into_iter()
@@ -232,6 +239,39 @@ impl RunLog {
             "scope": scope.as_str(), "at_utc_ms": now_ms(),
         });
         self.append(body).map_err(internal)
+    }
+
+    /// Records that a note or a prose block was adopted for a run: the token's
+    /// scope and the SHA-256 of the text, never the text (decision 117).
+    pub fn adopt(&self, study_id: &str, kind: &str, name: &str, text: &str, scope: Scope) -> Result<serde_json::Value, (StatusCode, String)> {
+        let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        if self.latest(study_id, "run").map_err(internal)?.is_none() {
+            return Err((StatusCode::NOT_FOUND, format!("the run log has no run {study_id}")));
+        }
+        let body = serde_json::json!({
+            "type": "adopted", "study_id": study_id, "kind": kind, "name": name,
+            "text_sha256": sha256_hex(text.as_bytes()), "scope": scope.as_str(), "at_utc_ms": now_ms(),
+        });
+        self.append(body).map_err(internal)
+    }
+
+    /// Appends the entry `build` makes, under the write lock, from the log as it
+    /// stands: every line before the new one, and the head they end at. A run
+    /// that ends meanwhile cannot slip between the head a publish records and
+    /// its own entry (decision 118).
+    pub(crate) fn append_with<F>(&self, build: F) -> Result<serde_json::Value, (StatusCode, String)>
+    where
+        F: FnOnce(&[serde_json::Value], Option<&str>) -> Result<serde_json::Value, (StatusCode, String)>,
+    {
+        let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        let _w = self.write.lock().unwrap();
+        let (head, _) = self
+            .verify()
+            .map_err(internal)?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the run log is broken at line {}: {}", e.line, e.reason)))?;
+        let lines = self.lines().map_err(internal)?;
+        let body = build(&lines, head.as_deref())?;
+        self.append_locked(body).map_err(internal)
     }
 
     /// Deletes a run's capture files and records that, with the scope of the
@@ -432,7 +472,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("streams")).unwrap();
         std::fs::write(dir.join("streams/tap.bin"), b"raw bytes").unwrap();
         std::fs::write(dir.join("events.json"), format!(r#"{{"steps":[{{"outcome":"{outcome}"}}]}}"#)).unwrap();
-        log.begin(id, "device");
+        log.begin(id, "device", Scope::Agent);
         log.end(id, status, None);
     }
 

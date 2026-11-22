@@ -324,6 +324,11 @@ impl Sealer {
         &self.declarations
     }
 
+    /// A DSSE envelope over `statement` (already serialised), as file bytes.
+    pub fn sign_statement(&self, statement: &[u8]) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&sign_envelope(&self.key, statement))?)
+    }
+
     /// Writes `record.dsse.json` into `dir`: a DSSE envelope over an in-toto
     /// Statement whose subjects are the files the run has now. The list comes
     /// from the files present, so a file a later unit starts writing
