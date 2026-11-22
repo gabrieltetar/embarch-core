@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, serial, study};
+use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, run_log, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -67,6 +67,8 @@ pub struct AppState {
     pub images: lease::ImageLog,
     /// Core's signing key and the ledger of who declared what (`signing.rs`, decision 110).
     pub sealer: crate::signing::Sealer,
+    /// The hash-chained run log (`run_log.rs`, decision 111).
+    pub run_log: crate::run_log::RunLog,
 }
 
 impl AppState {
@@ -74,16 +76,17 @@ impl AppState {
     #[cfg(test)]
     pub fn new(token: String) -> Self {
         let person = format!("person-{token}");
-        Self::with_tokens(crate::token_store::Tokens { agent: token, person }, crate::signing::Sealer::ephemeral())
+        Self::with_tokens(crate::token_store::Tokens { agent: token, person }, crate::signing::Sealer::ephemeral(), crate::run_log::RunLog::temp())
     }
 
     /// Constructs the `/study*`-only fields fresh — kept here so
     /// `main.rs`'s `serve` doesn't need to know any of their internals.
-    pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer) -> Self {
+    pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer, run_log: crate::run_log::RunLog) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         Self {
             tokens,
             sealer,
+            run_log,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
             host_cancel: Arc::new(StdMutex::new(None)),
@@ -201,6 +204,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/cancel", post(host_study::cancel_study_handler))
         .route("/study/{study_id}/prompt", post(host_study::answer_prompt_handler))
         .route("/study/{study_id}/line-counts", get(host_study::line_counts_handler).post(host_study::line_counts_rerender_handler))
+        .route("/run-log", get(run_log::run_log_handler))
+        .route("/study/{study_id}/log", get(run_log::study_log_handler))
+        .route("/study/{study_id}/published", post(run_log::publish_handler))
+        .route("/study/{study_id}/discard", post(run_log::discard_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
         .route("/study/{study_id}/steps", get(study::study_steps_handler))
@@ -3009,6 +3016,10 @@ mod tests {
         ("POST", "/study/{study_id}/prompt", "/study/abc/prompt"),
         ("GET", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("POST", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
+        ("GET", "/run-log", "/run-log"),
+        ("GET", "/study/{study_id}/log", "/study/abc/log"),
+        ("POST", "/study/{study_id}/published", "/study/abc/published"),
+        ("POST", "/study/{study_id}/discard", "/study/abc/discard"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
         ("GET", "/study/{study_id}/steps", "/study/abc/steps"),
@@ -3057,7 +3068,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 42;
+    const DOCUMENTED_ROUTE_COUNT: usize = 46;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3262,9 +3273,10 @@ mod tests {
     /// `api.rs` (bare name) or `study.rs` (`study::`-prefixed name) or `host_study.rs` (`host_study::`). `None`
     /// if the handler has no such comment immediately above its definition.
     fn handler_declared_route(handler_name: &str) -> Option<(String, String)> {
-        let (source, bare_name) = match (handler_name.strip_prefix("study::"), handler_name.strip_prefix("host_study::")) {
-            (Some(stripped), _) => (include_str!("study.rs"), stripped),
-            (_, Some(stripped)) => (include_str!("host_study.rs"), stripped),
+        let (source, bare_name) = match (handler_name.strip_prefix("study::"), handler_name.strip_prefix("host_study::"), handler_name.strip_prefix("run_log::")) {
+            (Some(stripped), _, _) => (include_str!("study.rs"), stripped),
+            (_, Some(stripped), _) => (include_str!("host_study.rs"), stripped),
+            (_, _, Some(stripped)) => (include_str!("run_log.rs"), stripped),
             _ => (include_str!("api.rs"), handler_name),
         };
         let lines: Vec<&str> = source.lines().collect();

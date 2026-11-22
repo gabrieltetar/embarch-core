@@ -280,6 +280,11 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("GET", "/study/{study_id}/stream/{name}/arrivals"),
     ("GET", "/study/{study_id}/stream/{name}/load"),
     // Counts lines of files already on disk: no port, no hardware (core/116).
+    // The run log and what it governs touch files and the log, never a port (decision 111).
+    ("GET", "/run-log"),
+    ("GET", "/study/{study_id}/log"),
+    ("POST", "/study/{study_id}/published"),
+    ("POST", "/study/{study_id}/discard"),
     ("GET", "/study/{study_id}/line-counts"),
     ("POST", "/study/{study_id}/line-counts"),
     // A person's answer to a prompt, from whichever surface is in front of them; the prompt id,

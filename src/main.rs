@@ -16,6 +16,7 @@ mod live;
 mod logs;
 mod serial;
 mod service;
+mod run_log;
 mod signing;
 mod outpost_load;
 mod outpost_manifest;
@@ -412,7 +413,9 @@ pub(crate) async fn serve(
 ) -> anyhow::Result<()> {
     let tokens = token_store::resolve_tokens()?;
 
-    let state = api::AppState::with_tokens(tokens, signing::Sealer::resolve()?);
+    let run_log = crate::run_log::RunLog::resolve()?;
+    run_log::install(run_log.clone());
+    let state = api::AppState::with_tokens(tokens, signing::Sealer::resolve()?, run_log);
 
     let app = api::build_router(state);
 

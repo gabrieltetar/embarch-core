@@ -820,6 +820,9 @@ pub(crate) fn update_job<F: FnOnce(&mut StudyJob)>(jobs: &JobRegistry, study_id:
 
 pub(crate) fn fail_job(jobs: &JobRegistry, events_tx: &broadcast::Sender<StudyEvent>, study_id: &str, reason: String) {
     tracing::error!(study_id, %reason, "study failed");
+    if let Some(log) = crate::run_log::installed() {
+        log.end(study_id, "failed", Some(&reason));
+    }
     update_job(jobs, study_id, |job| {
         job.status = "failed".to_string();
         job.reason = Some(reason.clone());
@@ -1576,6 +1579,7 @@ pub async fn post_study_handler(
 
     let total_steps = study.steps.len() as u32;
     {
+        state.run_log.begin(&study_id, "device");
         let mut jobs = state.study_jobs.lock().unwrap();
         jobs.insert(
             study_id.clone(),
@@ -1757,7 +1761,7 @@ fn run_study_to_completion(
     // being one out. A sweep that fails is logged and ignored — losing disk
     // hygiene is not a reason to lose a capture.
     if let Ok(root) = study_results_root() {
-        if let Err(e) = stream_store::sweep_study_results(&root, stream_store::study_results_keep()) {
+        if let Err(e) = stream_store::sweep_study_results(&root, stream_store::study_results_keep(), &crate::run_log::protected_ids()) {
             tracing::warn!("retention sweep of {} failed: {e:?}", root.display());
         }
     }
@@ -3465,6 +3469,9 @@ fn finish_job(
         }
     }
 
+    if let Some(log) = crate::run_log::installed() {
+        log.end(study_id, "completed", None);
+    }
     update_job(jobs, study_id, |job| job.status = "completed".to_string());
     let _ = events_tx.send(StudyEvent::StatusChanged {
         study_id: study_id.to_string(),
@@ -4321,9 +4328,10 @@ pub async fn studies_handler(
 ) -> Result<Json<StudiesResponse>, (StatusCode, String)> {
     let root = study_results_root().map_err(internal_err)?;
     let keep = stream_store::study_results_keep();
+    let protected = state.run_log.unpublished_ids();
 
     let disk: Vec<(String, StudyDiskSummary)> =
-        tokio::task::spawn_blocking(move || read_studies(&root, keep, studies_cache()))
+        tokio::task::spawn_blocking(move || read_studies(&root, keep, &protected, studies_cache()))
             .await
             .map_err(internal_err)?
             .map_err(internal_err)?;
@@ -4360,12 +4368,10 @@ pub async fn studies_handler(
 fn read_studies(
     root: &FsPath,
     keep: usize,
+    protected: &std::collections::HashSet<String>,
     cache: &StudiesCache,
 ) -> anyhow::Result<Vec<(String, StudyDiskSummary)>> {
-    let mut dirs = stream_store::study_result_dirs(root)?;
-    if keep > 0 {
-        dirs.truncate(keep);
-    }
+    let (dirs, _) = crate::run_log::retained(stream_store::study_result_dirs(root)?, keep, protected);
 
     let mut out = Vec::with_capacity(dirs.len());
     let mut cache = cache.lock().unwrap();
@@ -5900,7 +5906,7 @@ mod tests {
         let cache = StudiesCache::default();
         fake_study_dir(root.path(), 1, Some(("events.json", TWO_STEPS)));
 
-        let out = read_studies(root.path(), 50, &cache).unwrap();
+        let out = read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert_eq!(out.len(), 1);
         let s = &out[0].1;
         assert_eq!(s.study_name.as_deref(), Some("nightly"));
@@ -5920,7 +5926,7 @@ mod tests {
         let cache = StudiesCache::default();
         fake_study_dir(root.path(), 2, Some(("events.json.partial", TWO_STEPS)));
 
-        let out = read_studies(root.path(), 50, &cache).unwrap();
+        let out = read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert_eq!(out[0].1.events, EventsFileState::Partial);
         assert_eq!(study_status_from_disk(out[0].1.events), "interrupted");
         // And the steps it did record are still counted — an interrupted
@@ -5937,7 +5943,7 @@ mod tests {
         let id = fake_study_dir(root.path(), 3, Some(("events.json", TWO_STEPS)));
         std::fs::write(root.path().join(&id).join("events.json.partial"), "{").unwrap();
 
-        let out = read_studies(root.path(), 50, &cache).unwrap();
+        let out = read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert_eq!(out[0].1.events, EventsFileState::Finalized);
         assert_eq!(study_status_from_disk(out[0].1.events), "completed");
         assert!(out[0].1.steps.is_some(), "it parsed the finalized file, not the truncated one");
@@ -5952,7 +5958,7 @@ mod tests {
         let cache = StudiesCache::default();
         fake_study_dir(root.path(), 4, Some(("events.json", r#"{"steps":[{"step_"#)));
 
-        let out = read_studies(root.path(), 50, &cache).unwrap();
+        let out = read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert!(out[0].1.steps.is_none());
         assert!(
             out[0].1.note.as_deref().unwrap().contains("cannot read its events file"),
@@ -5967,7 +5973,7 @@ mod tests {
         let cache = StudiesCache::default();
         fake_study_dir(root.path(), 5, None);
 
-        let out = read_studies(root.path(), 50, &cache).unwrap();
+        let out = read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert_eq!(study_status_from_disk(out[0].1.events), "unknown");
         assert!(out[0].1.steps.is_none());
         assert!(out[0].1.taps.is_none(), "no streams/index.json means no tap list, not zero taps");
@@ -5991,13 +5997,13 @@ mod tests {
             ids.push(id);
         }
 
-        let all = read_studies(root.path(), 0, &cache).unwrap();
+        let all = read_studies(root.path(), 0, &Default::default(), &cache).unwrap();
         assert_eq!(all.len(), 4, "keep == 0 is retention off, so the listing is unbounded too");
         let got: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
         let want: Vec<&str> = ids.iter().rev().map(|s| s.as_str()).collect();
         assert_eq!(got, want, "newest first");
 
-        let two = read_studies(root.path(), 2, &cache).unwrap();
+        let two = read_studies(root.path(), 2, &Default::default(), &cache).unwrap();
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].0, ids[3], "and the bound takes the newest, not the first found");
     }
@@ -6042,19 +6048,19 @@ mod tests {
         let pinned = std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(1_700_000_000);
         filetime_set(&path, pinned);
-        assert_eq!(read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
+        assert_eq!(read_studies(root.path(), 50, &Default::default(), &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
 
         // Same length, same name, same mtime — a rewrite the fingerprint
         // genuinely cannot see. It reads back cached, which is the only way
         // to observe from outside that nothing was re-parsed.
         std::fs::write(&path, TWO_STEPS.replace("nightly", "renamed")).unwrap();
         filetime_set(&path, pinned);
-        assert_eq!(read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
+        assert_eq!(read_studies(root.path(), 50, &Default::default(), &cache).unwrap()[0].1.study_name.as_deref(), Some("nightly"));
 
         // A change that moves the length is seen.
         std::fs::write(&path, TWO_STEPS.replace("nightly", "renamed for real")).unwrap();
         assert_eq!(
-            read_studies(root.path(), 50, &cache).unwrap()[0].1.study_name.as_deref(),
+            read_studies(root.path(), 50, &Default::default(), &cache).unwrap()[0].1.study_name.as_deref(),
             Some("renamed for real")
         );
     }
@@ -6064,11 +6070,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = StudiesCache::default();
         let id = fake_study_dir(root.path(), 11, Some(("events.json", TWO_STEPS)));
-        read_studies(root.path(), 50, &cache).unwrap();
+        read_studies(root.path(), 50, &Default::default(), &cache).unwrap();
         assert!(cache.lock().unwrap().contains_key(&root.path().join(&id)));
 
         std::fs::remove_dir_all(root.path().join(&id)).unwrap();
-        assert!(read_studies(root.path(), 50, &cache).unwrap().is_empty());
+        assert!(read_studies(root.path(), 50, &Default::default(), &cache).unwrap().is_empty());
         assert!(
             cache.lock().unwrap().is_empty(),
             "a swept study's entry would otherwise sit in the cache forever"

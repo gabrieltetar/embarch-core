@@ -964,20 +964,21 @@ fn unique_stem(tap: &StreamTap, used: &[String]) -> String {
 /// everything I did not expect to find" is not a posture a retention sweep
 /// should ever take.
 ///
+/// `protected` names runs the run log has not seen published or discarded
+/// (decision 111): their directories are never removed, and do not count
+/// toward `keep`.
+///
 /// Returns how many directories it removed. Takes `root` explicitly rather
 /// than resolving it, so it is testable against a temporary directory.
-pub fn sweep_study_results(root: &Path, keep: usize) -> anyhow::Result<usize> {
+pub fn sweep_study_results(root: &Path, keep: usize, protected: &std::collections::HashSet<String>) -> anyhow::Result<usize> {
     if keep == 0 {
         return Ok(0);
     }
 
-    let dirs = study_result_dirs(root)?;
-    if dirs.len() <= keep {
-        return Ok(0);
-    }
+    let (_, gone) = crate::run_log::retained(study_result_dirs(root)?, keep, protected);
 
     let mut removed = 0;
-    for (_, path) in dirs.into_iter().skip(keep) {
+    for (_, path) in gone {
         match fs::remove_dir_all(&path) {
             Ok(()) => {
                 tracing::info!("retention: removed old study results at {}", path.display());
@@ -1505,7 +1506,7 @@ mod tests {
             make_result_dir(root.path(), id, 1_000 + rank as u64);
         }
 
-        let removed = sweep_study_results(root.path(), 2).unwrap();
+        let removed = sweep_study_results(root.path(), 2, &Default::default()).unwrap();
         assert_eq!(removed, 3);
         // The two newest survive; the three oldest are gone.
         assert!(root.path().join(&ids[4]).exists());
@@ -1521,7 +1522,7 @@ mod tests {
         for i in 0..3u8 {
             make_result_dir(root.path(), &format!("{:032x}", i), 1_000 + u64::from(i));
         }
-        assert_eq!(sweep_study_results(root.path(), 0).unwrap(), 0);
+        assert_eq!(sweep_study_results(root.path(), 0, &Default::default()).unwrap(), 0);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
     }
 
@@ -1534,7 +1535,7 @@ mod tests {
         fs::create_dir_all(root.path().join("not-a-study")).unwrap();
         fs::write(root.path().join("README"), b"hi").unwrap();
 
-        sweep_study_results(root.path(), 1).unwrap();
+        sweep_study_results(root.path(), 1, &Default::default()).unwrap();
         assert!(root.path().join("not-a-study").exists());
         assert!(root.path().join("README").exists());
     }
@@ -1542,7 +1543,7 @@ mod tests {
     #[test]
     fn sweeping_a_results_root_that_does_not_exist_yet_is_not_a_failure() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(sweep_study_results(&root.path().join("never-written"), 5).unwrap(), 0);
+        assert_eq!(sweep_study_results(&root.path().join("never-written"), 5, &Default::default()).unwrap(), 0);
     }
 
     // ---- env knobs ---------------------------------------------------------

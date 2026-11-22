@@ -1157,6 +1157,9 @@ pub fn run_job<B: HostBackend>(
         (None, 0) => None,
         (None, n) => Some(format!("{n} teardown step(s) did not pass")),
     };
+    if let Some(log) = crate::run_log::installed() {
+        log.end(study_id, "completed", reason.as_deref());
+    }
     crate::study::update_job(jobs, study_id, |j| {
         j.status = "completed".to_string();
         j.reason = reason.clone();
@@ -1275,6 +1278,7 @@ pub async fn post_host_study_handler(
 
     let cancel = Arc::new(AtomicBool::new(false));
     *state.host_cancel.lock().unwrap() = Some((study_id.clone(), cancel.clone()));
+    state.run_log.begin(&study_id, "host");
     state.study_jobs.lock().unwrap().insert(
         study_id.clone(),
         StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(study.steps.len() as u32), reason: None },

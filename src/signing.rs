@@ -119,7 +119,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     options.open(path)?.write_all(bytes)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -392,7 +392,7 @@ fn subjects_of(dir: &Path) -> Result<Vec<serde_json::Value>> {
         .collect()
 }
 
-fn sha256_of_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_of_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
