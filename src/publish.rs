@@ -1,5 +1,6 @@
-//! Core's side of publish (decisions 116 to 119): adopting notes and prose, the
-//! signed `report-data.json`, and the signed manifest, for one study run.
+//! Core's side of publish (decisions 116 to 119, and 126 for a swept run):
+//! adopting notes and prose, the signed `report-data.json`, and the signed
+//! manifest, for one study run.
 //!
 //! Nothing here takes a value from embarch-api except the list of the files
 //! embarch-api made, which the manifest records as embarch-api's and never
@@ -111,6 +112,117 @@ pub async fn adopt_handler(
         .map(Json)
 }
 
+// ---- a run the retention sweep took (decision 126) ---------------------------
+
+/// Where a handed-back manifest waits, inside the run's directory.
+const RESTORED_DIR: &str = "restored";
+/// The most one handed-back file takes.
+const MAX_RESTORED_BYTES: usize = 1 << 30;
+
+/// The Statements of the manifests handed back for this run, by revision.
+fn staged_manifests(dir: &std::path::Path) -> Result<Vec<serde_json::Value>, Failure> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir.join(RESTORED_DIR)) else { return Ok(out) };
+    for e in rd {
+        let bytes = std::fs::read(e.map_err(internal)?.path()).map_err(internal)?;
+        let env: serde_json::Value = serde_json::from_slice(&bytes).map_err(internal)?;
+        let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
+        out.push(serde_json::from_slice(&payload).map_err(internal)?);
+    }
+    out.sort_by_key(|st| st["predicate"]["revision"].as_u64().unwrap_or(0));
+    Ok(out)
+}
+
+/// The run's Core files must be there, or have all been handed back: a swept
+/// run is `409` naming what to restore, never a half-built manifest.
+fn require_run_files(dir: &std::path::Path) -> Result<(), Failure> {
+    let staged = staged_manifests(dir)?;
+    let Some(latest) = staged.last() else {
+        return if dir.join("events.json").is_file() {
+            Ok(())
+        } else {
+            Err((
+                StatusCode::CONFLICT,
+                "the run's files are gone (the retention sweep took them): hand back the earlier revision's manifest, then its Core files, with PUT /study/{id}/restore/{name}".into(),
+            ))
+        };
+    };
+    let missing: Vec<&str> = latest["subject"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .filter(|n| !PUBLISH_FILES.contains(n) && !dir.join(n).is_file())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err((StatusCode::CONFLICT, format!("the earlier manifest names files not yet handed back: {}", missing.join(", "))))
+    }
+}
+
+fn refused(msg: String) -> Failure {
+    (StatusCode::UNPROCESSABLE_ENTITY, msg)
+}
+
+/// Takes one file of the earlier revision back into the run's directory. The
+/// manifest first, which Core accepts only if the run log recorded its hash for
+/// this run; then each Core file, which Core accepts only if a manifest so
+/// accepted names it as a subject with the same digest. Nothing else is taken.
+// route: PUT /study/{study_id}/restore/{*name}
+pub async fn restore_handler(
+    State(state): State<AppState>,
+    UrlPath((study_id, name)): UrlPath<(String, String)>,
+    _scope: Scope,
+    request: axum::extract::Request,
+) -> Result<Json<serde_json::Value>, Failure> {
+    // Read here, not through the `Bytes` extractor, whose 2 MiB default is too
+    // small for a capture; the cap is ours.
+    let body = axum::body::to_bytes(request.into_body(), MAX_RESTORED_BYTES)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("a restored file is over {MAX_RESTORED_BYTES} bytes")))?;
+    if !safe_name(&name) {
+        return Err((StatusCode::BAD_REQUEST, "name must be a relative file name of printable characters, 200 bytes at most".into()));
+    }
+    tokio::task::spawn_blocking(move || {
+        let lines = state.run_log.lines().map_err(internal)?;
+        publishable_run(&lines, &study_id)?;
+        let dir = state.run_log.run_dir(&study_id);
+        let sha = sha256_hex(&body);
+        if name == MANIFEST_FILE {
+            let logged = lines.iter().any(|l| {
+                l["entry"]["type"] == "published" && l["entry"]["study_id"] == study_id.as_str() && l["entry"]["manifest_sha256"] == sha.as_str()
+            });
+            if !logged {
+                return Err(refused(format!("the run log never recorded a manifest with hash {sha} for run {study_id}")));
+            }
+            write_file(&dir.join(RESTORED_DIR).join(format!("{sha}.json")), &body)?;
+            return Ok(Json(serde_json::json!({ "restored": name, "sha256": sha })));
+        }
+        if PUBLISH_FILES.contains(&name.as_str()) {
+            return Err(refused(format!("`{name}` is written by a revision, not restored")));
+        }
+        let staged = staged_manifests(&dir)?;
+        if staged.is_empty() {
+            return Err((StatusCode::CONFLICT, "hand back the earlier revision's manifest.dsse.json first".into()));
+        }
+        let digest = staged.iter().find_map(|st| {
+            st["subject"].as_array()?.iter().find(|s| s["name"] == name.as_str()).map(|s| s["digest"]["sha256"].clone())
+        });
+        match digest {
+            None => Err(refused(format!("`{name}` is not a subject of a manifest Core signed and logged for run {study_id}"))),
+            Some(d) if d != sha.as_str() => Err(refused(format!("`{name}` does not match the digest its manifest names"))),
+            Some(_) => {
+                write_file(&dir.join(&name), &body)?;
+                Ok(Json(serde_json::json!({ "restored": name, "sha256": sha })))
+            }
+        }
+    })
+    .await
+    .map_err(internal)?
+}
+
 // ---- report-data.json --------------------------------------------------------
 
 /// The study's run entry, which must be signed and whose captures must still be
@@ -195,6 +307,7 @@ fn report_data(
 ) -> Result<(serde_json::Value, u64), Failure> {
     let run = publishable_run(lines, study_id)?;
     let dir = state.run_log.run_dir(study_id);
+    require_run_files(&dir)?;
     let events: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("events.json")).map_err(internal)?).map_err(internal)?;
     let statement = record_statement(&dir)?;
     let counts = count_outcomes(&events);
@@ -716,6 +829,104 @@ mod tests {
         // Revision 1 is published, so revision 2 is pending but not yet opened.
         let (s, _) = send(&state, "GET", &url(2, "events.json"), "agent", "").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// What a caller keeps of a published revision: the manifest and every
+    /// Core run file it names, fetched through the file route.
+    async fn keep_revision(state: &AppState, revision: u64) -> Vec<(String, Vec<u8>)> {
+        let (_, env) = send(state, "GET", &format!("/study/{ID}/publish/{revision}/files/manifest.dsse.json"), "agent", "").await;
+        let st = dsse_payload(&env, &state.sealer.key().public_key_hex());
+        let mut kept = vec![(MANIFEST_FILE.to_string(), env)];
+        for s in st["subject"].as_array().unwrap() {
+            let n = s["name"].as_str().unwrap();
+            if PUBLISH_FILES.contains(&n) {
+                continue;
+            }
+            let (_, b) = send(state, "GET", &format!("/study/{ID}/publish/{revision}/files/{n}"), "agent", "").await;
+            kept.push((n.to_string(), b));
+        }
+        kept
+    }
+
+    async fn put(state: &AppState, name: &str, bytes: &[u8]) -> StatusCode {
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/study/{ID}/restore/{name}"))
+            .header("authorization", "Bearer agent")
+            .body(axum::body::Body::from(bytes.to_vec()))
+            .unwrap();
+        crate::api::build_router(state.clone()).oneshot(req).await.unwrap().status()
+    }
+
+    async fn published_then_swept() -> (AppState, Vec<(String, Vec<u8>)>) {
+        let state = AppState::new("agent".to_string());
+        finished_run(&state, "completed", r#""Pass""#, Scope::Agent);
+        send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        let (s, _) = send(&state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
+        assert_eq!(s, StatusCode::OK);
+        let kept = keep_revision(&state, 1).await;
+        std::fs::remove_dir_all(state.run_log.run_dir(ID)).unwrap();
+        (state, kept)
+    }
+
+    #[tokio::test]
+    async fn a_run_swept_after_its_publish_republishes_from_the_earlier_zips_files() {
+        let (state, kept) = published_then_swept().await;
+        let first = sha256_hex(&kept[0].1);
+        // Swept and nothing handed back: a 409 that says what to do, not a 500.
+        let (s, b) = send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        assert_eq!(s, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&b));
+        for (n, bytes) in &kept {
+            assert_eq!(put(&state, n, bytes).await, StatusCode::OK, "{n}");
+            // Partway through, report-data names what is missing instead of signing a short manifest.
+            if n == MANIFEST_FILE {
+                let (s, _) = send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+                assert_eq!(s, StatusCode::CONFLICT);
+            }
+        }
+        let (s, b) = send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(json(&b)["revision"], 2);
+        let (s, b) = send(&state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (_, env) = send(&state, "GET", &format!("/study/{ID}/publish/2/files/manifest.dsse.json"), "agent", "").await;
+        let st = dsse_payload(&env, &state.sealer.key().public_key_hex());
+        assert_eq!(st["predicate"]["revision"], 2);
+        assert_eq!(st["predicate"]["supersedes"]["revision"], 1);
+        assert_eq!(st["predicate"]["supersedes"]["manifest_sha256"], first.as_str());
+        let names: Vec<&str> = st["subject"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        for want in ["events.json", "record.dsse.json", "streams/tap.bin", "report-data.json"] {
+            assert!(names.contains(&want), "{want} in {names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restore_refuses_a_manifest_the_log_never_recorded_a_stray_file_and_wrong_bytes() {
+        let (state, kept) = published_then_swept().await;
+        // A file before any manifest was accepted.
+        assert_eq!(put(&state, "events.json", &kept[1].1).await, StatusCode::CONFLICT);
+        // A manifest whose hash the run log never recorded for this run.
+        let mut forged = kept[0].1.clone();
+        let last = forged.len() - 3;
+        forged[last] ^= 1;
+        assert_eq!(put(&state, MANIFEST_FILE, &forged).await, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(put(&state, MANIFEST_FILE, &kept[0].1).await, StatusCode::OK);
+        // A file that is not one of the manifest's subjects, and a revision output.
+        assert_eq!(put(&state, "extra.bin", b"x").await, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(put(&state, "report-data.json", b"{}").await, StatusCode::UNPROCESSABLE_ENTITY);
+        // A subject whose bytes do not match its digest.
+        assert_eq!(put(&state, "streams/tap.bin", b"other bytes").await, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!state.run_log.run_dir(ID).join("streams/tap.bin").exists());
+        assert_eq!(put(&state, "streams/tap.bin", b"raw bytes").await, StatusCode::OK);
+        // A run the log does not know is refused before anything is written.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/study/ffffffffffffffffffffffffffffffff/restore/manifest.dsse.json")
+            .header("authorization", "Bearer agent")
+            .body(axum::body::Body::from(kept[0].1.clone()))
+            .unwrap();
+        let r = crate::api::build_router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

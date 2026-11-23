@@ -211,6 +211,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/adopt", post(publish::adopt_handler))
         .route("/study/{study_id}/report-data", post(publish::report_data_handler))
         .route("/study/{study_id}/publish", post(publish::publish_handler))
+        .route("/study/{study_id}/restore/{*name}", put(publish::restore_handler))
         .route("/study/{study_id}/publish/{revision}/files/{*name}", get(publish::file_handler))
         .route("/study/{study_id}", get(study::get_study_handler))
         .route("/study/{study_id}/events", get(study::study_events_handler))
@@ -3027,6 +3028,7 @@ mod tests {
         ("POST", "/study/{study_id}/adopt", "/study/abc/adopt"),
         ("POST", "/study/{study_id}/report-data", "/study/abc/report-data"),
         ("POST", "/study/{study_id}/publish", "/study/abc/publish"),
+        ("PUT", "/study/{study_id}/restore/{*name}", "/study/abc/restore/events.json"),
         ("GET", "/study/{study_id}/publish/{revision}/files/{*name}", "/study/abc/publish/1/files/report-data.json"),
         ("GET", "/study/{study_id}", "/study/abc"),
         ("GET", "/study/{study_id}/events", "/study/abc/events"),
@@ -3076,7 +3078,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 50;
+    const DOCUMENTED_ROUTE_COUNT: usize = 51;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
