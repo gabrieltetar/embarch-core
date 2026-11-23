@@ -1,6 +1,6 @@
-//! Core's side of publish (decisions 116 to 119, and 126 for a swept run):
-//! adopting notes and prose, the signed `report-data.json`, and the signed
-//! manifest, for one study run.
+//! Core's side of publish (decisions 116 to 120): adopting notes and prose,
+//! the signed `report-data.json`, and the signed manifest, for one study run,
+//! and a swept run's files taken back.
 //!
 //! Nothing here takes a value from embarch-api except the list of the files
 //! embarch-api made, which the manifest records as embarch-api's and never
@@ -112,7 +112,7 @@ pub async fn adopt_handler(
         .map(Json)
 }
 
-// ---- a run the retention sweep took (decision 126) ---------------------------
+// ---- a run the retention sweep took (decision 120) ---------------------------
 
 /// Where a handed-back manifest waits, inside the run's directory.
 const RESTORED_DIR: &str = "restored";
