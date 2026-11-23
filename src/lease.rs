@@ -276,6 +276,8 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("GET", "/study/{study_id}/events"),
     ("GET", "/study/{study_id}/steps"),
     ("GET", "/study/{study_id}/streams"),
+    // A file already on disk, written as the study ended: no port (decision 121).
+    ("GET", "/study/{study_id}/measurements"),
     ("GET", "/study/{study_id}/stream/{name}"),
     ("GET", "/study/{study_id}/stream/{name}/arrivals"),
     ("GET", "/study/{study_id}/stream/{name}/load"),

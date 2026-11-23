@@ -570,6 +570,43 @@ pub async fn file_handler(
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 
+/// A finished run's own `measurements.json`, byte for byte as Core wrote it as
+/// the study ended, with no publish and no revision (decision 121). The same
+/// run directory the publish routes read; nothing is recomputed. Three distinct
+/// refusals: `404` no such run, `409` the study has not ended, `422` no file was written (the
+/// study declared no measurements, failed, or is a host study), and `410` the
+/// run's files are gone.
+// route: GET /study/{study_id}/measurements
+pub async fn measurements_handler(State(state): State<AppState>, UrlPath(study_id): UrlPath<String>) -> Result<Response, Failure> {
+    if state.study_jobs.lock().unwrap().get(&study_id).is_some_and(|j| j.status == "running") {
+        return Err((StatusCode::CONFLICT, format!("study {study_id} is still running: its measurements are written as it ends")));
+    }
+    let st = state.clone();
+    let id = study_id.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, Failure> {
+        let lines = st.run_log.lines().map_err(internal)?;
+        let entered = lines.iter().any(|l| l["entry"]["type"] == "run" && l["entry"]["study_id"] == id.as_str());
+        if !entered {
+            return Err((StatusCode::NOT_FOUND, format!("the run log has no run {id}")));
+        }
+        let dir = st.run_log.run_dir(&id);
+        match std::fs::read(dir.join(crate::measurements::FILE)) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if dir.join("events.json").is_file() {
+                    Err((StatusCode::UNPROCESSABLE_ENTITY, format!("study {id} has no {}: it declared no measurements, did not complete, or is a host study", crate::measurements::FILE)))
+                } else {
+                    Err((StatusCode::GONE, format!("study {id}'s files are gone (discarded or swept by retention)")))
+                }
+            }
+            Err(e) => Err(internal(e)),
+        }
+    })
+    .await
+    .map_err(internal)??;
+    Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,6 +866,32 @@ mod tests {
         // Revision 1 is published, so revision 2 is pending but not yet opened.
         let (s, _) = send(&state, "GET", &url(2, "events.json"), "agent", "").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn measurements_are_served_as_written_with_distinct_refusals() {
+        let state = AppState::new("agent".to_string());
+        let uri = format!("/study/{ID}/measurements");
+        // Unknown study.
+        let (s, b) = send(&state, "GET", &uri, "agent", "").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&b).contains("no run"));
+        // A run that ends without declaring measurements wrote no file.
+        finished_run(&state, "completed", r#""Pass""#, Scope::Agent);
+        let (s, b) = send(&state, "GET", &uri, "agent", "").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(String::from_utf8_lossy(&b).contains("declared no measurements"));
+        // With the file Core wrote, the bytes come back unchanged, no publish run.
+        let written = br#"{"schema":1,  "behaviours":{"x":[1,2]}}"#;
+        std::fs::write(state.run_log.run_dir(ID).join(crate::measurements::FILE), written).unwrap();
+        let (s, b) = send(&state, "GET", &uri, "agent", "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b, written);
+        // A study still running refuses, even with a file on disk.
+        state.study_jobs.lock().unwrap().insert(ID.to_string(), crate::study::StudyJob { status: "running".into(), current_step: None, total_steps: None, reason: None });
+        let (s, b) = send(&state, "GET", &uri, "agent", "").await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(String::from_utf8_lossy(&b).contains("still running"));
     }
 
     /// What a caller keeps of a published revision: the manifest and every
