@@ -1,5 +1,6 @@
 mod api;
 mod bootload;
+mod call_log;
 mod capture;
 mod chip_resolve;
 mod dev_bench_link;
@@ -419,6 +420,7 @@ pub(crate) async fn serve(
     run_log::install(run_log.clone());
     let state = api::AppState::with_tokens(tokens, signing::Sealer::resolve()?, run_log);
 
+    let call_log = state.call_log.clone();
     let app = api::build_router(state);
 
     let addr = format!("{bind}:{port}");
@@ -429,6 +431,8 @@ pub(crate) async fn serve(
         .with_graceful_shutdown(shutdown)
         .await?;
 
+    // A clean stop writes the pending fold (decision 122).
+    call_log.flush();
     Ok(())
 }
 

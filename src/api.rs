@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, chip_resolve, hardware, host_study, lease, logs, publish, run_log, serial, study};
+use crate::{bootload, call_log, chip_resolve, hardware, host_study, lease, logs, publish, run_log, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -69,6 +69,8 @@ pub struct AppState {
     pub sealer: crate::signing::Sealer,
     /// The hash-chained run log (`run_log.rs`, decision 111).
     pub run_log: crate::run_log::RunLog,
+    /// The hash-chained log of every gated call (`call_log.rs`, decision 122).
+    pub call_log: crate::call_log::CallLog,
 }
 
 impl AppState {
@@ -86,6 +88,7 @@ impl AppState {
         Self {
             tokens,
             sealer,
+            call_log: crate::call_log::CallLog::at(run_log.data_dir().to_path_buf()),
             run_log,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
@@ -204,6 +207,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/cancel", post(host_study::cancel_study_handler))
         .route("/study/{study_id}/prompt", post(host_study::answer_prompt_handler))
         .route("/study/{study_id}/line-counts", get(host_study::line_counts_handler).post(host_study::line_counts_rerender_handler))
+        .route("/call-log", get(call_log::call_log_handler))
         .route("/run-log", get(run_log::run_log_handler))
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
@@ -222,6 +226,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/stream/{name}/arrivals", get(study::stream_arrivals_handler))
         .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
         .layer(middleware::from_fn_with_state(state.clone(), lease_middleware))
+        // Outside the lease layer, so a refusal is logged too (decision 122).
+        .layer(middleware::from_fn_with_state(state.clone(), call_log::call_log_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone())
         // The one route with no token: a client has Core sign a challenge before it
@@ -350,6 +356,8 @@ async fn release_lease_handler(
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     state.lease.release(lease_token(&headers)).map_err(lease_err)?;
+    // The lease ended: write the call log's pending fold (decision 122).
+    state.call_log.flush();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -641,6 +649,7 @@ async fn flash_handler(
 
     let _guard = acquire_hw_lock(&state, "POST /flash").await?;
 
+    call_log::board_note().set(None, args.probe_serial.as_deref(), Some(&args.chip));
     let chip_for_response = args.chip.clone();
     let FlashArgs {
         chip,
@@ -809,6 +818,7 @@ async fn reset_handler(
     Json(req): Json<ResetRequest>,
 ) -> Result<Json<ResetResponse>, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /reset").await?;
+    call_log::board_note().set(None, req.probe_serial.as_deref(), Some(&req.chip));
     let chip = req.chip;
     let probe_serial = req.probe_serial;
 
@@ -1977,9 +1987,12 @@ async fn live_mem_read_handler(
     crate::live::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let _guard = acquire_hw_lock(&state, "POST /live/mem-read").await?;
 
+    let note = call_log::board_note();
+    note.set(req.role.as_deref(), req.probe_serial.as_deref(), None);
     tokio::task::spawn_blocking(move || {
         let target = crate::live::target(&req.role, &req.probe_serial).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         let (board, probe_serial) = live_target_board(target)?;
+        note.set(Some(&board.role), Some(&probe_serial), Some(&board.chip));
         crate::live::run(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
     })
     .await
@@ -2023,9 +2036,12 @@ async fn live_core_state_handler(
     crate::live::check_core_state(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let _guard = acquire_hw_lock(&state, "POST /live/core-state").await?;
 
+    let note = call_log::board_note();
+    note.set(req.role.as_deref(), req.probe_serial.as_deref(), None);
     tokio::task::spawn_blocking(move || {
         let target = crate::live::target(&req.role, &req.probe_serial).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         let (board, probe_serial) = live_target_board(target)?;
+        note.set(Some(&board.role), Some(&probe_serial), Some(&board.chip));
         crate::live::run_core_state(&board.chip, &probe_serial, &board.role, &req).map_err(describe_topology_error)
     })
     .await
@@ -3022,6 +3038,7 @@ mod tests {
         ("POST", "/study/{study_id}/prompt", "/study/abc/prompt"),
         ("GET", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("POST", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
+        ("GET", "/call-log", "/call-log"),
         ("GET", "/run-log", "/run-log"),
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
@@ -3080,7 +3097,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 52;
+    const DOCUMENTED_ROUTE_COUNT: usize = 53;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3295,7 +3312,10 @@ mod tests {
             (_, Some(stripped), _, _) => (include_str!("host_study.rs"), stripped),
             (_, _, Some(stripped), _) => (include_str!("run_log.rs"), stripped),
             (_, _, _, Some(stripped)) => (include_str!("publish.rs"), stripped),
-            _ => (include_str!("api.rs"), handler_name),
+            _ => match handler_name.strip_prefix("call_log::") {
+                Some(stripped) => (include_str!("call_log.rs"), stripped),
+                None => (include_str!("api.rs"), handler_name),
+            },
         };
         let lines: Vec<&str> = source.lines().collect();
         let fn_prefixes = [format!("async fn {bare_name}("), format!("pub async fn {bare_name}(")];

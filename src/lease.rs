@@ -284,6 +284,8 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     // Counts lines of files already on disk: no port, no hardware (core/116).
     // The run log and what it governs touch files and the log, never a port (decision 111).
     ("GET", "/run-log"),
+    // Reads Core's own call log, never a port (decision 122).
+    ("GET", "/call-log"),
     ("GET", "/study/{study_id}/log"),
     ("POST", "/study/{study_id}/published"),
     ("POST", "/study/{study_id}/discard"),

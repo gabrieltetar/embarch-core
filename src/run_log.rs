@@ -76,7 +76,29 @@ pub struct ChainError {
     pub reason: String,
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Recomputes a chain of `{entry, hash}` lines (the call log, decision 122, shares it).
+pub(crate) fn verify_lines(lines: &[serde_json::Value]) -> Result<std::result::Result<(Option<String>, usize), ChainError>> {
+    let mut prev = GENESIS.to_string();
+    for (i, line) in lines.iter().enumerate() {
+        let fail = |reason: String| Ok(Err(ChainError { line: i + 1, reason }));
+        let (Some(entry), Some(hash)) = (line.get("entry"), line.get("hash").and_then(|h| h.as_str())) else {
+            return fail("not an {entry, hash} line".into());
+        };
+        if sha256_hex(&serde_json::to_vec(entry)?) != hash {
+            return fail("the entry does not match its hash: it was altered".into());
+        }
+        if entry.get("prev").and_then(|p| p.as_str()) != Some(prev.as_str()) {
+            return fail("its prev is not the previous entry's hash: an entry was removed, added or reordered".into());
+        }
+        if entry.get("seq").and_then(|s| s.as_u64()) != Some(i as u64) {
+            return fail("its seq is not its position".into());
+        }
+        prev = hash.to_string();
+    }
+    Ok(Ok(((!lines.is_empty()).then_some(prev), lines.len())))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     crate::signing::hex(&Sha256::digest(bytes))
 }
 
@@ -110,6 +132,11 @@ impl RunLog {
         self.data_dir.join(RUN_LOG_FILE)
     }
 
+    /// The directory the log (and the call log beside it) lives in.
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub(crate) fn run_dir(&self, study_id: &str) -> PathBuf {
         self.data_dir.join("study_results").join(study_id)
     }
@@ -136,25 +163,7 @@ impl RunLog {
     /// Recomputes the whole chain: every hash, every `prev`, every `seq`.
     /// Returns the head (`None` for an empty log) and the length.
     pub fn verify(&self) -> Result<std::result::Result<(Option<String>, usize), ChainError>> {
-        let lines = self.lines()?;
-        let mut prev = GENESIS.to_string();
-        for (i, line) in lines.iter().enumerate() {
-            let fail = |reason: String| Ok(Err(ChainError { line: i + 1, reason }));
-            let (Some(entry), Some(hash)) = (line.get("entry"), line.get("hash").and_then(|h| h.as_str())) else {
-                return fail("not an {entry, hash} line".into());
-            };
-            if sha256_hex(&serde_json::to_vec(entry)?) != hash {
-                return fail("the entry does not match its hash: it was altered".into());
-            }
-            if entry.get("prev").and_then(|p| p.as_str()) != Some(prev.as_str()) {
-                return fail("its prev is not the previous entry's hash: an entry was removed, added or reordered".into());
-            }
-            if entry.get("seq").and_then(|s| s.as_u64()) != Some(i as u64) {
-                return fail("its seq is not its position".into());
-            }
-            prev = hash.to_string();
-        }
-        Ok(Ok(((!lines.is_empty()).then_some(prev), lines.len())))
+        verify_lines(&self.lines()?)
     }
 
     /// Chains `body` onto the head and appends it. Refuses to extend a chain

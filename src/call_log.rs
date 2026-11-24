@@ -1,0 +1,667 @@
+//! Core's hash-chained call log (decision 122): one entry for every call to a
+//! route in [`crate::lease::LEASE_GATED`], a call the lease refuses included,
+//! in the run log's line shape (`run_log.rs`, decision 111) in
+//! `call-log.jsonl` beside `run-log.jsonl`. No sweep, discard or restart
+//! touches it.
+//!
+//! It is **Core's calls only**: hardware reached without Core (the topology
+//! CLI's own hardware feature, a probe tool run by hand) is not in it, and a
+//! host or dev-bench study's own steps stay in its `events.json`.
+//!
+//! The layer ([`call_log_middleware`]) sits outside `lease_middleware` and
+//! inside `auth_middleware`, so a refusal is seen and a new gated route is
+//! logged with no handler change. A handler that resolves a board says which
+//! through [`board_note`].
+//!
+//! Five reads fold ([`FOLDED_READS`]): the first of a run of identical reads
+//! is chained at once, the repeats are counted in memory and written as one
+//! `fold` entry when a different call arrives, the lease is released, or Core
+//! stops cleanly. A chained entry is never rewritten.
+
+use anyhow::{Context, Result};
+use axum::{
+    body::Body,
+    extract::{FromRequestParts, MatchedPath, Query, RawPathParams, Request, State},
+    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use crate::api::AppState;
+use crate::run_log::{sha256_hex, verify_lines, GENESIS};
+use crate::token_store::Scope;
+
+/// The log's file name beside the token files.
+pub const CALL_LOG_FILE: &str = "call-log.jsonl";
+/// A JSON request body this small is kept in the entry beside its hash; a
+/// larger one, or a body that is not JSON (a firmware upload), is its hash
+/// alone. Chosen, not measured: every JSON request body of today's routes is
+/// well under it.
+pub const BODY_CAP_BYTES: usize = 4096;
+/// Entries `GET /call-log` returns in one answer.
+pub const MAX_RANGE: usize = 1000;
+/// The most request or answer body the layer will buffer to hash it. The
+/// largest body Core takes is a firmware image; the flash handler already
+/// holds one whole in memory.
+const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+/// The reads that fold (decision 122); every other gated route is an action.
+pub const FOLDED_READS: &[(&str, &str)] = &[
+    ("POST", "/live/mem-read"),
+    ("POST", "/live/core-state"),
+    ("GET", "/serial-log"),
+    ("POST", "/validate"),
+    ("GET", "/dev-bench/hello"),
+];
+
+/// The response headers a gated route's answer carries.
+pub const SEQ_HEADER: &str = "x-embarch-call-seq";
+pub const HASH_HEADER: &str = "x-embarch-call-hash";
+/// Present on a folded repeat: which repeat of the first entry this is (1 for the first repeat).
+pub const REPEAT_HEADER: &str = "x-embarch-call-repeat";
+
+#[derive(Debug, Clone, Default)]
+struct BoardInfo {
+    role: Option<String>,
+    probe_serial: Option<String>,
+    chip: Option<String>,
+}
+
+/// A handle a handler fills with the board it resolved. Detached (a no-op)
+/// outside a logged call, so a handler can always call it.
+#[derive(Debug, Clone, Default)]
+pub struct BoardNote(Arc<StdMutex<Option<BoardInfo>>>);
+
+impl BoardNote {
+    /// Names the board this call reached; a later call fills in what it knows
+    /// and keeps what an earlier one set.
+    pub fn set(&self, role: Option<&str>, probe_serial: Option<&str>, chip: Option<&str>) {
+        let mut g = self.0.lock().unwrap();
+        let b = g.get_or_insert_with(BoardInfo::default);
+        let own = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
+        b.role = own(role).or(b.role.take());
+        b.probe_serial = own(probe_serial).or(b.probe_serial.take());
+        b.chip = own(chip).or(b.chip.take());
+    }
+
+    fn take(&self) -> Option<BoardInfo> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+tokio::task_local! {
+    static NOTE: BoardNote;
+}
+
+/// The note of the call being logged, for a handler to name its board in. Clone it
+/// into a `spawn_blocking` closure: a task-local does not cross into one.
+pub fn board_note() -> BoardNote {
+    NOTE.try_with(|n| n.clone()).unwrap_or_default()
+}
+
+struct Fold {
+    key: String,
+    first_seq: u64,
+    first_hash: String,
+    repeats: u64,
+    first_repeat_ms: u64,
+    last_repeat_ms: u64,
+    /// What the fold entry repeats of the first entry, for a reader.
+    summary: serde_json::Value,
+}
+
+struct Inner {
+    /// The head and length, read from the file once and kept: a call appends
+    /// without re-reading a log that grows with every call.
+    chain: Option<(String, u64)>,
+    fold: Option<Fold>,
+}
+
+/// Where a call landed, for the response headers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub seq: u64,
+    pub hash: String,
+    pub repeat: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct CallLog {
+    path: PathBuf,
+    inner: Arc<StdMutex<Inner>>,
+}
+
+impl CallLog {
+    /// A call log in `data_dir`.
+    pub fn at(data_dir: PathBuf) -> Self {
+        Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(Inner { chain: None, fold: None })) }
+    }
+
+    fn lines(&self) -> Result<Vec<serde_json::Value>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).context("failed to read the call log"),
+        };
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).context("a call-log line is not JSON"))
+            .collect()
+    }
+
+    /// Recomputes the whole chain: the head (`None` when empty) and the length.
+    pub fn verify(&self) -> Result<std::result::Result<(Option<String>, usize), crate::run_log::ChainError>> {
+        verify_lines(&self.lines()?)
+    }
+
+    /// Chains `body` onto the head and appends it, with the lock held. A log
+    /// that does not verify is not extended: it stays as it is, to be read.
+    fn append(&self, inner: &mut Inner, mut body: serde_json::Value) -> Result<(u64, String)> {
+        if inner.chain.is_none() {
+            let (head, len) = self
+                .verify()?
+                .map_err(|e| anyhow::anyhow!("the call log is broken at line {}: {}", e.line, e.reason))?;
+            inner.chain = Some((head.unwrap_or_else(|| GENESIS.to_string()), len as u64));
+        }
+        let (head, len) = inner.chain.clone().unwrap();
+        body["prev"] = head.into();
+        body["seq"] = len.into();
+        let hash = sha256_hex(&serde_json::to_vec(&body)?);
+        let line = serde_json::json!({ "entry": body, "hash": hash });
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        f.write_all(format!("{}\n", serde_json::to_string(&line)?).as_bytes())?;
+        f.sync_data()?;
+        inner.chain = Some((hash.clone(), len + 1));
+        Ok((len, hash))
+    }
+
+    fn flush_locked(&self, inner: &mut Inner) -> Result<()> {
+        let Some(f) = inner.fold.take() else { return Ok(()) };
+        if f.repeats == 0 {
+            return Ok(());
+        }
+        let mut body = serde_json::json!({
+            "type": "fold", "first_seq": f.first_seq, "count": f.repeats,
+            "first_utc_ms": f.first_repeat_ms, "last_utc_ms": f.last_repeat_ms,
+        });
+        for (k, v) in f.summary.as_object().into_iter().flatten() {
+            body[k] = v.clone();
+        }
+        self.append(inner, body).map(|_| ())
+    }
+
+    /// Writes the pending fold, if any: the lease ended, or Core is stopping.
+    pub fn flush(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Err(e) = self.flush_locked(&mut inner) {
+            tracing::error!("could not write the call log's fold entry: {e:#}");
+        }
+    }
+
+    /// Enters one call. `entry` carries everything but `prev` and `seq`; `key`
+    /// is `Some` for a fold-eligible read and names what makes two reads identical.
+    fn record(&self, entry: serde_json::Value, key: Option<String>) -> Result<Stamp> {
+        let mut inner = self.inner.lock().unwrap();
+        let now = entry["at_utc_ms"].as_u64().unwrap_or(0);
+        if let (Some(k), Some(f)) = (&key, inner.fold.as_mut()) {
+            if &f.key == k {
+                f.repeats += 1;
+                if f.repeats == 1 {
+                    f.first_repeat_ms = now;
+                }
+                f.last_repeat_ms = now;
+                return Ok(Stamp { seq: f.first_seq, hash: f.first_hash.clone(), repeat: Some(f.repeats) });
+            }
+        }
+        self.flush_locked(&mut inner)?;
+        let summary = serde_json::json!({
+            "method": entry["method"], "route": entry["route"], "scope": entry["scope"],
+            "status": entry["status"], "answer_sha256": entry["answer_sha256"],
+        });
+        let (seq, hash) = self.append(&mut inner, entry)?;
+        inner.fold = key.map(|key| Fold {
+            key,
+            first_seq: seq,
+            first_hash: hash.clone(),
+            repeats: 0,
+            first_repeat_ms: 0,
+            last_repeat_ms: 0,
+            summary,
+        });
+        Ok(Stamp { seq, hash, repeat: None })
+    }
+}
+
+fn now_ms() -> u64 {
+    crate::study::current_utc_ms()
+}
+
+fn is_json(parts: &axum::http::request::Parts) -> bool {
+    parts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"))
+}
+
+fn too_large() -> Response {
+    (StatusCode::PAYLOAD_TOO_LARGE, "request body too large for Core to log").into_response()
+}
+
+/// Logs every call to a gated route (decision 122): see the module doc.
+pub async fn call_log_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let (mut parts, body) = req.into_parts();
+    let route = parts.extensions.get::<MatchedPath>().map(|p| p.as_str().to_string());
+    let method = parts.method.as_str().to_string();
+    let Some(route) = route.filter(|r| crate::lease::is_gated(&method, r)) else {
+        return next.run(Request::from_parts(parts, body)).await;
+    };
+
+    let started_ms = now_ms();
+    let params: serde_json::Map<String, serde_json::Value> = match RawPathParams::from_request_parts(&mut parts, &state).await {
+        Ok(p) => p.iter().map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string()))).collect(),
+        Err(_) => Default::default(),
+    };
+    let scope = parts.extensions.get::<Scope>().map(|s| s.as_str()).unwrap_or("unknown");
+    let lease = state.lease.view().map(|l| serde_json::json!({ "holder": l.holder, "purpose": l.purpose }));
+
+    let Ok(request_bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
+        return too_large();
+    };
+    let body_json = (is_json(&parts) && !request_bytes.is_empty() && request_bytes.len() <= BODY_CAP_BYTES)
+        .then(|| serde_json::from_slice::<serde_json::Value>(&request_bytes).ok())
+        .flatten();
+    let body_sha256 = sha256_hex(&request_bytes);
+
+    let note = BoardNote::default();
+    let req = Request::from_parts(parts, Body::from(request_bytes));
+    let response = NOTE.scope(note.clone(), next.run(req)).await;
+
+    let (mut rparts, rbody) = response.into_parts();
+    let (answer_sha256, answer) = match axum::body::to_bytes(rbody, MAX_BODY_BYTES).await {
+        Ok(b) => (Some(sha256_hex(&b)), b),
+        Err(e) => {
+            tracing::error!("call log: could not read the answer to hash it: {e}");
+            (None, Default::default())
+        }
+    };
+    let status = rparts.status.as_u16();
+
+    let board = note.take().map(|b| {
+        let image = b.chip.as_deref().and_then(|c| state.images.all().into_iter().find(|i| i.chip == c)).and_then(|i| i.sha256);
+        serde_json::json!({
+            "role": b.role, "probe_serial": b.probe_serial, "chip": b.chip,
+            "image_sha256": image.map(serde_json::Value::String).unwrap_or_else(|| "unknown".into()),
+        })
+    });
+
+    let key = FOLDED_READS.iter().any(|(m, p)| *m == method && *p == route).then(|| {
+        sha256_hex(
+            serde_json::json!([method, route, params, body_sha256, scope, lease, status, answer_sha256])
+                .to_string()
+                .as_bytes(),
+        )
+    });
+    let entry = serde_json::json!({
+        "type": "call", "at_utc_ms": started_ms, "method": method, "route": route, "params": params,
+        "body_sha256": body_sha256, "body": body_json, "scope": scope, "lease": lease,
+        "status": status, "answer_sha256": answer_sha256, "board": board,
+    });
+    match state.call_log.record(entry, key) {
+        Ok(stamp) => {
+            let h = &mut rparts.headers;
+            if let (Ok(s), Ok(x)) = (HeaderValue::from_str(&stamp.seq.to_string()), HeaderValue::from_str(&stamp.hash)) {
+                h.insert(SEQ_HEADER, s);
+                h.insert(HASH_HEADER, x);
+            }
+            if let Some(r) = stamp.repeat {
+                h.insert(REPEAT_HEADER, HeaderValue::from(r));
+            }
+        }
+        // Today a call is served either way; the fail-closed rule is a later phase (decision 122).
+        Err(e) => tracing::error!("could not enter the call in the call log: {e:#}"),
+    }
+    Response::from_parts(rparts, Body::from(answer))
+}
+
+#[derive(Deserialize)]
+pub struct RangeQuery {
+    #[serde(default)]
+    from: Option<usize>,
+    #[serde(default)]
+    to: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct CallLogResponse {
+    verified: bool,
+    error: Option<String>,
+    length: usize,
+    head: Option<String>,
+    from: usize,
+    to: usize,
+    /// More entries lie in the asked range than one answer returns ([`MAX_RANGE`]).
+    truncated: bool,
+    entries: Vec<serde_json::Value>,
+    /// Repeats counted in memory and not yet chained: `{first_seq, repeats}`.
+    pending_fold: Option<serde_json::Value>,
+}
+
+/// A range of entries, `from` inclusive to `to` exclusive (the whole log by
+/// default, at most [`MAX_RANGE`]), and the head. Touches no hardware.
+// route: GET /call-log
+pub async fn call_log_handler(
+    State(state): State<AppState>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<CallLogResponse>, (StatusCode, String)> {
+    let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let log = &state.call_log;
+    // Under the lock, so an append cannot land half-written between the reads.
+    let inner = log.inner.lock().unwrap();
+    let lines = log.lines().map_err(internal)?;
+    let pending_fold = inner
+        .fold
+        .as_ref()
+        .filter(|f| f.repeats > 0)
+        .map(|f| serde_json::json!({ "first_seq": f.first_seq, "repeats": f.repeats }));
+    drop(inner);
+    let (verified, error, head) = match verify_lines(&lines).map_err(internal)? {
+        Ok((head, _)) => (true, None, head),
+        Err(e) => (false, Some(format!("line {}: {}", e.line, e.reason)), None),
+    };
+    let length = lines.len();
+    let from = q.from.unwrap_or(0).min(length);
+    let to = q.to.unwrap_or(length).clamp(from, length);
+    let truncated = to - from > MAX_RANGE;
+    let to = if truncated { from + MAX_RANGE } else { to };
+    Ok(Json(CallLogResponse { verified, error, length, head, from, to, truncated, entries: lines[from..to].to_vec(), pending_fold }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::build_router;
+    use axum::Router;
+    use tower::ServiceExt as _;
+
+    const TOKEN: &str = "test-token";
+
+    fn state() -> AppState {
+        AppState::new(TOKEN.to_string())
+    }
+
+    async fn call(router: &Router, bearer: &str, method: &str, uri: &str, lease: Option<&str>, body: Option<&str>) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut b = Request::builder().method(method).uri(uri).header("authorization", format!("Bearer {bearer}"));
+        if let Some(t) = lease {
+            b = b.header(crate::lease::LEASE_HEADER, t);
+        }
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let r = router.clone().oneshot(b.body(Body::from(body.unwrap_or("").to_string())).unwrap()).await.unwrap();
+        let (p, bd) = r.into_parts();
+        let bytes = axum::body::to_bytes(bd, 1 << 20).await.unwrap();
+        (p.status, p.headers, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn uri_of(path: &str) -> String {
+        path.replace("{role}", "dut").replace("{serial}", "abc").replace("{name}", "console").replace("{study_id}", "abc")
+    }
+
+    fn entries(s: &AppState) -> Vec<serde_json::Value> {
+        s.call_log.lines().unwrap().into_iter().map(|l| l["entry"].clone()).collect()
+    }
+
+    /// Takes the lease as someone else, so every gated call below is refused
+    /// before its handler runs: nothing here reaches a board.
+    async fn lease_held_elsewhere(router: &Router) {
+        let (st, _, _) = call(router, TOKEN, "POST", "/lease", None, Some(r#"{"holder":"other","purpose":"p","ttl_s":60}"#)).await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn every_gated_route_is_logged_once_per_call_refusals_included_with_its_scope() {
+        let s = state();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        for (n, (method, path)) in crate::lease::LEASE_GATED.iter().enumerate() {
+            // Alternate the two tokens: the entry names the scope of the token that called.
+            let (bearer, scope) = if n % 2 == 0 { (TOKEN.to_string(), "agent") } else { (format!("person-{TOKEN}"), "person") };
+            let (st, h, _) = call(&router, &bearer, method, &uri_of(path), None, Some("{}")).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{method} {path}");
+            let e = &entries(&s);
+            assert_eq!(e.len(), n + 1, "{method} {path} must add exactly one entry");
+            assert_eq!(e[n]["route"], *path);
+            assert_eq!(e[n]["method"], *method);
+            assert_eq!(e[n]["scope"], scope);
+            assert_eq!(e[n]["status"], 409);
+            assert_eq!(e[n]["lease"]["holder"], "other");
+            assert_eq!(h[SEQ_HEADER].to_str().unwrap(), n.to_string());
+        }
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_admitted_call_is_logged_with_its_body_and_answer_hash() {
+        let s = state();
+        let router = build_router(s.clone());
+        let (st, h, text) = call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        let e = &entries(&s)[0];
+        assert_eq!(e["body"], serde_json::json!({}));
+        assert_eq!(e["body_sha256"], sha256_hex(b"{}"));
+        assert_eq!(e["answer_sha256"], sha256_hex(text.as_bytes()));
+        assert!(e["lease"].is_null());
+        assert_eq!(h[HASH_HEADER].to_str().unwrap(), s.call_log.lines().unwrap()[0]["hash"]);
+    }
+
+    #[tokio::test]
+    async fn a_path_parameter_is_recorded() {
+        let s = state();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        call(&router, TOKEN, "POST", "/signals/console/exchange", None, Some("{}")).await;
+        assert_eq!(entries(&s)[0]["params"], serde_json::json!({ "name": "console" }));
+    }
+
+    #[tokio::test]
+    async fn ungated_calls_are_not_logged() {
+        let s = state();
+        let router = build_router(s.clone());
+        call(&router, TOKEN, "GET", "/lease", None, None).await;
+        call(&router, TOKEN, "GET", "/call-log", None, None).await;
+        assert!(entries(&s).is_empty());
+    }
+
+    #[tokio::test]
+    async fn five_identical_reads_chain_one_entry_and_fold_four() {
+        let s = state();
+        let router = build_router(s.clone());
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let (_, h, _) = call(&router, TOKEN, "POST", "/live/mem-read", None, Some("{}")).await;
+            seen.push((h[SEQ_HEADER].to_str().unwrap().to_string(), h[HASH_HEADER].to_str().unwrap().to_string(), h.get(REPEAT_HEADER).map(|v| v.to_str().unwrap().to_string())));
+        }
+        assert_eq!(entries(&s).len(), 1, "the repeats are counted in memory, not chained");
+        assert!(seen.iter().all(|(sq, hs, _)| *sq == seen[0].0 && *hs == seen[0].1), "a repeat names the first entry");
+        assert_eq!(seen[0].2, None);
+        assert_eq!(seen[4].2.as_deref(), Some("4"));
+        let (_, _, text) = call(&router, TOKEN, "GET", "/call-log", None, None).await;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["pending_fold"]["repeats"], 4);
+        s.call_log.flush();
+        let e = entries(&s);
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[1]["type"], "fold");
+        assert_eq!(e[1]["count"], 4);
+        assert_eq!(e[1]["first_seq"], 0);
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_different_call_between_two_reads_gives_no_fold() {
+        let s = state();
+        let router = build_router(s.clone());
+        call(&router, TOKEN, "POST", "/live/mem-read", None, Some("{}")).await;
+        call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        call(&router, TOKEN, "POST", "/live/mem-read", None, Some("{}")).await;
+        s.call_log.flush();
+        let e = entries(&s);
+        assert_eq!(e.len(), 3);
+        assert!(e.iter().all(|x| x["type"] == "call"));
+    }
+
+    #[tokio::test]
+    async fn the_other_scope_does_not_fold_into_a_read() {
+        let s = state();
+        let router = build_router(s.clone());
+        call(&router, TOKEN, "POST", "/live/mem-read", None, Some("{}")).await;
+        call(&router, &format!("person-{TOKEN}"), "POST", "/live/mem-read", None, Some("{}")).await;
+        assert_eq!(entries(&s).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_action_never_folds() {
+        let s = state();
+        let router = build_router(s.clone());
+        for _ in 0..3 {
+            call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        }
+        assert_eq!(entries(&s).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_call_log_route_returns_the_entry_a_call_named_and_the_head() {
+        let s = state();
+        let router = build_router(s.clone());
+        call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        let (_, h, _) = call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        let seq: usize = h[SEQ_HEADER].to_str().unwrap().parse().unwrap();
+        let (st, _, text) = call(&router, TOKEN, "GET", &format!("/call-log?from={seq}&to={}", seq + 1), None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["verified"], true);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(v["entries"][0]["hash"], h[HASH_HEADER].to_str().unwrap());
+        assert_eq!(v["head"], h[HASH_HEADER].to_str().unwrap());
+        assert_eq!(v["length"], 2);
+    }
+
+    fn rewrite(s: &AppState, f: impl FnOnce(&mut Vec<String>)) {
+        let text = std::fs::read_to_string(&s.call_log.path).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        f(&mut lines);
+        std::fs::write(&s.call_log.path, lines.join("\n") + "\n").unwrap();
+    }
+
+    async fn three_calls() -> AppState {
+        let s = state();
+        let router = build_router(s.clone());
+        for _ in 0..3 {
+            call(&router, TOKEN, "POST", "/reset", None, Some("{}")).await;
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn the_chain_recomputes_and_an_edit_a_removal_or_a_reorder_is_reported() {
+        let s = three_calls().await;
+        let (head, len) = s.call_log.verify().unwrap().unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(s.call_log.lines().unwrap()[0]["entry"]["prev"], GENESIS);
+        assert_eq!(head.unwrap(), s.call_log.lines().unwrap()[2]["hash"]);
+
+        rewrite(&s, |l| l[1] = l[1].replace("\"status\":422", "\"status\":200"));
+        assert_eq!(s.call_log.verify().unwrap().unwrap_err().line, 2);
+
+        let s = three_calls().await;
+        rewrite(&s, |l| {
+            l.remove(1);
+        });
+        assert_eq!(s.call_log.verify().unwrap().unwrap_err().line, 2);
+
+        let s = three_calls().await;
+        rewrite(&s, |l| l.swap(1, 2));
+        assert_eq!(s.call_log.verify().unwrap().unwrap_err().line, 2);
+    }
+
+    #[tokio::test]
+    async fn a_broken_log_is_not_extended() {
+        let s = three_calls().await;
+        let fresh = CallLog::at(s.call_log.path.parent().unwrap().to_path_buf());
+        rewrite(&s, |l| l[0] = l[0].replace("\"status\":422", "\"status\":200"));
+        let mut inner = fresh.inner.lock().unwrap();
+        assert!(fresh.append(&mut inner, serde_json::json!({ "type": "call" })).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_restart_continues_the_chain() {
+        let s = three_calls().await;
+        let reopened = CallLog::at(s.call_log.path.parent().unwrap().to_path_buf());
+        reopened.record(serde_json::json!({ "type": "call", "at_utc_ms": 1 }), None).unwrap();
+        assert_eq!(reopened.verify().unwrap().unwrap().1, 4);
+    }
+
+    #[tokio::test]
+    async fn a_handler_names_the_board_and_the_entry_carries_its_image_hash() {
+        let s = state();
+        s.images.record(crate::lease::FlashedImage {
+            chip: "nRF54L15".into(),
+            probe_serial: None,
+            path: "p".into(),
+            sha256: Some("abc123".into()),
+            flashed_at: String::new(),
+            lease_holder: None,
+        });
+        // A stand-in handler on a gated path: nothing reaches a board.
+        let router = Router::new()
+            .route("/reset", axum::routing::post(|| async {
+                board_note().set(Some("dut"), Some("0010"), Some("nRF54L15"));
+                "ok"
+            }))
+            .layer(axum::middleware::from_fn_with_state(s.clone(), call_log_middleware))
+            .layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+                req.extensions_mut().insert(Scope::Agent);
+                next.run(req).await
+            }));
+        let r = router.clone().oneshot(Request::builder().method("POST").uri("/reset").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = &entries(&s)[0]["board"];
+        assert_eq!(b["role"], "dut");
+        assert_eq!(b["image_sha256"], "abc123");
+
+        s.images.record(crate::lease::FlashedImage {
+            chip: "nRF54L15".into(),
+            probe_serial: None,
+            path: "p".into(),
+            sha256: None,
+            flashed_at: String::new(),
+            lease_holder: None,
+        });
+        router.oneshot(Request::builder().method("POST").uri("/reset").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(entries(&s)[1]["board"]["image_sha256"], "unknown");
+    }
+
+    #[test]
+    fn a_note_outside_a_logged_call_is_a_no_op() {
+        board_note().set(Some("dut"), None, None);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_kept_as_its_hash_alone() {
+        let s = state();
+        let router = build_router(s.clone());
+        let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(BODY_CAP_BYTES));
+        call(&router, TOKEN, "POST", "/reset", None, Some(&big)).await;
+        let e = &entries(&s)[0];
+        assert!(e["body"].is_null());
+        assert_eq!(e["body_sha256"], sha256_hex(big.as_bytes()));
+    }
+}
