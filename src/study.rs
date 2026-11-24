@@ -7499,6 +7499,7 @@ mod tests {
             direction: SignalDirection::Bidirectional,
             route: Route::Direct { port_serial: "0671FF".into(), interface: Some(2) },
             baud: None,
+            safe_off: None,
         };
         let enrolled = |role: &str, name: &str, probe: Option<&str>| EnrolledBoard {
             probe_serial: probe.map(Into::into),

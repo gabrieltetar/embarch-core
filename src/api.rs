@@ -2552,6 +2552,7 @@ mod tests {
             direction,
             route,
             baud: None,
+            safe_off: None,
         }
     }
 

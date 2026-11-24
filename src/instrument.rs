@@ -244,6 +244,7 @@ mod tests {
             min_interval_ms: interval_ms,
             ack_ok: acks.then(|| "Rexecu success".into()),
             ack_err: acks.then(|| "Rexecu err".into()),
+            safe_off: Vec::new(),
         }
     }
 
