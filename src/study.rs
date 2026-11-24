@@ -476,7 +476,7 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // crate, not restated (core decision 90).
     study.validate_monitor_windows().map_err(|e| e.to_string())?;
 
-    // `embarch-study-designer` decision 93: a GATT notify tap no step subscribes
+    // `embarch-study-designer` decision 55: a GATT notify tap no step subscribes
     // to captures nothing. Computed by the crate, not restated (core decision 90).
     study.validate_stream_subscriptions().map_err(|e| e.to_string())?;
 
@@ -5285,7 +5285,7 @@ mod tests {
         .is_ok());
     }
 
-    /// study-designer decision 93 / core decision 90: a GATT notify tap no
+    /// study-designer decision 55 / core decision 90: a GATT notify tap no
     /// step subscribes to is refused with the crate's text; an unfiltered
     /// monitor step subscribes it.
     #[test]
