@@ -85,6 +85,7 @@ impl AppState {
     /// `main.rs`'s `serve` doesn't need to know any of their internals.
     pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer, run_log: crate::run_log::RunLog) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
+        let study_lock: study::StudyLock = Arc::new(StdMutex::new(None));
         Self {
             tokens,
             sealer,
@@ -95,11 +96,11 @@ impl AppState {
             host_cancel: Arc::new(StdMutex::new(None)),
             host_prompt: Arc::new(StdMutex::new(None)),
             captures: crate::capture::CaptureRegistry::default(),
-            lease: lease::LeaseSlot::default(),
+            lease: lease::LeaseSlot::watching(study_lock.clone()),
             images: lease::ImageLog::default(),
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
-            study_lock: Arc::new(StdMutex::new(None)),
+            study_lock,
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
             study_events,
         }
@@ -297,6 +298,10 @@ fn lease_err(e: lease::LeaseError) -> (StatusCode, String) {
             StatusCode::NOT_FOUND,
             "no lease is live (never taken, released, expired, or Core restarted)".to_string(),
         ),
+        lease::LeaseError::IdleReleased(holder) => (
+            StatusCode::NOT_FOUND,
+            format!("no lease is live: the lease held by '{holder}' was {}", lease::IDLE_RELEASE_REASON),
+        ),
         lease::LeaseError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg),
     }
 }
@@ -334,7 +339,7 @@ async fn take_lease_handler(
 /// The live lease without its token, or `404`.
 // route: GET /lease
 async fn get_lease_handler(State(state): State<AppState>) -> Result<Json<lease::LeaseView>, (StatusCode, String)> {
-    state.lease.view().map(Json).ok_or_else(|| lease_err(lease::LeaseError::NoLease))
+    state.lease.view().map(Json).ok_or_else(|| lease_err(state.lease.absent()))
 }
 
 /// Extends the live lease to `ttl_s` from now (its own TTL when omitted);

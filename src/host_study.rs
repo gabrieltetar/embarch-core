@@ -1233,6 +1233,7 @@ impl HostBackend for CoreBackend {
 /// however it ends.
 struct JobHold {
     lock: crate::study::StudyLock,
+    lease: crate::lease::LeaseSlot,
     cancel: HostCancel,
     prompt: HostPrompt,
 }
@@ -1241,6 +1242,8 @@ impl Drop for JobHold {
     fn drop(&mut self) {
         *self.prompt.lock().unwrap() = None;
         *self.cancel.lock().unwrap() = None;
+        // Before the lock clears, so the idle clock restarts while the run still counts (decision 123).
+        self.lease.study_ended();
         *self.lock.lock().unwrap() = None;
     }
 }
@@ -1260,7 +1263,7 @@ pub async fn post_host_study_handler(
 
     let study_id = crate::study::generate_study_id();
     crate::study::take_study_lock(&state, &study_id)?;
-    let hold = JobHold { lock: state.study_lock.clone(), cancel: state.host_cancel.clone(), prompt: state.host_prompt.clone() };
+    let hold = JobHold { lock: state.study_lock.clone(), lease: state.lease.clone(), cancel: state.host_cancel.clone(), prompt: state.host_prompt.clone() };
 
     let for_signals = study.clone();
     match tokio::task::spawn_blocking(move || check_signals(&for_signals)).await {

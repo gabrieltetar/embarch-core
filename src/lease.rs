@@ -12,12 +12,17 @@
 //! cannot block the bench past its TTL. A Core restart drops it too, which
 //! frees the bench (the safe direction) and makes the holder's next renew a
 //! `404`.
+//!
+//! A lease also ends after [`IDLE_RELEASE`] with no hardware call (decision
+//! 123), whatever client renews it.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+
+use crate::study::StudyLock;
 
 /// The request header that carries the lease token.
 pub const LEASE_HEADER: &str = "x-embarch-lease";
@@ -28,6 +33,13 @@ pub const LEASE_HEADER: &str = "x-embarch-lease";
 /// without letting a forgotten lease park the bench for a day.
 pub const MAX_TTL_S: u64 = 4 * 60 * 60;
 
+/// A lease with no hardware call for this long is released, however it is
+/// renewed (decision 123). 30 minutes, the owner's call; not measured.
+pub const IDLE_RELEASE: Duration = Duration::from_secs(30 * 60);
+
+/// What a renew after an idle release is refused with.
+pub const IDLE_RELEASE_REASON: &str = "released after 30 min with no hardware call";
+
 #[derive(Debug, Clone)]
 struct Lease {
     token: String,
@@ -37,6 +49,11 @@ struct Lease {
     started_at: OffsetDateTime,
     expires_at: OffsetDateTime,
     expires: Instant,
+    /// The idle clock's zero: the start, the last hardware call, or the end
+    /// of the last study run, whichever is latest.
+    idle_since: Instant,
+    /// Wall time of the last hardware call; `None` until one is made.
+    last_call_at: Option<OffsetDateTime>,
 }
 
 /// What a caller may see of a lease: everything except the token.
@@ -47,6 +64,8 @@ pub struct LeaseView {
     pub started_at: String,
     pub expires_at: String,
     pub ttl_s: u64,
+    /// The last hardware call admitted with the token, or `None` before one.
+    pub last_hardware_call_at: Option<String>,
 }
 
 impl LeaseView {
@@ -72,6 +91,7 @@ impl Lease {
             started_at: rfc3339(self.started_at),
             expires_at: rfc3339(self.expires_at),
             ttl_s: self.ttl_s,
+            last_hardware_call_at: self.last_call_at.map(rfc3339),
         }
     }
 }
@@ -87,28 +107,81 @@ pub struct Granted {
 #[derive(Debug, PartialEq, Eq)]
 pub enum LeaseError {
     /// Another lease is live (create), or the token is not the live one.
-    Held(LeaseView),
+    Held(Box<LeaseView>),
     /// Nothing is live: never taken, released, expired, or Core restarted.
     NoLease,
+    /// Nothing is live because the last lease, held by this holder, sat
+    /// [`IDLE_RELEASE`] with no hardware call.
+    IdleReleased(String),
     Invalid(String),
 }
 
+#[derive(Default)]
+struct Inner {
+    lease: Option<Lease>,
+    /// Holder of the last lease if it ended idle; cleared by the next take
+    /// or a release.
+    idle_released: Option<String>,
+}
+
 #[derive(Clone, Default)]
-pub struct LeaseSlot(Arc<StdMutex<Option<Lease>>>);
+pub struct LeaseSlot {
+    inner: Arc<StdMutex<Inner>>,
+    /// `AppState::study_lock`: a lease is not idle while it is held.
+    study_lock: Option<StudyLock>,
+}
 
 impl LeaseSlot {
-    /// The live lease, clearing one that has expired.
-    fn live(slot: &mut Option<Lease>) -> Option<&mut Lease> {
-        if slot.as_ref().is_some_and(|l| Instant::now() >= l.expires) {
-            if let Some(l) = slot.take() {
-                tracing::info!("lease held by '{}' expired", l.holder);
+    /// A slot that treats a held `study_lock` as activity (decision 123).
+    pub fn watching(study_lock: StudyLock) -> Self {
+        Self { inner: Arc::default(), study_lock: Some(study_lock) }
+    }
+
+    fn study_in_flight(&self) -> bool {
+        self.study_lock.as_ref().is_some_and(|l| l.lock().unwrap().is_some())
+    }
+
+    /// The live lease, clearing one that has expired or sat idle.
+    fn live<'a>(&self, inner: &'a mut Inner) -> Option<&'a mut Lease> {
+        let now = Instant::now();
+        let expired = inner.lease.as_ref().is_some_and(|l| now >= l.expires);
+        let idle = !expired
+            && inner.lease.as_ref().is_some_and(|l| now >= l.idle_since + IDLE_RELEASE)
+            && !self.study_in_flight();
+        if expired || idle {
+            if let Some(l) = inner.lease.take() {
+                if idle {
+                    tracing::info!("lease held by '{}' released: {IDLE_RELEASE_REASON}", l.holder);
+                    inner.idle_released = Some(l.holder);
+                } else {
+                    tracing::info!("lease held by '{}' expired", l.holder);
+                }
             }
         }
-        slot.as_mut()
+        inner.lease.as_mut()
     }
 
     pub fn view(&self) -> Option<LeaseView> {
-        Self::live(&mut self.0.lock().unwrap()).map(|l| l.view())
+        self.live(&mut self.inner.lock().unwrap()).map(|l| l.view())
+    }
+
+    /// Why nothing is live: [`LeaseError::IdleReleased`] naming the holder
+    /// when the last lease ended idle, else [`LeaseError::NoLease`].
+    pub fn absent(&self) -> LeaseError {
+        let mut inner = self.inner.lock().unwrap();
+        if self.live(&mut inner).is_some() {
+            return LeaseError::NoLease;
+        }
+        self.idle_or_none(&inner)
+    }
+
+    /// A study run ended: the idle clock restarts from now (decision 123).
+    /// Called before the study lock is cleared, so no check sees it free
+    /// with a stale clock.
+    pub fn study_ended(&self) {
+        if let Some(l) = self.inner.lock().unwrap().lease.as_mut() {
+            l.idle_since = Instant::now();
+        }
     }
 
     pub fn take(&self, holder: &str, purpose: &str, ttl_s: u64) -> Result<Granted, LeaseError> {
@@ -117,10 +190,11 @@ impl LeaseSlot {
             return Err(LeaseError::Invalid("holder must not be empty".into()));
         }
         let ttl_s = check_ttl(ttl_s)?;
-        let mut slot = self.0.lock().unwrap();
-        if let Some(l) = Self::live(&mut slot) {
-            return Err(LeaseError::Held(l.view()));
+        let mut slot = self.inner.lock().unwrap();
+        if let Some(l) = self.live(&mut slot) {
+            return Err(LeaseError::Held(Box::new(l.view())));
         }
+        slot.idle_released = None;
         let mut bytes = [0u8; 16];
         rand::fill(&mut bytes);
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -134,19 +208,24 @@ impl LeaseSlot {
             started_at: now,
             expires_at: now + d,
             expires: Instant::now() + d,
+            idle_since: Instant::now(),
+            last_call_at: None,
         };
         tracing::info!("lease taken by '{}' ({}), ttl {ttl_s}s", lease.holder, lease.purpose);
         let view = lease.view();
-        *slot = Some(lease);
+        slot.lease = Some(lease);
         Ok(Granted { token, lease: view })
     }
 
     /// Extends the live lease to `ttl_s` from now (its own TTL when `None`).
     pub fn renew(&self, token: Option<&str>, ttl_s: Option<u64>) -> Result<LeaseView, LeaseError> {
-        let mut slot = self.0.lock().unwrap();
-        let l = Self::live(&mut slot).ok_or(LeaseError::NoLease)?;
+        let mut slot = self.inner.lock().unwrap();
+        if self.live(&mut slot).is_none() {
+            return Err(self.idle_or_none(&slot));
+        }
+        let l = slot.lease.as_mut().unwrap();
         if token != Some(l.token.as_str()) {
-            return Err(LeaseError::Held(l.view()));
+            return Err(LeaseError::Held(Box::new(l.view())));
         }
         let ttl_s = check_ttl(ttl_s.unwrap_or(l.ttl_s))?;
         let d = Duration::from_secs(ttl_s);
@@ -157,24 +236,38 @@ impl LeaseSlot {
     }
 
     pub fn release(&self, token: Option<&str>) -> Result<(), LeaseError> {
-        let mut slot = self.0.lock().unwrap();
-        let l = Self::live(&mut slot).ok_or(LeaseError::NoLease)?;
+        let mut slot = self.inner.lock().unwrap();
+        if self.live(&mut slot).is_none() {
+            return Err(self.idle_or_none(&slot));
+        }
+        let l = slot.lease.as_ref().unwrap();
         if token != Some(l.token.as_str()) {
-            return Err(LeaseError::Held(l.view()));
+            return Err(LeaseError::Held(Box::new(l.view())));
         }
         tracing::info!("lease released by '{}'", l.holder);
-        *slot = None;
+        slot.lease = None;
+        slot.idle_released = None;
         Ok(())
     }
 
+    fn idle_or_none(&self, inner: &Inner) -> LeaseError {
+        inner.idle_released.clone().map_or(LeaseError::NoLease, LeaseError::IdleReleased)
+    }
+
     /// `Ok(holder)` when the request may touch hardware: no lease is live
-    /// (`None`), or it carries the live lease's token (`Some(holder)`).
-    pub fn admit(&self, token: Option<&str>) -> Result<Option<String>, LeaseView> {
-        let mut slot = self.0.lock().unwrap();
-        match Self::live(&mut slot) {
+    /// (`None`), or it carries the live lease's token (`Some(holder)`),
+    /// which also stamps the lease's last hardware call and restarts its
+    /// idle clock. A refused call stamps nothing.
+    pub fn admit(&self, token: Option<&str>) -> Result<Option<String>, Box<LeaseView>> {
+        let mut slot = self.inner.lock().unwrap();
+        match self.live(&mut slot) {
             None => Ok(None),
-            Some(l) if token == Some(l.token.as_str()) => Ok(Some(l.holder.clone())),
-            Some(l) => Err(l.view()),
+            Some(l) if token == Some(l.token.as_str()) => {
+                l.idle_since = Instant::now();
+                l.last_call_at = Some(OffsetDateTime::now_utc());
+                Ok(Some(l.holder.clone()))
+            }
+            Some(l) => Err(Box::new(l.view())),
         }
     }
 }
@@ -343,7 +436,7 @@ mod tests {
         let s = LeaseSlot::default();
         s.take("a", "p", 1).unwrap();
         // Force expiry rather than sleeping.
-        s.0.lock().unwrap().as_mut().unwrap().expires = Instant::now();
+        s.inner.lock().unwrap().lease.as_mut().unwrap().expires = Instant::now();
         assert!(s.view().is_none());
         assert_eq!(s.admit(None), Ok(None));
         assert!(s.take("b", "p", 60).is_ok());
@@ -359,6 +452,72 @@ mod tests {
         assert_eq!(v.ttl_s, 120);
         s.release(Some(&g.token)).unwrap();
         assert_eq!(s.renew(Some(&g.token), None), Err(LeaseError::NoLease));
+    }
+
+    fn age(s: &LeaseSlot, by: Duration) {
+        let mut inner = s.inner.lock().unwrap();
+        let l = inner.lease.as_mut().unwrap();
+        l.idle_since -= by;
+    }
+
+    #[test]
+    fn renewing_every_minute_without_a_hardware_call_ends_at_30_minutes() {
+        let s = LeaseSlot::default();
+        let g = s.take("a", "p", 600).unwrap();
+        for _ in 0..29 {
+            age(&s, Duration::from_secs(60));
+            s.renew(Some(&g.token), Some(600)).unwrap();
+        }
+        assert!(s.view().is_some());
+        age(&s, Duration::from_secs(60));
+        assert!(s.view().is_none());
+        assert_eq!(s.admit(None), Ok(None));
+    }
+
+    #[test]
+    fn a_token_call_restarts_the_clock_and_a_wrong_token_does_not() {
+        let s = LeaseSlot::default();
+        s.take("a", "p", 7200).unwrap();
+        assert_eq!(s.view().unwrap().last_hardware_call_at, None);
+        age(&s, IDLE_RELEASE - Duration::from_secs(10));
+        assert!(s.admit(Some("wrong")).is_err());
+        assert_eq!(s.view().unwrap().last_hardware_call_at, None);
+        age(&s, Duration::from_secs(20));
+        assert!(s.view().is_none(), "a refused call must not restart the clock");
+
+        let g2 = s.take("a", "p", 7200).unwrap();
+        age(&s, IDLE_RELEASE - Duration::from_secs(10));
+        s.admit(Some(&g2.token)).unwrap();
+        age(&s, IDLE_RELEASE - Duration::from_secs(10));
+        let v = s.view().expect("the call restarted the clock");
+        assert!(v.last_hardware_call_at.is_some());
+    }
+
+    #[test]
+    fn a_study_in_flight_keeps_the_lease_and_the_clock_restarts_when_it_ends() {
+        let study_lock: StudyLock = Arc::new(StdMutex::new(Some("study-1".into())));
+        let s = LeaseSlot::watching(study_lock.clone());
+        s.take("a", "p", 7200).unwrap();
+        age(&s, IDLE_RELEASE * 2);
+        assert!(s.view().is_some(), "kept while the run holds the study lock");
+        s.study_ended();
+        *study_lock.lock().unwrap() = None;
+        age(&s, IDLE_RELEASE - Duration::from_secs(10));
+        assert!(s.view().is_some());
+        age(&s, Duration::from_secs(20));
+        assert!(s.view().is_none());
+    }
+
+    #[test]
+    fn a_renew_after_an_idle_release_names_it_and_the_holder() {
+        let s = LeaseSlot::default();
+        let g = s.take("alice", "p", 7200).unwrap();
+        age(&s, IDLE_RELEASE);
+        assert_eq!(s.renew(Some(&g.token), None), Err(LeaseError::IdleReleased("alice".into())));
+        assert_eq!(s.absent(), LeaseError::IdleReleased("alice".into()));
+        // A new take clears the reason.
+        s.take("bob", "p", 60).unwrap();
+        assert_eq!(s.absent(), LeaseError::NoLease);
     }
 
     #[test]

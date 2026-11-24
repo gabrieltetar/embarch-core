@@ -1602,6 +1602,7 @@ pub async fn post_study_handler(
 
     let jobs = state.study_jobs.clone();
     let study_lock = state.study_lock.clone();
+    let lease_slot = state.lease.clone();
     let events_tx = state.study_events.clone();
     let manifest_slot = state.outpost_manifest.clone();
     let tap_ports = state.tap_ports.clone();
@@ -1637,6 +1638,8 @@ pub async fn post_study_handler(
             );
         }
 
+        // Before the lock clears, so the idle clock restarts while the run still counts (decision 123).
+        lease_slot.study_ended();
         *study_lock.lock().unwrap() = None;
     });
 
