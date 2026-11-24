@@ -86,6 +86,7 @@ impl AppState {
     pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer, run_log: crate::run_log::RunLog) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         let study_lock: study::StudyLock = Arc::new(StdMutex::new(None));
+        let images = lease::ImageLog::at(run_log.data_dir());
         Self {
             tokens,
             sealer,
@@ -97,7 +98,7 @@ impl AppState {
             host_prompt: Arc::new(StdMutex::new(None)),
             captures: crate::capture::CaptureRegistry::default(),
             lease: lease::LeaseSlot::watching(study_lock.clone()),
-            images: lease::ImageLog::default(),
+            images,
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock,
@@ -692,26 +693,42 @@ async fn flash_handler(
     let uploaded = _uploaded.is_some();
     let image_path = if uploaded { "(uploaded)".to_string() } else { path.display().to_string() };
     let image_probe = probe_serial.clone();
-    let (erased, image_sha) = tokio::task::spawn_blocking(move || {
-        let sha = std::fs::read(&path).ok().map(|b| lease::sha256_hex(&b));
+    let note = call_log::board_note();
+    let image_format = format.clone();
+    let (erased, image_sha, detail) = tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(&path).ok();
+        let sha = bytes.as_deref().map(lease::sha256_hex);
         let result =
             hardware::flash(&chip, &path, &format, base_address, probe_serial.as_deref(), erase);
         drop(_uploaded); // outlives the flash call; dropped (deleted) here, not before
-        result.map(|erased| (erased, sha))
+        result.map(|erased| {
+            let mut detail = lease::image_detail(bytes.as_deref(), &image_format, base_address);
+            detail.role = probe_serial
+                .as_deref()
+                .and_then(|s| embarch_topology::hardware::find_enrolled_by_probe(s).ok().flatten())
+                .map(|row| row.role);
+            (erased, sha, detail)
+        })
     })
     .await
     .map_err(internal_err)?
     .map_err(describe_topology_error)?;
 
     // Only after the flash succeeded: the record says what is on the board.
-    state.images.record(lease::FlashedImage {
-        chip: chip_for_response.clone(),
-        probe_serial: image_probe,
-        path: image_path,
-        sha256: image_sha,
-        flashed_at: String::new(),
-        lease_holder: state.lease.view().map(|l| l.holder),
-    });
+    // The middleware appends it to `flashed-images.jsonl` once the call has its
+    // call-log entry.
+    state.images.record_detail(
+        lease::FlashedImage {
+            chip: chip_for_response.clone(),
+            probe_serial: image_probe,
+            path: image_path,
+            sha256: image_sha,
+            flashed_at: String::new(),
+            lease_holder: state.lease.view().map(|l| l.holder),
+        },
+        detail,
+    );
+    note.flashed(&chip_for_response);
 
     // Only after the flash actually succeeded: a manifest bound to an image
     // that never reached the board would describe firmware that is not running.
@@ -873,6 +890,7 @@ async fn bootload_handler(
     let images = state.images.clone();
     let lease_slot = state.lease.clone();
     let image_sha = lease::sha256_hex(&plan.image);
+    let note = call_log::board_note();
 
     tokio::task::spawn_blocking(move || {
         let dut = embarch_topology::hardware::DUT_ROLE;
@@ -898,14 +916,21 @@ async fn bootload_handler(
             }
         });
         if result.is_ok() {
-            images.record(lease::FlashedImage {
-                chip: dut_chip.unwrap_or_else(|| dut.to_string()),
-                probe_serial: None,
-                path: "(bootload image)".to_string(),
-                sha256: Some(image_sha),
-                flashed_at: String::new(),
-                lease_holder: lease_slot.view().map(|l| l.holder),
-            });
+            // Segments stay `None`: a signed image goes to an MCUboot slot whose
+            // address Core is not told here, so there is nothing to compare.
+            let chip = dut_chip.unwrap_or_else(|| dut.to_string());
+            images.record_detail(
+                lease::FlashedImage {
+                    chip: chip.clone(),
+                    probe_serial: None,
+                    path: "(bootload image)".to_string(),
+                    sha256: Some(image_sha),
+                    flashed_at: String::new(),
+                    lease_holder: lease_slot.view().map(|l| l.holder),
+                },
+                lease::ImageDetail { role: Some(dut.to_string()), ..Default::default() },
+            );
+            note.flashed(&chip);
         }
         result
     })

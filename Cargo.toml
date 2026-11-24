@@ -12,7 +12,8 @@ axum = { version = "0.8.9", features = ["multipart"] }
 clap = { version = "4.6.2", features = ["derive"] }
 # `reducers` (that crate's decisions 92 to 94) is what `measurements.rs` runs
 # over each study's captures as the study ends (decision 113).
-# `std` (which implies `alloc`) is what Core needs from this crate: the
+# `hil-image` is `image_segments`, which `flashed-images.jsonl` records
+# (decision 93). `std` (which implies `alloc`) is what Core needs from this crate: the
 # `gatt.csv`/`data.csv` rendering helpers (`GattTranscriptEntry::csv_header`,
 # `Sample::to_csv_row`) are std-gated, and `alloc` backs `Study.steps` with a
 # heap Vec (that crate's decision 46). Core used to reach `std` indirectly
@@ -20,7 +21,7 @@ clap = { version = "4.6.2", features = ["derive"] }
 # retired that feature along with the rest of post-hoc validation (the
 # `SignalCheck` evaluation it would have run was never built), so the
 # dependency now says what it actually wants.
-embarch-study-designer = { path = "../embarch-study-designer", features = ["std", "reducers"] }
+embarch-study-designer = { path = "../embarch-study-designer", features = ["std", "reducers", "hil-image"] }
 # study.rs constructs embarch-study-designer types' heapless::Vec fields
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
 # features with embarch-study-designer's own "serde"-enabled dependency.

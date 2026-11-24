@@ -75,7 +75,7 @@ struct BoardInfo {
 /// A handle a handler fills with the board it resolved. Detached (a no-op)
 /// outside a logged call, so a handler can always call it.
 #[derive(Debug, Clone, Default)]
-pub struct BoardNote(Arc<StdMutex<Option<BoardInfo>>>);
+pub struct BoardNote(Arc<StdMutex<Option<BoardInfo>>>, Arc<StdMutex<Option<String>>>);
 
 impl BoardNote {
     /// Names the board this call reached; a later call fills in what it knows
@@ -87,6 +87,13 @@ impl BoardNote {
         b.role = own(role).or(b.role.take());
         b.probe_serial = own(probe_serial).or(b.probe_serial.take());
         b.chip = own(chip).or(b.chip.take());
+    }
+
+    /// Says this call put a new image on `chip`: once the call has its call-log
+    /// entry, the middleware writes that image's `flashed-images.jsonl` line
+    /// with the entry's `seq`.
+    pub fn flashed(&self, chip: &str) {
+        *self.1.lock().unwrap() = Some(chip.to_string());
     }
 
     fn take(&self) -> Option<BoardInfo> {
@@ -394,6 +401,7 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
     };
     let status = rparts.status.as_u16();
 
+    let flashed = note.1.lock().unwrap().take();
     let board = note.take().map(|b| {
         let image = b.chip.as_deref().and_then(|c| state.images.all().into_iter().find(|i| i.chip == c)).and_then(|i| i.sha256);
         serde_json::json!({
@@ -414,7 +422,11 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
         "body_sha256": body_sha256, "body": body_json, "scope": scope, "lease": lease,
         "status": status, "answer_sha256": answer_sha256, "board": board,
     });
-    match state.call_log.record(entry, key) {
+    let recorded = state.call_log.record(entry, key);
+    if let Some(chip) = flashed {
+        state.images.commit(&chip, scope, recorded.as_ref().ok().map(|s| s.seq));
+    }
+    match recorded {
         Ok(stamp) => {
             let h = &mut rparts.headers;
             if let (Ok(s), Ok(x)) = (HeaderValue::from_str(&stamp.seq.to_string()), HeaderValue::from_str(&stamp.hash)) {
@@ -746,6 +758,41 @@ mod tests {
         });
         router.oneshot(Request::builder().method("POST").uri("/reset").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(entries(&s)[1]["board"]["image_sha256"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn a_flash_is_written_to_flashed_images_with_its_call_log_seq_and_scope() {
+        let s = state();
+        let images = s.images.clone();
+        let router = Router::new()
+            .route("/flash", axum::routing::post(move || {
+                let images = images.clone();
+                async move {
+                    images.record_detail(
+                        crate::lease::FlashedImage {
+                            chip: "nRF54L15".into(),
+                            probe_serial: None,
+                            path: "p".into(),
+                            sha256: Some("abc".into()),
+                            flashed_at: String::new(),
+                            lease_holder: None,
+                        },
+                        Default::default(),
+                    );
+                    board_note().flashed("nRF54L15");
+                    "ok"
+                }
+            }))
+            .layer(axum::middleware::from_fn_with_state(s.clone(), call_log_middleware))
+            .layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+                req.extensions_mut().insert(Scope::Agent);
+                next.run(req).await
+            }));
+        let r = router.oneshot(Request::builder().method("POST").uri("/flash").body(Body::empty()).unwrap()).await.unwrap();
+        let seq: u64 = r.headers()[SEQ_HEADER].to_str().unwrap().parse().unwrap();
+        let reopened = crate::lease::ImageLog::at(s.call_log.path.parent().unwrap());
+        let e = &reopened.entries()[0];
+        assert_eq!((e.scope.as_str(), e.call_log_seq), ("agent", Some(seq)));
     }
 
     #[test]

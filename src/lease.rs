@@ -280,8 +280,9 @@ fn check_ttl(ttl_s: u64) -> Result<u64, LeaseError> {
 }
 
 /// The last image Core put on a board (decision 93), so a session that takes
-/// the bench can tell whether it must reflash. Keyed by chip. In memory: a
-/// Core restart forgets it, and an absent entry means "unknown", not "none".
+/// the bench can tell whether it must reflash. Keyed by chip. Kept in
+/// `flashed-images.jsonl` (`ImageLog`), so a restart keeps it; an absent entry
+/// means "unknown", not "none".
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlashedImage {
     pub chip: String,
@@ -296,17 +297,157 @@ pub struct FlashedImage {
     pub lease_holder: Option<String>,
 }
 
+/// What Core knows about an image beyond [`FlashedImage`]'s status shape: the
+/// load segments the bytes write, so a later readback has something to compare.
+/// `None` when the format has no segment reading here (uf2, idf, a bootload
+/// image whose load address Core does not know) or the bytes would not parse.
+#[derive(Debug, Clone, Default)]
+pub struct ImageDetail {
+    pub role: Option<String>,
+    pub identity: Option<String>,
+    pub segments: Option<Vec<embarch_study_designer::hil_image::Segment>>,
+}
+
+/// The segments and identity of `bytes` flashed as `format` (`base` is a raw
+/// binary's load address). All `None` for a format `image_segments` does not
+/// read, a missing file, or bytes that do not parse (logged).
+pub fn image_detail(bytes: Option<&[u8]>, format: &str, base: Option<u64>) -> ImageDetail {
+    use embarch_study_designer::hil_image::{identity, image_segments, ImageFormat};
+    let fmt = match format.to_ascii_lowercase().as_str() {
+        "hex" | "ihex" => ImageFormat::Hex,
+        "elf" => ImageFormat::Elf,
+        "bin" => ImageFormat::Bin,
+        _ => return ImageDetail::default(),
+    };
+    let Some(bytes) = bytes else { return ImageDetail::default() };
+    match image_segments(bytes, fmt, base) {
+        Ok(segments) => ImageDetail { role: None, identity: Some(identity(&segments)), segments: Some(segments) },
+        Err(e) => {
+            tracing::warn!("flashed image: no segments recorded: {e}");
+            ImageDetail::default()
+        }
+    }
+}
+
+/// One line of `flashed-images.jsonl` (decision 93): [`FlashedImage`]'s own
+/// fields (`flashed_at` is the same instant as `at_utc_ms`), the board's
+/// `role`, the segments, the token scope that flashed, and the call-log entry
+/// of that flash. `call_log_seq` is `None` when the call log could not enter it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FlashedEntry {
+    pub chip: String,
+    pub probe_serial: Option<String>,
+    pub role: Option<String>,
+    pub path: String,
+    pub sha256: Option<String>,
+    pub flashed_at: String,
+    pub lease_holder: Option<String>,
+    pub identity: Option<String>,
+    pub segments: Option<Vec<embarch_study_designer::hil_image::Segment>>,
+    pub scope: String,
+    pub at_utc_ms: u64,
+    pub call_log_seq: Option<u64>,
+}
+
+impl FlashedEntry {
+    fn status(&self) -> FlashedImage {
+        FlashedImage {
+            chip: self.chip.clone(),
+            probe_serial: self.probe_serial.clone(),
+            path: self.path.clone(),
+            sha256: self.sha256.clone(),
+            flashed_at: self.flashed_at.clone(),
+            lease_holder: self.lease_holder.clone(),
+        }
+    }
+}
+
+/// The file the log appends to, beside the run log.
+pub const FLASHED_IMAGES_FILE: &str = "flashed-images.jsonl";
+
+#[derive(Default)]
+struct ImageLogInner {
+    dir: Option<std::path::PathBuf>,
+    map: StdMutex<BTreeMap<String, FlashedEntry>>,
+}
+
 #[derive(Clone, Default)]
-pub struct ImageLog(Arc<StdMutex<BTreeMap<String, FlashedImage>>>);
+pub struct ImageLog(Arc<ImageLogInner>);
 
 impl ImageLog {
-    pub fn record(&self, mut image: FlashedImage) {
-        image.flashed_at = rfc3339(OffsetDateTime::now_utc());
-        self.0.lock().unwrap().insert(image.chip.clone(), image);
+    /// A log backed by `dir/flashed-images.jsonl`, reading back the latest
+    /// entry per chip. A line that does not parse is skipped, not fatal.
+    pub fn at(dir: &std::path::Path) -> Self {
+        let mut map = BTreeMap::new();
+        if let Ok(text) = std::fs::read_to_string(dir.join(FLASHED_IMAGES_FILE)) {
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                match serde_json::from_str::<FlashedEntry>(line) {
+                    Ok(e) => {
+                        map.insert(e.chip.clone(), e);
+                    }
+                    Err(e) => tracing::warn!("{FLASHED_IMAGES_FILE}: skipping a line that does not parse: {e}"),
+                }
+            }
+        }
+        Self(Arc::new(ImageLogInner { dir: Some(dir.to_path_buf()), map: StdMutex::new(map) }))
+    }
+
+    /// Remembers an image in memory only; [`commit`](Self::commit) writes it.
+    #[cfg(test)]
+    pub fn record(&self, image: FlashedImage) {
+        self.record_detail(image, ImageDetail::default());
+    }
+
+    pub fn record_detail(&self, image: FlashedImage, detail: ImageDetail) {
+        let at = OffsetDateTime::now_utc();
+        let entry = FlashedEntry {
+            chip: image.chip,
+            probe_serial: image.probe_serial,
+            role: detail.role,
+            path: image.path,
+            sha256: image.sha256,
+            flashed_at: rfc3339(at),
+            lease_holder: image.lease_holder,
+            identity: detail.identity,
+            segments: detail.segments,
+            scope: "unknown".to_string(),
+            at_utc_ms: (at.unix_timestamp_nanos() / 1_000_000) as u64,
+            call_log_seq: None,
+        };
+        self.0.map.lock().unwrap().insert(entry.chip.clone(), entry);
+    }
+
+    /// Stamps the chip's latest entry with the scope of the call that flashed it
+    /// and that call's call-log entry, then appends it to the file. A write
+    /// that fails is logged: the flash already happened.
+    pub fn commit(&self, chip: &str, scope: &str, call_log_seq: Option<u64>) {
+        let entry = {
+            let mut map = self.0.map.lock().unwrap();
+            let Some(e) = map.get_mut(chip) else { return };
+            e.scope = scope.to_string();
+            e.call_log_seq = call_log_seq;
+            e.clone()
+        };
+        let Some(dir) = &self.0.dir else { return };
+        let write = || -> std::io::Result<()> {
+            use std::io::Write as _;
+            std::fs::create_dir_all(dir)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(FLASHED_IMAGES_FILE))?;
+            writeln!(f, "{}", serde_json::to_string(&entry).map_err(std::io::Error::other)?)
+        };
+        if let Err(e) = write() {
+            tracing::error!("could not append to {FLASHED_IMAGES_FILE}: {e}");
+        }
     }
 
     pub fn all(&self) -> Vec<FlashedImage> {
-        self.0.lock().unwrap().values().cloned().collect()
+        self.0.map.lock().unwrap().values().map(FlashedEntry::status).collect()
+    }
+
+    /// The latest entry per chip, with its segments. Tests only until the readback lands.
+    #[cfg(test)]
+    pub fn entries(&self) -> Vec<FlashedEntry> {
+        self.0.map.lock().unwrap().values().cloned().collect()
     }
 }
 
@@ -545,5 +686,85 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].sha256.as_deref(), Some("2"));
         assert!(!all[0].flashed_at.is_empty());
+    }
+
+    /// A fixture hex: 4 bytes at 0x1000, 2 more at 0x2000.
+    fn fixture_hex() -> Vec<u8> {
+        // Built, not hand-summed: a checksum is the two's complement of the line's sum.
+        fn line(addr: u16, ty: u8, data: &[u8]) -> String {
+            let mut b = vec![data.len() as u8, (addr >> 8) as u8, addr as u8, ty];
+            b.extend_from_slice(data);
+            let sum = b.iter().fold(0u8, |a, x| a.wrapping_add(*x));
+            format!(":{}{:02X}\n", b.iter().map(|x| format!("{x:02X}")).collect::<String>(), 0u8.wrapping_sub(sum))
+        }
+        [line(0x1000, 0, &[1, 2, 3, 4]), line(0x2000, 0, &[9, 8]), line(0, 1, &[])].concat().into_bytes()
+    }
+
+    fn flashed(chip: &str, sha: &str) -> FlashedImage {
+        FlashedImage {
+            chip: chip.into(),
+            probe_serial: Some("0010".into()),
+            path: "p".into(),
+            sha256: Some(sha.into()),
+            flashed_at: String::new(),
+            lease_holder: Some("me".into()),
+        }
+    }
+
+    #[test]
+    fn a_flashed_hex_is_recorded_with_its_segments_identity_and_scope_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ImageLog::at(dir.path());
+        let detail = image_detail(Some(&fixture_hex()), "hex", None);
+        let segs = detail.segments.clone().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[0].address, segs[0].length), (0x1000, 4));
+        assert!(detail.identity.is_some());
+        log.record_detail(flashed("nRF54L15", "aa"), ImageDetail { role: Some("dut".into()), ..detail.clone() });
+        log.commit("nRF54L15", "agent", Some(7));
+
+        let again = ImageLog::at(dir.path());
+        let e = &again.entries()[0];
+        assert_eq!((e.chip.as_str(), e.role.as_deref(), e.scope.as_str(), e.call_log_seq), ("nRF54L15", Some("dut"), "agent", Some(7)));
+        assert_eq!(e.segments, detail.segments);
+        assert_eq!(e.identity, detail.identity);
+        assert_eq!(e.probe_serial.as_deref(), Some("0010"));
+        assert!(e.at_utc_ms > 0);
+        assert_eq!(again.all(), log.all());
+    }
+
+    #[test]
+    fn a_reopened_log_keeps_the_latest_entry_per_chip_and_skips_a_bad_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ImageLog::at(dir.path());
+        log.record(flashed("c", "1"));
+        log.commit("c", "agent", Some(1));
+        log.record(flashed("c", "2"));
+        log.commit("c", "person", Some(2));
+        let path = dir.path().join(FLASHED_IMAGES_FILE);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("not json\n");
+        std::fs::write(&path, text).unwrap();
+        let again = ImageLog::at(dir.path());
+        assert_eq!(again.all().len(), 1);
+        assert_eq!(again.all()[0].sha256.as_deref(), Some("2"));
+        assert_eq!(again.entries()[0].scope, "person");
+    }
+
+    #[test]
+    fn an_unreadable_format_has_no_segments() {
+        assert!(image_detail(Some(b"x"), "uf2", None).segments.is_none());
+        assert!(image_detail(None, "hex", None).segments.is_none());
+        assert!(image_detail(Some(b"zzz"), "hex", None).segments.is_none());
+    }
+
+    #[test]
+    fn status_shape_is_the_six_original_fields() {
+        let log = ImageLog::default();
+        log.record_detail(flashed("c", "1"), image_detail(Some(&fixture_hex()), "hex", None));
+        let v = serde_json::to_value(&log.all()[0]).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["chip", "flashed_at", "lease_holder", "path", "probe_serial", "sha256"]);
     }
 }
