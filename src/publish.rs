@@ -321,6 +321,21 @@ fn report_data(
         || adopted.iter().any(|a| a["scope"] == "person")
         || declarations["entries"].as_array().is_some_and(|e| e.iter().any(|d| d["scope"] == "person"));
     let revision = revision_of(lines, study_id);
+    let mut observed = serde_json::json!({
+        "image_status": statement["predicate"]["observed"]["image_status"],
+        "declarations": declarations,
+    });
+    // The record's call-log claim, present exactly when the record carries one.
+    let range = &statement["predicate"]["observed"]["call_log"];
+    if range.is_object() {
+        let count = match (range["first_seq"].as_u64(), range["last_seq"].as_u64()) {
+            (Some(first), Some(last)) => last + 1 - first,
+            _ => 0,
+        };
+        observed["call_log"] = serde_json::json!({
+            "head": range["head"], "first_seq": range["first_seq"], "last_seq": range["last_seq"], "count": count,
+        });
+    }
     let data = serde_json::json!({
         "schema": 1,
         "study_id": study_id,
@@ -333,10 +348,7 @@ fn report_data(
         "go_by": go_by,
         "published_by": publisher.as_str(),
         "adopted": adopted,
-        "observed": {
-            "image_status": statement["predicate"]["observed"]["image_status"],
-            "declarations": declarations,
-        },
+        "observed": observed,
         "claimed": { "build": statement["predicate"]["claimed"]["build"] },
         "core": { "version": env!("CARGO_PKG_VERSION"), "keyid": state.sealer.key().keyid() },
         "record_sha256": run["record_sha256"],
@@ -787,6 +799,11 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(prev, range["head"].as_str().unwrap());
 
+        // report-data.json carries the same claim, with the count.
+        let (_, rd) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/report-data.json"), "agent", "").await;
+        let rd: serde_json::Value = serde_json::from_slice(&rd).unwrap();
+        assert_eq!(rd["observed"]["call_log"], serde_json::json!({"head": range["head"], "first_seq": 1, "last_seq": 3, "count": 3}));
+
         // The signed manifest lists it by hash.
         let pk = state.sealer.key().public_key_hex();
         let (_, env) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/manifest.dsse.json"), "agent", "").await;
@@ -808,6 +825,12 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "the header alone");
         let h: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(h["call_log_segment"]["head"], head.as_str());
+        let (_, rd) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/report-data.json"), "agent", "").await;
+        let rd: serde_json::Value = serde_json::from_slice(&rd).unwrap();
+        assert_eq!(
+            rd["observed"]["call_log"],
+            serde_json::json!({"head": head.as_str(), "first_seq": null, "last_seq": null, "count": 0})
+        );
     }
 
     #[tokio::test]
@@ -819,6 +842,9 @@ mod tests {
         send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
         let (s, _) = send(&state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
         assert_eq!(s, StatusCode::OK);
+        let (_, rd) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/report-data.json"), "agent", "").await;
+        let rd: serde_json::Value = serde_json::from_slice(&rd).unwrap();
+        assert!(rd["observed"].get("call_log").is_none());
         let (s, _) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/call-log-segment.jsonl"), "agent", "").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
