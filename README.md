@@ -2,10 +2,9 @@
 
 The OS-level service that owns the debug probe (flash / reset) and the
 serial console log. This is *Core* — it has no idea the EmbArch API or
-Claude Code exist. It just exposes 22 bearer-token-authed HTTP endpoints
-(the full list is in `embarch-doc/embarch-core/interfaces.md`; a handful
-of the core ones are below) and holds the hardware connection so nothing
-else has to fight over the USB port.
+Claude Code exist. It just exposes a bearer-token-authed HTTP interface
+(owned by the interface docs, see **Interfaces** below) and holds the
+hardware connection so nothing else has to fight over the USB port.
 
 Built with **Rust + probe-rs (as a library) + Axum + service-manager**.
 
@@ -23,55 +22,16 @@ and directly via its own CLI (`run`/`install`/`uninstall`/`detect-dev-bench`)
 for local operation and service management. Both paths converge on the same
 hardware/serial modules — there's no separate code path for "CLI mode."
 
-## Layout
+## Interfaces
 
-```
-src/
-├── main.rs        — CLI (clap): `run`, `install`, `uninstall`,
-│                    `detect-dev-bench`; resolves the token via token_store,
-│                    builds AppState, starts Axum
-├── api.rs         — Axum router, handlers, bearer-token auth middleware
-├── hardware.rs    — probe-rs: list probes, flash, reset
-├── serial.rs      — serialport: read the UART console log
-├── service.rs     — service-manager: register/remove as a background service
-└── token_store.rs — resolves/generates/persists the machine-wide EMBARCH_TOKEN file
-```
-
-## Endpoints
-
-All routes require `Authorization: Bearer <token>` (see **Auth** below).
-
-| Method | Path          | Body / Query                                             |
-|--------|---------------|-----------------------------------------------------------|
-| GET    | `/status`     | —                                                          |
-| POST   | `/flash`      | `{"chip": "...", "firmware_path": "...", "format": "elf"}` |
-| POST   | `/reset`      | `{"chip": "..."}`                                          |
-| GET    | `/serial-log` | `?port=...&baud=115200&duration_ms=2000`                   |
-| GET    | `/dev-bench/port` | —                                                      |
-
-`/dev-bench/port` answers which serial port
-[`embarch-dev-bench`](https://github.com/gabrieltetar/embarch-dev-bench) is on,
-by matching SEGGER's USB VID `0x1366` (the DK's on-board J-Link — dev-bench's
-own SoC has no USB peripheral) plus a product-string / serial-number /
-interface-index heuristic. `404` means no port matched, which is just "the
-bench isn't plugged in"; `500` means detection itself failed or was ambiguous.
-The four env overrides this section used to document
-(`EMBARCH_DEV_BENCH_PORT`/`_SERIAL`/`_PRODUCT`/`_INTERFACE`) are gone, with no
-replacement env knob (decision 23) — they were the mechanism behind the
-incident that motivated `embarch-topology`, whose whole class of problem is
-[a stale port override winning silently over reality](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-topology/spec.md).
-Detection is now
-`embarch_topology::hardware::resolve_dev_bench_port`, keyed on that crate's
-enrollment state (`POST /probes/enroll`, `POST /dev-bench/link`) rather than
-an operator-typed override.
-
-`embarch-core detect-dev-bench` runs the same detection from the CLI.
-
-`chip` must be a probe-rs target name (e.g. `STM32F407VG`, `nRF52840_xxAA`,
-`esp32c3`) — Core doesn't validate it beyond whatever `probe.attach()` itself
-rejects. `format` is one of `elf` / `bin` / `hex` / `uf2` / `idf`.
-`firmware_path` is read from Core's own local disk — the caller is
-responsible for getting the file onto whatever machine Core runs on.
+Endpoints, request shapes, the module layout and the dev-bench port
+detection are owned by the interface docs in
+[`embarch-doc/embarch-core/interfaces/`](https://github.com/gabrieltetar/embarch-doc/tree/main/embarch-core/interfaces)
+and the sub-project's
+[`spec.md`](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-core/spec.md),
+not repeated here, so this page does not go stale. Every route requires
+`Authorization: Bearer <token>` (see **Auth** below). The router is
+`src/api.rs`; `embarch-core --help` lists the CLI.
 
 ## Auth
 
