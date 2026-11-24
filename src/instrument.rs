@@ -1,5 +1,6 @@
-//! `/instruments` and `POST /instruments/{name}/exchange`: one command to a
-//! declared bench instrument and its reply (decision 104).
+//! `/instruments`, and one command to a declared bench instrument and its reply
+//! (decision 104). `POST /instruments/{name}/exchange` now refuses every caller;
+//! only a host study's `Instrument` step runs an exchange.
 //!
 //! **The instrument's own line facts drive every byte**: its terminators, its
 //! pacing and its acknowledgement strings come from the declaration

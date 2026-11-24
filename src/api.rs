@@ -1778,31 +1778,19 @@ async fn remove_instrument_handler(
     }
 }
 
-/// One command to a declared instrument and its reply (decision 104; see
-/// [`crate::instrument`]). `400` for a request [`crate::instrument::check`]
-/// refuses, before any lock; `409` while a study holds the bench, so a manual
-/// command cannot land between a study's own steps; `404` when nothing is
-/// declared under `name`; `409` when its port is not enumerated, or its
-/// identity matches more than one port. Takes `hw_lock`.
+/// Refused for every caller, `409`, before any lock and before any port is
+/// opened (decision 104): an instrument is reached only through a host study's
+/// `Instrument` step, which runs [`run_instrument_exchange`] directly. The route
+/// stays registered so an older client reads this reason, not a `404`.
 // route: POST /instruments/{name}/exchange
 async fn instrument_exchange_handler(
-    State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    Json(req): Json<embarch_topology::hardware::InstrumentExchange>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
+    _req: axum::extract::Json<serde_json::Value>,
 ) -> Result<Json<embarch_topology::hardware::InstrumentReply>, (StatusCode, String)> {
-    crate::instrument::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    if let Some(holder) = state.study_lock.lock().unwrap().clone() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("{holder} holds the bench; an instrument command now would land between its steps"),
-        ));
-    }
-    let _guard = acquire_hw_lock(&state, "POST /instruments/{name}/exchange").await?;
-    tokio::task::spawn_blocking(move || run_instrument_exchange(&name, req))
-        .await
-        .map_err(internal_err)?
-        .map(Json)
+    Err((StatusCode::CONFLICT, INSTRUMENT_EXCHANGE_REFUSED.to_string()))
 }
+
+const INSTRUMENT_EXCHANGE_REFUSED: &str = "an instrument is reached only through a host study: run one with an `Instrument` step (POST /host-studies); there is no manual instrument command";
 
 /// The instrument route's blocking body, with `hw_lock` already held by the
 /// caller. A host study's `Instrument` step runs through this same function,
@@ -2834,6 +2822,22 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("zephyr.signed.bin"), "{text}");
+    }
+
+    /// Decision 104: the route refuses every caller `409` naming the host study's
+    /// `Instrument` step, even with `hw_lock` held and nothing declared, so no port is opened.
+    #[tokio::test]
+    async fn instrument_exchange_route_refuses_outside_a_run() {
+        let state = AppState::new("t".to_string());
+        let _held = state.hw_lock.clone().try_lock_owned().unwrap();
+        let (status, body) = capture_call(&state, "POST", "/instruments/eload/exchange", r#"{"line":"VOLT?","query":true}"#).await;
+        let refused = instrument_exchange_handler(axum::extract::Path("eload".into()), axum::Json(serde_json::json!({"line": "VOLT?"})))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("`Instrument` step"), "{}", refused.1);
+        // Through the router a lease may answer first; what it must never be is a success.
+        assert!(!status.is_success(), "{status} {body}");
     }
 
     async fn capture_call(state: &AppState, method: &str, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
