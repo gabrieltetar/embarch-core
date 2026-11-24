@@ -296,6 +296,8 @@ pub struct SealJob {
     /// `study_value` declaration was made with (decision 113). `None` for a host
     /// study, which declares none.
     pub submitted_by: Option<Scope>,
+    /// The call log as the run began; `None` seals without a call-log range.
+    pub calls: Option<crate::call_log::RunCalls>,
 }
 
 impl Sealer {
@@ -346,6 +348,18 @@ impl Sealer {
             .and_then(|m| m.get("behaviours").cloned())
             .unwrap_or_else(|| serde_json::json!({}));
 
+        let call_log = job.calls.as_ref().and_then(|c| c.at_end()).map(|(v, _)| v);
+        let mut observed = serde_json::json!({
+            "core": { "version": env!("CARGO_PKG_VERSION") },
+            "provenance": provenance,
+            "image_status": "unverified",
+            "declarations": self.declarations.snapshot(),
+            "behaviours": behaviours,
+        });
+        if let Some(c) = call_log {
+            observed["call_log"] = c;
+        }
+
         // `serde_json`'s map is ordered by key, and every number here is an
         // integer, so the serialisation is RFC 8785 canonical (decision 110).
         let statement = serde_json::json!({
@@ -357,13 +371,7 @@ impl Sealer {
                 "study_id": study_id,
                 "kind": job.kind,
                 "ended_utc_ms": ended_utc_ms,
-                "observed": {
-                    "core": { "version": env!("CARGO_PKG_VERSION") },
-                    "provenance": provenance,
-                    "image_status": "unverified",
-                    "declarations": self.declarations.snapshot(),
-                    "behaviours": behaviours,
-                },
+                "observed": observed,
                 "claimed": { "told_by": "embarch-api", "build": job.build },
             }
         });
@@ -505,7 +513,7 @@ mod tests {
     }
 
     fn job(sealer: &Sealer, build: Option<BuildClaims>) -> SealJob {
-        SealJob { sealer: sealer.clone(), kind: "device", build, submitted_by: None }
+        SealJob { sealer: sealer.clone(), kind: "device", build, submitted_by: None, calls: None }
     }
 
     /// A DSSE check written from the DSSE v1 text alone, not through this

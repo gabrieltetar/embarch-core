@@ -1259,7 +1259,7 @@ pub async fn post_host_study_handler(
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     check_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let build = build.claims().map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "host", build, submitted_by: None };
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "host", build, submitted_by: None, calls: crate::call_log::RunCalls::begin(&state.call_log) };
 
     let study_id = crate::study::generate_study_id();
     crate::study::take_study_lock(&state, &study_id)?;
@@ -2208,7 +2208,7 @@ mod tests {
         let jobs: JobRegistry = Default::default();
         jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(1), reason: None });
         let (tx, _rx) = broadcast::channel(16);
-        let seal = crate::signing::SealJob { sealer: crate::signing::Sealer::ephemeral(), kind: "host", build: None, submitted_by: None };
+        let seal = crate::signing::SealJob { sealer: crate::signing::Sealer::ephemeral(), kind: "host", build: None, submitted_by: None, calls: None };
         run_job(&s, "id1", dir.path(), &mut b, &AtomicBool::new(false), &jobs, &tx, None, Some(&seal));
         assert_eq!(jobs.lock().unwrap().get("id1").unwrap().status, "completed");
         let env: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(crate::signing::RECORD_FILE)).unwrap()).unwrap();

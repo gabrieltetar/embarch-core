@@ -130,6 +130,51 @@ pub struct Stamp {
     pub repeat: Option<u64>,
 }
 
+/// The call log's head (`GENESIS` when empty) and length at one moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub head: String,
+    pub len: u64,
+}
+
+/// A run's note of the call log at its start (decision 111): the seal takes the
+/// end note and names the entries made between them.
+#[derive(Clone)]
+pub struct RunCalls {
+    pub log: CallLog,
+    pub start: Mark,
+}
+
+impl RunCalls {
+    /// `None` when the log cannot be read: the run is then sealed without a call-log range.
+    pub fn begin(log: &CallLog) -> Option<Self> {
+        match log.mark(false) {
+            Ok(start) => Some(Self { log: log.clone(), start }),
+            Err(e) => {
+                tracing::error!("could not note the call log's head at the run's start: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// The predicate's `observed.call_log`, and the end note.
+    pub fn at_end(&self) -> Option<(serde_json::Value, Mark)> {
+        let end = match self.log.mark(true) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("could not note the call log's head at the run's end: {e:#}");
+                return None;
+            }
+        };
+        let any = end.len > self.start.len;
+        let v = serde_json::json!({
+            "prev": self.start.head, "head": end.head, "length": end.len,
+            "first_seq": any.then_some(self.start.len), "last_seq": any.then(|| end.len - 1),
+        });
+        Some((v, end))
+    }
+}
+
 #[derive(Clone)]
 pub struct CallLog {
     path: PathBuf,
@@ -159,16 +204,70 @@ impl CallLog {
         verify_lines(&self.lines()?)
     }
 
-    /// Chains `body` onto the head and appends it, with the lock held. A log
-    /// that does not verify is not extended: it stays as it is, to be read.
-    fn append(&self, inner: &mut Inner, mut body: serde_json::Value) -> Result<(u64, String)> {
+    /// The head (`GENESIS` when empty) and length, read from the file on first use.
+    fn chain_of(&self, inner: &mut Inner) -> Result<(String, u64)> {
         if inner.chain.is_none() {
             let (head, len) = self
                 .verify()?
                 .map_err(|e| anyhow::anyhow!("the call log is broken at line {}: {}", e.line, e.reason))?;
             inner.chain = Some((head.unwrap_or_else(|| GENESIS.to_string()), len as u64));
         }
-        let (head, len) = inner.chain.clone().unwrap();
+        Ok(inner.chain.clone().unwrap())
+    }
+
+    /// The head and length now. With `flush`, a pending fold is written first, so
+    /// the repeats counted so far fall before the mark.
+    pub fn mark(&self, flush: bool) -> Result<Mark> {
+        let mut inner = self.inner.lock().unwrap();
+        if flush {
+            self.flush_locked(&mut inner)?;
+        }
+        let (head, len) = self.chain_of(&mut inner)?;
+        Ok(Mark { head, len })
+    }
+
+    /// The entries with `seq` in `start.len..end.len`, as `call-log-segment.jsonl`
+    /// bytes (decision 117): a header line naming the entry before the range by
+    /// its hash and the head at the range's end, then the entries. It is
+    /// refused unless the entries chain from `start.head` to `end.head`.
+    pub fn segment_bytes(&self, start: &Mark, end: &Mark) -> Result<Vec<u8>> {
+        let lines = {
+            let _inner = self.inner.lock().unwrap();
+            self.lines()?
+        };
+        anyhow::ensure!(end.len as usize <= lines.len() && start.len <= end.len, "the call log no longer holds the run's range");
+        let range = &lines[start.len as usize..end.len as usize];
+        let mut prev = start.head.clone();
+        for (i, l) in range.iter().enumerate() {
+            let e = &l["entry"];
+            anyhow::ensure!(
+                e["prev"] == prev.as_str()
+                    && e["seq"] == start.len + i as u64
+                    && l["hash"].as_str() == Some(sha256_hex(&serde_json::to_vec(e)?).as_str()),
+                "the call log's entry {} does not chain from the run's start",
+                start.len + i as u64
+            );
+            prev = l["hash"].as_str().unwrap_or_default().to_string();
+        }
+        anyhow::ensure!(prev == end.head, "the call log's entries do not reach the head the run recorded");
+        let header = serde_json::json!({ "call_log_segment": {
+            "prev": start.head, "head": end.head,
+            "first_seq": (!range.is_empty()).then_some(start.len),
+            "last_seq": (!range.is_empty()).then(|| end.len - 1),
+        }});
+        let mut out = serde_json::to_vec(&header)?;
+        out.push(b'\n');
+        for l in range {
+            out.extend(serde_json::to_vec(l)?);
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    /// Chains `body` onto the head and appends it, with the lock held. A log
+    /// that does not verify is not extended: it stays as it is, to be read.
+    fn append(&self, inner: &mut Inner, mut body: serde_json::Value) -> Result<(u64, String)> {
+        let (head, len) = self.chain_of(inner)?;
         body["prev"] = head.into();
         body["seq"] = len.into();
         let hash = sha256_hex(&serde_json::to_vec(&body)?);
@@ -208,7 +307,7 @@ impl CallLog {
 
     /// Enters one call. `entry` carries everything but `prev` and `seq`; `key`
     /// is `Some` for a fold-eligible read and names what makes two reads identical.
-    fn record(&self, entry: serde_json::Value, key: Option<String>) -> Result<Stamp> {
+    pub(crate) fn record(&self, entry: serde_json::Value, key: Option<String>) -> Result<Stamp> {
         let mut inner = self.inner.lock().unwrap();
         let now = entry["at_utc_ms"].as_u64().unwrap_or(0);
         if let (Some(k), Some(f)) = (&key, inner.fold.as_mut()) {

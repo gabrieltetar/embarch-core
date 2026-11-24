@@ -1428,7 +1428,7 @@ pub async fn post_study_handler(
 ) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
     validate_study(&study).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let build = build.claims().map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build, submitted_by: Some(scope) };
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build, submitted_by: Some(scope), calls: crate::call_log::RunCalls::begin(&state.call_log) };
 
     // A tap on a signal a decision 92 capture holds open would be refused by
     // the OS only after the flash and reset (core decision 102).

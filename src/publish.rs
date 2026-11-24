@@ -31,10 +31,12 @@ const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 pub const REPORT_DATA_FILE: &str = "report-data.json";
 pub const REPORT_DATA_ENVELOPE_FILE: &str = "report-data.dsse.json";
 pub const SEGMENT_FILE: &str = "run-log-segment.jsonl";
+pub const CALL_LOG_SEGMENT_FILE: &str = "call-log-segment.jsonl";
 pub const MANIFEST_FILE: &str = "manifest.dsse.json";
 /// The files Core writes into a revision's directory, which a reader may fetch
 /// beside whatever the manifest names.
-const PUBLISH_FILES: [&str; 4] = [REPORT_DATA_FILE, REPORT_DATA_ENVELOPE_FILE, SEGMENT_FILE, MANIFEST_FILE];
+const PUBLISH_FILES: [&str; 5] =
+    [REPORT_DATA_FILE, REPORT_DATA_ENVELOPE_FILE, SEGMENT_FILE, CALL_LOG_SEGMENT_FILE, MANIFEST_FILE];
 
 /// The most text one adoption takes.
 const MAX_ADOPTED_BYTES: usize = 1 << 20;
@@ -421,6 +423,27 @@ fn core_run_files(dir: &std::path::Path) -> Result<Vec<String>, Failure> {
     Ok(names)
 }
 
+/// The run's slice of the call log (decision 117), from the range its signed
+/// record names. `None` for a run sealed with no call-log range (one recorded
+/// before the call log, or whose log could not be read at the time).
+fn call_log_segment(state: &AppState, dir: &std::path::Path) -> Result<Option<Vec<u8>>, Failure> {
+    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(RECORD_FILE)).map_err(internal)?).map_err(internal)?;
+    let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
+    let statement: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
+    let range = &statement["predicate"]["observed"]["call_log"];
+    if range.is_null() {
+        return Ok(None);
+    }
+    let text = |k: &str| range[k].as_str().map(str::to_string).ok_or_else(|| internal(format!("the record's call_log has no {k}")));
+    let (prev, head) = (text("prev")?, text("head")?);
+    // `length` is the log's length when the run ended; an empty range names no seq, so it starts there.
+    let end_len = range["length"].as_u64().ok_or_else(|| internal("the record's call_log has no length"))?;
+    let start_len = range["first_seq"].as_u64().unwrap_or(end_len);
+    let start = crate::call_log::Mark { head: prev, len: start_len };
+    let end = crate::call_log::Mark { head, len: end_len };
+    state.call_log.segment_bytes(&start, &end).map(Some).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))
+}
+
 /// Signs the manifest over every file Core produced and records the publish,
 /// with the run log's head, in the log.
 // route: POST /study/{study_id}/publish
@@ -467,10 +490,11 @@ fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) 
         subjects.push((name.to_string(), sha256_of_file(&rdir.join(name)).map_err(internal)?));
     }
     for f in &req.files {
-        if subjects.iter().any(|(n, _)| *n == f.name) || f.name == SEGMENT_FILE || f.name == MANIFEST_FILE {
+        if subjects.iter().any(|(n, _)| *n == f.name) || f.name == SEGMENT_FILE || f.name == CALL_LOG_SEGMENT_FILE || f.name == MANIFEST_FILE {
             return Err((StatusCode::BAD_REQUEST, format!("`{}` is a file Core produces; embarch-api lists only its own", f.name)));
         }
     }
+    let call_segment = call_log_segment(state, &dir)?;
     let report_data_sha256 = sha256_hex(&bytes);
     let record_sha256 = data["record_sha256"].clone();
 
@@ -488,6 +512,10 @@ fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) 
         write_file(&rdir.join(SEGMENT_FILE), &segment)?;
         let mut all = subjects.clone();
         all.push((SEGMENT_FILE.to_string(), sha256_hex(&segment)));
+        if let Some(c) = &call_segment {
+            write_file(&rdir.join(CALL_LOG_SEGMENT_FILE), c)?;
+            all.push((CALL_LOG_SEGMENT_FILE.to_string(), sha256_hex(c)));
+        }
         all.sort();
         let subject: Vec<serde_json::Value> =
             all.iter().map(|(n, h)| serde_json::json!({ "name": n, "digest": { "sha256": h } })).collect();
@@ -618,6 +646,12 @@ mod tests {
     /// A finished run as the log and the signer leave it: captures, events, a
     /// record, and the run's entry.
     fn finished_run(state: &AppState, status: &str, outcome: &str, go: Scope) {
+        finished_run_with_calls(state, status, outcome, go, 0, true);
+    }
+
+    /// As `finished_run`, with `calls` entries made in the call log while it ran;
+    /// `noted` false is a run sealed before the call log existed.
+    fn finished_run_with_calls(state: &AppState, status: &str, outcome: &str, go: Scope, calls: u64, noted: bool) {
         let dir = state.run_log.run_dir(ID);
         std::fs::create_dir_all(dir.join("streams")).unwrap();
         std::fs::write(dir.join("streams/tap.bin"), b"raw bytes").unwrap();
@@ -627,7 +661,11 @@ mod tests {
         )
         .unwrap();
         state.run_log.begin(ID, "device", go);
-        let job = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build: None, submitted_by: Some(go) };
+        let before = crate::call_log::RunCalls::begin(&state.call_log).filter(|_| noted);
+        for i in 0..calls {
+            state.call_log.record(serde_json::json!({"type": "call", "at_utc_ms": i, "method": "POST", "route": "/x"}), None).unwrap();
+        }
+        let job = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "device", build: None, submitted_by: Some(go), calls: before };
         state.sealer.seal(&job, &dir, ID, 1).unwrap();
         state.run_log.end(ID, status, None);
     }
@@ -683,7 +721,7 @@ mod tests {
         let st = dsse_payload(&env, &pk);
         assert_eq!(st["predicateType"], MANIFEST_PREDICATE_TYPE);
         let names: Vec<&str> = st["subject"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
-        for want in ["events.json", "record.dsse.json", "streams/tap.bin", "report-data.json", "report-data.dsse.json", "run-log-segment.jsonl"] {
+        for want in ["events.json", "record.dsse.json", "streams/tap.bin", "report-data.json", "report-data.dsse.json", "run-log-segment.jsonl", "call-log-segment.jsonl"] {
             assert!(names.contains(&want), "{want} in {names:?}");
         }
         assert!(!names.contains(&"report.pdf"), "embarch-api's file is not Core's subject");
@@ -707,6 +745,82 @@ mod tests {
         payload[10] ^= 1;
         e["payload"] = base64::engine::general_purpose::STANDARD.encode(payload).into();
         assert!(std::panic::catch_unwind(|| dsse_payload(&serde_json::to_vec(&e).unwrap(), &pk)).is_err());
+    }
+
+    /// The call log's range as the signed record names it, and the segment the
+    /// publish wrote, recomputed from the segment alone.
+    async fn call_log_of(state: &AppState) -> (serde_json::Value, Vec<u8>) {
+        let pk = state.sealer.key().public_key_hex();
+        let record = std::fs::read(state.run_log.run_dir(ID).join("record.dsse.json")).unwrap();
+        let range = dsse_payload(&record, &pk)["predicate"]["observed"]["call_log"].clone();
+        send(state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        let (s, b) = send(state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (s, seg) = send(state, "GET", &format!("/study/{ID}/publish/1/files/call-log-segment.jsonl"), "agent", "").await;
+        assert_eq!(s, StatusCode::OK);
+        (range, seg)
+    }
+
+    #[tokio::test]
+    async fn a_runs_record_names_the_call_log_range_and_the_publish_carries_the_segment() {
+        let state = AppState::new("agent".to_string());
+        // One call before the run, which is not in its range.
+        state.call_log.record(serde_json::json!({"type": "call", "at_utc_ms": 0}), None).unwrap();
+        finished_run_with_calls(&state, "completed", r#""Pass""#, Scope::Agent, 3, true);
+        let (range, seg) = call_log_of(&state).await;
+        assert_eq!((range["first_seq"].as_u64(), range["last_seq"].as_u64(), range["length"].as_u64()), (Some(1), Some(3), Some(4)));
+
+        // The segment's entries recompute from the named entry to the recorded head.
+        let text = String::from_utf8(seg.clone()).unwrap();
+        let mut lines = text.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap());
+        let header = lines.next().unwrap()["call_log_segment"].clone();
+        assert_eq!(header["prev"], range["prev"]);
+        assert_eq!(header["head"], range["head"]);
+        let mut prev = range["prev"].as_str().unwrap().to_string();
+        let mut n = 0;
+        for l in lines {
+            assert_eq!(l["entry"]["prev"], prev.as_str());
+            assert_eq!(l["hash"], sha256_hex(&serde_json::to_vec(&l["entry"]).unwrap()).as_str());
+            prev = l["hash"].as_str().unwrap().to_string();
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(prev, range["head"].as_str().unwrap());
+
+        // The signed manifest lists it by hash.
+        let pk = state.sealer.key().public_key_hex();
+        let (_, env) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/manifest.dsse.json"), "agent", "").await;
+        let st = dsse_payload(&env, &pk);
+        let listed = st["subject"].as_array().unwrap().iter().find(|s| s["name"] == "call-log-segment.jsonl").unwrap();
+        assert_eq!(listed["digest"]["sha256"], sha256_hex(&seg).as_str());
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_call_in_its_range_publishes_an_empty_segment_that_names_the_head() {
+        let state = AppState::new("agent".to_string());
+        state.call_log.record(serde_json::json!({"type": "call", "at_utc_ms": 0}), None).unwrap();
+        let head = state.call_log.mark(false).unwrap().head;
+        finished_run_with_calls(&state, "completed", r#""Pass""#, Scope::Agent, 0, true);
+        let (range, seg) = call_log_of(&state).await;
+        assert!(range["first_seq"].is_null() && range["last_seq"].is_null());
+        assert_eq!((range["head"].as_str(), range["prev"].as_str()), (Some(head.as_str()), Some(head.as_str())));
+        let text = String::from_utf8(seg).unwrap();
+        assert_eq!(text.lines().count(), 1, "the header alone");
+        let h: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(h["call_log_segment"]["head"], head.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_run_sealed_without_a_call_log_range_publishes_no_segment() {
+        let state = AppState::new("agent".to_string());
+        finished_run_with_calls(&state, "completed", r#""Pass""#, Scope::Agent, 0, false);
+        let record = std::fs::read(state.run_log.run_dir(ID).join("record.dsse.json")).unwrap();
+        assert!(dsse_payload(&record, &state.sealer.key().public_key_hex())["predicate"]["observed"].get("call_log").is_none());
+        send(&state, "POST", &format!("/study/{ID}/report-data"), "agent", "").await;
+        let (s, _) = send(&state, "POST", &format!("/study/{ID}/publish"), "agent", r#"{"files":[]}"#).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send(&state, "GET", &format!("/study/{ID}/publish/1/files/call-log-segment.jsonl"), "agent", "").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
