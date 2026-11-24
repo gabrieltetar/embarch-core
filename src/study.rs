@@ -476,6 +476,10 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // crate, not restated (core decision 90).
     study.validate_monitor_windows().map_err(|e| e.to_string())?;
 
+    // `embarch-study-designer` decision 93: a GATT notify tap no step subscribes
+    // to captures nothing. Computed by the crate, not restated (core decision 90).
+    study.validate_stream_subscriptions().map_err(|e| e.to_string())?;
+
     let recomputed = steps_crc(&study.steps)
         .map_err(|_| "failed to recompute steps_crc (a step's encoding is unexpectedly large)".to_string())?;
     if recomputed != study.steps_crc {
@@ -5279,6 +5283,30 @@ mod tests {
             Action::GattMonitorAll {},
         ]))
         .is_ok());
+    }
+
+    /// study-designer decision 93 / core decision 90: a GATT notify tap no
+    /// step subscribes to is refused with the crate's text; an unfiltered
+    /// monitor step subscribes it.
+    #[test]
+    fn validate_study_refuses_a_gatt_notify_tap_no_step_subscribes_to() {
+        use embarch_study_designer::Uuid;
+        let notify = tap(
+            0,
+            "n",
+            StreamSource::GattNotify {
+                service_uuid: Uuid([1u8; 16]),
+                characteristic_uuid: Uuid([2u8; 16]),
+            },
+            StreamEncoding::Raw,
+        );
+        let mut study = study_with_taps(&[1_000], &[notify]);
+        let err = validate_study(&study).unwrap_err();
+        assert!(err.contains("streams[0]"), "{err}");
+
+        study.steps[0].action = Action::GattMonitorAll {};
+        study.steps_crc = steps_crc(&study.steps).unwrap();
+        assert!(validate_study(&study).is_ok());
     }
 
     #[test]
