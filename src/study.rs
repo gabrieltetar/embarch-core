@@ -79,7 +79,7 @@ pub type StudyLock = Arc<StdMutex<Option<String>>>;
 
 /// What `GET /dev-bench/hello` writes into [`StudyLock`] while it holds the
 /// dev-bench link, so a study (or a second hello) is refused `409` naming it.
-const HELLO_HOLDER: &str = "GET /dev-bench/hello";
+pub(crate) const HELLO_HOLDER: &str = "GET /dev-bench/hello";
 
 /// Releases [`StudyLock`] on drop; hello's hold on the link.
 struct HelloHold(StudyLock);

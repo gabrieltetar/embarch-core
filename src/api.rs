@@ -283,9 +283,20 @@ async fn lease_middleware(
         if let Err(view) = state.lease.admit(lease_token(req.headers())) {
             return (StatusCode::CONFLICT, view.refusal()).into_response();
         }
+        // While a study runs, every gated call but its cancel is refused, the lease's own
+        // token included (decision 95).
+        let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
+        if matched != Some(STUDY_CANCEL_ROUTE) {
+            if let Some(id) = state.study_lock.lock().unwrap().as_deref().filter(|h| *h != study::HELLO_HOLDER) {
+                return (StatusCode::CONFLICT, format!("study {id} is running: every lease-gated call is refused until it ends; only POST /study/{id}/cancel is admitted")).into_response();
+            }
+        }
     }
     next.run(req).await
 }
+
+/// The one lease-gated route a running study still admits (decision 95).
+const STUDY_CANCEL_ROUTE: &str = "/study/{study_id}/cancel";
 
 fn lease_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers.get(lease::LEASE_HEADER).and_then(|h| h.to_str().ok())
@@ -3827,6 +3838,31 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!msg.starts_with("probe not attached"), "lead must not contradict reason: {msg}");
         assert!(msg.contains("is attached but could not be opened"), "got: {msg}");
+    }
+
+    /// Decision 95: with a study in flight, every `LEASE_GATED` route but the study's cancel is
+    /// refused `409` naming the study, the lease's own token included.
+    #[tokio::test]
+    async fn a_running_study_refuses_every_lease_gated_route_but_its_cancel() {
+        let state = AppState::new("test-token".to_string());
+        let router = build_router(state.clone());
+        let (_, granted) = take(&router, "session-a", 60).await;
+        let token = granted["token"].as_str().unwrap().to_string();
+        *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
+        for (method, path) in lease::LEASE_GATED {
+            let uri = AUTH_CASES.iter().find(|(m, p, _)| m == method && p == path).unwrap().2;
+            let (status, text) = send(&router, method, uri, Some(&token), Some("{}")).await;
+            if *path == "/study/{study_id}/cancel" {
+                assert_ne!(status, StatusCode::CONFLICT, "{method} {uri} must be admitted: {text}");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {text}");
+                assert!(text.contains("study-abc"), "{method} {uri} must name the study: {text}");
+            }
+        }
+        // Lease-open routes stay admitted, and the bench is the lease's again once the run ends.
+        assert_ne!(send(&router, "GET", "/study/study-abc", Some(&token), None).await.0, StatusCode::CONFLICT);
+        *state.study_lock.lock().unwrap() = None;
+        assert_eq!(send(&router, "POST", "/reset", Some(&token), Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // ---- decision 93: the bench lease -------------------------------------
