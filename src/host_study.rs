@@ -536,7 +536,7 @@ fn run_step<B: HostBackend>(
                     rec.detail = detail::CANCELLED;
                 }
             }
-            HostAction::Exchange { signal, line, until, match_after_echo, refused_on } => {
+            HostAction::Exchange { signal, line, until, match_after_echo, refused_on, .. } => {
                 let req = ExchangeRequest {
                     write: format!("{line}\n"),
                     until: Some(until.clone()),
@@ -571,7 +571,7 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            HostAction::Instrument { instrument, line, query } => {
+            HostAction::Instrument { instrument, line, query, .. } => {
                 let req = InstrumentExchange { line: line.clone(), query: *query, timeout_ms: step.timeout_ms as u64, port_wait_ms: 0 };
                 match backend.instrument(instrument, req) {
                     Ok(r) => {
@@ -597,7 +597,7 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            HostAction::Prompt { text, bench_config } => {
+            HostAction::Prompt { text, bench_config, .. } => {
                 let req = PromptRequest {
                     list,
                     step_index: index,
@@ -1656,7 +1656,7 @@ mod tests {
     fn inst(name: &str, line: &str, query: bool) -> HostStep {
         HostStep {
             name: name.into(),
-            action: HostAction::Instrument { instrument: "eload".into(), line: line.into(), query },
+            action: HostAction::Instrument { instrument: "eload".into(), line: line.into(), query, parse: None },
             timeout_ms: 500,
             continue_on_fail: true,
             delay_before_ms: 0,
@@ -1726,7 +1726,7 @@ mod tests {
     fn ex(name: &str, line: &str, until: &str) -> HostStep {
         HostStep {
             name: name.into(),
-            action: HostAction::Exchange { signal: "pd".into(), line: line.into(), until: until.into(), match_after_echo: true, refused_on: None },
+            action: HostAction::Exchange { signal: "pd".into(), line: line.into(), until: until.into(), match_after_echo: true, refused_on: None, parse: None },
             timeout_ms: 80,
             continue_on_fail: false,
             delay_before_ms: 0,
@@ -1740,7 +1740,7 @@ mod tests {
     fn ask(name: &str, timeout_ms: u32) -> HostStep {
         HostStep {
             name: name.into(),
-            action: HostAction::Prompt { text: format!("{name}: plug in the pack"), bench_config: None },
+            action: HostAction::Prompt { text: format!("{name}: plug in the pack"), bench_config: None, kind: None, confirmed_by: None, answer: None },
             timeout_ms,
             continue_on_fail: false,
             delay_before_ms: 0,
@@ -1749,7 +1749,7 @@ mod tests {
 
     fn ask_for(name: &str, bench_config: &str) -> HostStep {
         let mut step = ask(name, 5_000);
-        step.action = HostAction::Prompt { text: format!("{name}: re-cable"), bench_config: Some(bench_config.into()) };
+        step.action = HostAction::Prompt { text: format!("{name}: re-cable"), bench_config: Some(bench_config.into()), kind: None, confirmed_by: None, answer: None };
         step
     }
 
@@ -2108,7 +2108,7 @@ mod tests {
             assert_eq!(recs[0].result.outcome, Outcome::Pass);
         }
         // The one declared refusal marker is the exception, and it is a marker, not a value.
-        let refusing = study(vec![HostStep { action: HostAction::Exchange { signal: "pd".into(), line: "x".into(), until: "pd: ".into(), match_after_echo: true, refused_on: Some("rejected".into()) }, ..ex("a", "x", "pd: ") }], vec![]);
+        let refusing = study(vec![HostStep { action: HostAction::Exchange { signal: "pd".into(), line: "x".into(), until: "pd: ".into(), match_after_echo: true, refused_on: Some("rejected".into()), parse: None }, ..ex("a", "x", "pd: ") }], vec![]);
         let mut b = Script::new(vec![Ok(b"x\r\npd: rejected\r\n".to_vec())]);
         let (end, recs) = run(&refusing, &mut b, &AtomicBool::new(false));
         assert!(!end.completed);
@@ -2239,7 +2239,7 @@ mod tests {
         assert!(e.contains("steps[0.0] 'forever'") && e.contains("decision 105"), "{e}");
         assert!(check_study(&study(vec![ask("hour", MAX_PROMPT_TIMEOUT_MS)], vec![])).is_ok());
         // An Instrument step runs too (decision 104).
-        assert!(check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).is_ok());
+        assert!(check_study(&study(vec![ex("a", "x", "pd: ")], vec![HostStep { name: "i".into(), action: HostAction::Instrument { instrument: "load".into(), line: "OUTP OFF".into(), query: false, parse: None }, timeout_ms: 500, continue_on_fail: false, delay_before_ms: 0 }])).is_ok());
         let mut with_counts = study(vec![ex("a", "x", "pd: ")], vec![]);
         with_counts.line_counts.push(embarch_study_designer::host_study::LineCount { name: "n".into(), tap: "t".into(), pattern: "p".into(), kind: Default::default() });
         // A count on a tap the study does not declare is the study's own check.
