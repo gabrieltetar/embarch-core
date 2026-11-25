@@ -275,6 +275,9 @@ fn resolve_token_at_path(path: &Path) -> Result<String> {
             .with_context(|| format!("failed to read token file at {}", path.display()))?;
         let token = contents.trim().to_string();
         tracing::info!(path = %path.display(), "reusing existing machine-wide token");
+        // A file created before this grant existed (EMB-563) gets it now.
+        #[cfg(windows)]
+        grant_interactive_read(path);
         return Ok(token);
     }
 
@@ -299,6 +302,7 @@ fn resolve_token_at_path(path: &Path) -> Result<String> {
     #[cfg(windows)]
     {
         restrict_token_file_permissions(path)?;
+        grant_interactive_read(path);
     }
 
     tracing::info!(path = %path.display(), "generated new machine-wide token");
@@ -356,6 +360,48 @@ pub(crate) fn restrict_token_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Windows' well-known INTERACTIVE group: every account logged on at the
+/// machine, the engineer's included. A Core running as a `LocalSystem`
+/// service creates its token files as SYSTEM, which
+/// [`restrict_token_file_permissions`] then grants only SYSTEM and
+/// Administrators, so the engineer's account could read neither token and
+/// embarch-api and embarch-ui, which read the pair, could not start
+/// (EMB-563, 2026-11-25). Granted by SID for the same reason as the others.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SID_INTERACTIVE: &str = "S-1-5-4";
+
+/// `icacls` arguments that add read access for [`SID_INTERACTIVE`] to `path`,
+/// leaving every other entry as it is (`/grant`, not `/grant:r`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn interactive_read_args(path: &str) -> [String; 3] {
+    [path.to_string(), "/grant".to_string(), format!("*{SID_INTERACTIVE}:R")]
+}
+
+/// Lets the accounts logged on at the machine read a token file. Run on
+/// every start, so a file made before this grant existed gets it too. A
+/// failure is logged, not fatal: Core itself still reads the file, and an
+/// account that cannot change this file's ACL (a development Core run as the
+/// engineer over a file SYSTEM made) is told why its clients cannot.
+#[cfg(windows)]
+fn grant_interactive_read(path: &Path) {
+    let Some(path_str) = path.to_str() else {
+        tracing::warn!(path = %path.display(), "token file path is not valid UTF-8; INTERACTIVE read not granted");
+        return;
+    };
+    match std::process::Command::new("icacls").args(interactive_read_args(path_str)).output() {
+        Ok(out) if out.status.success() => {
+            tracing::info!(path = %path.display(), "token file readable by the interactive accounts");
+        }
+        Ok(out) => tracing::warn!(
+            path = %path.display(),
+            status = %out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "icacls could not grant INTERACTIVE read on the token file; embarch-api and embarch-ui may not read it"
+        ),
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "failed to invoke icacls for INTERACTIVE read"),
+    }
+}
+
 /// Resolves the SID of the account running this process via `whoami /user`,
 /// rather than trusting `%USERNAME%` to resolve unambiguously through
 /// `icacls`'s own name lookup (see `restrict_token_file_permissions`'s doc
@@ -387,6 +433,16 @@ fn current_user_sid() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_read_adds_one_read_entry_by_sid() {
+        // `/grant`, not `/grant:r`: the creator, SYSTEM and Administrators
+        // entries restrict_token_file_permissions wrote must stay.
+        assert_eq!(
+            interactive_read_args(r"C:\ProgramData\embarch\person-token"),
+            [r"C:\ProgramData\embarch\person-token".to_string(), "/grant".to_string(), "*S-1-5-4:R".to_string()]
+        );
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("embarch-token-store-test-{name}-{}", std::process::id()))
