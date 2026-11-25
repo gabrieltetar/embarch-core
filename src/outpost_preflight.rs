@@ -207,9 +207,7 @@ pub fn read_header(
     let port = embarch_topology::hardware::resolve_signal_port(signal_name)
         .map_err(|e| format!("couldn't resolve a carrier for signal '{signal_name}': {e:#}"))?;
     let baud = crate::stream_store::signal_baud_for(&link);
-    let mut serial = serialport::new(&port.port_name, baud)
-        .timeout(READ_TIMEOUT)
-        .open()
+    let mut serial = crate::port_hold::open(&port.port_name, baud, READ_TIMEOUT)
         .map_err(|e| {
             format!(
                 "failed to open signal '{signal_name}' on {} at {baud} baud to read the \

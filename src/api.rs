@@ -345,11 +345,11 @@ async fn take_lease_handler(
     State(state): State<AppState>,
     Json(req): Json<TakeLeaseRequest>,
 ) -> Result<(StatusCode, Json<lease::Granted>), (StatusCode, String)> {
-    state
-        .lease
-        .take(&req.holder, &req.purpose, req.ttl_s)
-        .map(|g| (StatusCode::CREATED, Json(g)))
-        .map_err(lease_err)
+    let granted = state.lease.take(&req.holder, &req.purpose, req.ttl_s).map_err(lease_err)?;
+    // Core now holds the bench's serial ports until the lease ends (decision 130).
+    crate::port_hold::acquire(crate::port_hold::Owner::Lease);
+    state.lease.spawn_expiry_watch();
+    Ok((StatusCode::CREATED, Json(granted)))
 }
 
 /// The live lease without its token, or `404`.
@@ -2017,9 +2017,7 @@ async fn start_capture_handler(
             let name = name.clone();
             Arc::new(move || {
                 let p = embarch_topology::hardware::resolve_signal_port(&name)?;
-                let mut sp = serialport::new(p.port_name.as_str(), baud)
-                    .timeout(crate::exchange::READ_POLL)
-                    .open()?;
+                let mut sp = crate::port_hold::open(p.port_name.as_str(), baud, crate::exchange::READ_POLL)?;
                 let _ = sp.write_data_terminal_ready(true);
                 Ok(Box::new(sp) as Box<dyn crate::capture::CapturePort>)
             })

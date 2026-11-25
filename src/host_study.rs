@@ -979,7 +979,7 @@ fn resolve_tap(signal: &str) -> Result<TapTarget, TapError> {
     let name = signal.to_string();
     let opener: crate::capture::Opener = Arc::new(move || {
         let p = embarch_topology::hardware::resolve_signal_port(&name)?;
-        let mut sp = serialport::new(p.port_name.as_str(), baud).timeout(crate::exchange::READ_POLL).open()?;
+        let mut sp = crate::port_hold::open(p.port_name.as_str(), baud, crate::exchange::READ_POLL)?;
         let _ = sp.write_data_terminal_ready(true);
         Ok(Box::new(sp) as Box<dyn crate::capture::CapturePort>)
     });
@@ -1303,6 +1303,7 @@ pub async fn post_host_study_handler(
     let study_id = crate::study::generate_study_id();
     crate::study::take_study_lock(&state, &study_id)?;
     let hold = JobHold { lock: state.study_lock.clone(), lease: state.lease.clone(), cancel: state.host_cancel.clone(), prompt: state.host_prompt.clone() };
+    state.lease.study_started();
 
     let for_signals = study.clone();
     match tokio::task::spawn_blocking(move || check_signals(&for_signals)).await {

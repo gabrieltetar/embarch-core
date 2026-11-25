@@ -156,6 +156,7 @@ impl LeaseSlot {
                 } else {
                     tracing::info!("lease held by '{}' expired", l.holder);
                 }
+                crate::port_hold::release(crate::port_hold::Owner::Lease);
             }
         }
         inner.lease.as_mut()
@@ -182,6 +183,38 @@ impl LeaseSlot {
         if let Some(l) = self.inner.lock().unwrap().lease.as_mut() {
             l.idle_since = Instant::now();
         }
+        crate::port_hold::release(crate::port_hold::Owner::Study);
+    }
+
+    /// A study run begins: it holds the bench's serial ports for its own life, or shares the
+    /// lease's hold (decision 130). Paired with [`Self::study_ended`].
+    pub fn study_started(&self) {
+        crate::port_hold::acquire(crate::port_hold::Owner::Study);
+    }
+
+    /// How long until this lease could next end by itself, or `None` with no lease.
+    fn next_end(&self) -> Option<Duration> {
+        let inner = self.inner.lock().unwrap();
+        let l = inner.lease.as_ref()?;
+        let mut end = l.expires;
+        if !self.study_in_flight() {
+            end = end.min(l.idle_since + IDLE_RELEASE);
+        } else {
+            end = end.min(Instant::now() + IDLE_RELEASE);
+        }
+        Some(end.saturating_duration_since(Instant::now()) + Duration::from_millis(50))
+    }
+
+    /// Ends a lease the moment it expires or goes idle, though nobody calls: expiry is otherwise
+    /// evaluated lazily, and the ports the lease holds (decision 130) must not outlive it.
+    pub fn spawn_expiry_watch(&self) {
+        let slot = self.clone();
+        tokio::spawn(async move {
+            while let Some(wait) = slot.next_end() {
+                tokio::time::sleep(wait).await;
+                let _ = slot.view();
+            }
+        });
     }
 
     pub fn take(&self, holder: &str, purpose: &str, ttl_s: u64) -> Result<Granted, LeaseError> {
@@ -246,6 +279,7 @@ impl LeaseSlot {
         }
         tracing::info!("lease released by '{}'", l.holder);
         slot.lease = None;
+        crate::port_hold::release(crate::port_hold::Owner::Lease);
         slot.idle_released = None;
         Ok(())
     }

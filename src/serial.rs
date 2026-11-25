@@ -71,9 +71,7 @@ pub struct CaptureResult {
 /// Most boards expose both: a probe for flashing/debug, and a serial adapter
 /// for the running firmware's log output.
 pub fn read_log(port: &str, baud: u32, duration_ms: u64, max_bytes: usize) -> Result<CaptureResult> {
-    let mut conn = serialport::new(port, baud)
-        .timeout(Duration::from_millis(200))
-        .open()
+    let mut conn = crate::port_hold::open(port, baud, Duration::from_millis(200))
         .with_context(|| format!("failed to open serial port '{port}'"))?;
 
     capture(&mut conn, duration_ms, max_bytes)

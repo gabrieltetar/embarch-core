@@ -1720,6 +1720,7 @@ pub async fn post_study_handler(
     let cancel = register_device_cancel(&state, &study_id);
     let device_cancel = state.device_cancel.clone();
 
+    lease_slot.study_started();
     tokio::spawn(async move {
         let jobs_for_panic = jobs.clone();
         let events_tx_for_panic = events_tx.clone();
@@ -1860,6 +1861,7 @@ async fn start_session_study(
     let cancel = register_device_cancel(state, &study_id);
     let device_cancel = state.device_cancel.clone();
 
+    lease_slot.study_started();
     tokio::spawn(async move {
         let jobs_for_panic = jobs.clone();
         let events_tx_for_panic = events_tx.clone();
@@ -3379,9 +3381,7 @@ fn start_signal_tap(
         .map_err(|e| format!("couldn't resolve a carrier for signal '{signal_name}': {e:#}"))?;
 
     let baud = stream_store::signal_baud_for(&link);
-    let serial = serialport::new(&port.port_name, baud)
-        .timeout(Duration::from_millis(200))
-        .open()
+    let serial = crate::port_hold::open(&port.port_name, baud, Duration::from_millis(200))
         .map_err(|e| {
             format!("failed to open signal '{signal_name}' on {} at {baud} baud: {e:?}", port.port_name)
         })?;

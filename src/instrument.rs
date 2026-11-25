@@ -143,9 +143,7 @@ pub fn run(inst: &Instrument, port: &embarch_topology::hardware::DetectedPort, r
     let started = Instant::now();
     let started_utc_ms = crate::exchange::utc_ms();
     let name = port.port_name.as_str();
-    let mut sp = serialport::new(name, inst.baud)
-        .timeout(READ_POLL)
-        .open()
+    let mut sp = crate::port_hold::open(name, inst.baud, READ_POLL)
         .with_context(|| format!("failed to open instrument '{}' on {name} at {} baud: nothing was written", inst.name, inst.baud))?;
     // Best effort, as for a signal exchange: a bridge may not support it.
     let _ = sp.write_data_terminal_ready(true);

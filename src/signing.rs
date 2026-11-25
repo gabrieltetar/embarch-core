@@ -370,6 +370,7 @@ impl Sealer {
         let mut observed = serde_json::json!({
             "core": { "version": env!("CARGO_PKG_VERSION") },
             "mode": crate::token_store::mode(),
+            "ports_held": crate::port_hold::held(),
             "provenance": provenance,
             "image_status": "unverified",
             "declarations": self.declarations.snapshot(),
@@ -623,6 +624,22 @@ mod tests {
         .unwrap();
         assert!(st["subject"].as_array().unwrap().iter().any(|s| s["name"] == "measurements.json"));
         assert_eq!(st["predicate"]["observed"]["behaviours"]["rate"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_record_lists_the_ports_held_during_the_run() {
+        let (_master, port) = crate::port_hold::tests::pty();
+        crate::port_hold::acquire_with(crate::port_hold::Owner::Study, vec![(port.clone(), 115_200)]);
+        let dir = run_dir();
+        let sealer = Sealer::ephemeral();
+        sealer.seal(&job(&sealer, None), dir.path(), "abc", 42).unwrap();
+        crate::port_hold::release(crate::port_hold::Owner::Study);
+        let st: serde_json::Value = serde_json::from_slice(
+            &standard_dsse_check(&read_envelope(dir.path()), &sealer.key().public_key_hex()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(st["predicate"]["observed"]["ports_held"], serde_json::json!([port]));
     }
 
     #[test]

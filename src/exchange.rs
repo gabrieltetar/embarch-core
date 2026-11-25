@@ -438,9 +438,7 @@ pub fn run(
     let started = Instant::now();
     let started_utc_ms = utc_ms();
     let port_name = port.port_name.as_str();
-    let mut sp = serialport::new(port_name, baud)
-        .timeout(READ_POLL)
-        .open()
+    let mut sp = crate::port_hold::open(port_name, baud, READ_POLL)
         .with_context(|| format!("failed to open signal '{signal}' on {port_name} at {baud} baud: nothing was written"))?;
     // Best effort: a plain UART bridge may not support the control line, and
     // that is no reason to refuse the write.
