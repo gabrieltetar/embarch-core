@@ -1383,7 +1383,7 @@ fn run_job_with_origin<B: HostBackend>(
     // Before the record is signed, so it is a subject of it (decision 131).
     let fallback = crate::signing::Declarations::new();
     let declarations = seal.map_or(&fallback, |s| s.sealer.declarations());
-    if let Err(e) = crate::host_parse::write(dir, study_id, &parses, &observed, signal_origin, declarations) {
+    if let Err(e) = crate::host_parse::write(dir, study_id, &parses, &observed, signal_origin, &|n| embarch_topology::hardware::instrument::get(n).ok().flatten(), declarations) {
         crate::study::fail_job(jobs, events_tx, study_id, format!("failed to write measurements.json: {e:#}"));
         return;
     }

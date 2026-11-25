@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::measurements::{incomplete_str, num, SignalOrigin};
 use crate::signing::Declarations;
+use embarch_topology::hardware::Instrument;
 use crate::token_store::Scope;
 
 /// What a step addressed: the one thing that says who measured.
@@ -122,6 +123,7 @@ pub fn write(
     collected: &[Collected],
     observed: &[CollectedObservation],
     signal_origin: &dyn Fn(&str) -> Option<SignalOrigin>,
+    instrument_of: &dyn Fn(&str) -> Option<Instrument>,
     declarations: &Declarations,
 ) -> Result<Option<PathBuf>> {
     if collected.is_empty() && observed.is_empty() {
@@ -132,7 +134,7 @@ pub fn write(
         "run_id": run_id,
         // A parse is no reducer: it carries no behaviour version.
         "behaviours": {},
-        "measurements": collected.iter().map(|c| measurement(c, signal_origin, declarations)).chain(observed.iter().map(observation)).collect::<Vec<_>>(),
+        "measurements": collected.iter().map(|c| measurement(c, signal_origin, instrument_of, declarations)).chain(observed.iter().map(observation)).collect::<Vec<_>>(),
     });
     crate::measurements::write_file(dir, &doc).map(Some)
 }
@@ -152,7 +154,30 @@ fn producer(addressed: &Addressed, signal_origin: &dyn Fn(&str) -> Option<Signal
     }
 }
 
-fn measurement(c: &Collected, signal_origin: &dyn Fn(&str) -> Option<SignalOrigin>, declarations: &Declarations) -> Value {
+/// The metrology entry that speaks for a parse: the one whose unit the parse reads in, when
+/// exactly one does. Two entries in one unit (two quantities) leave no honest pick, so none.
+fn metrology_for<'a>(inst: &'a Instrument, unit: &str) -> Option<&'a embarch_topology::hardware::instrument::Metrology> {
+    let mut hits = inst.metrology.iter().filter(|m| m.unit == unit);
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
+/// `instrument.calibration` as a measurement carries it: the declared block, with the serial
+/// marked unchecked until the smoke check's `*IDN?` reply can be compared (EMB-368).
+fn calibration_json(c: &embarch_topology::hardware::instrument::Calibration) -> Value {
+    let mut v = json!({"serial": c.serial, "certificate_ref": c.certificate_ref, "due": c.due, "serial_checked": false});
+    if let Some(h) = &c.certificate_sha256 {
+        v["certificate_sha256"] = json!(h);
+    }
+    v
+}
+
+fn measurement(
+    c: &Collected,
+    signal_origin: &dyn Fn(&str) -> Option<SignalOrigin>,
+    instrument_of: &dyn Fn(&str) -> Option<Instrument>,
+    declarations: &Declarations,
+) -> Value {
     let p = &c.parsed;
     let (by, instrument, bench_image) = producer(&p.addressed, signal_origin);
     let mut source = json!({"file": "events.json", "step": c.step});
@@ -168,6 +193,22 @@ fn measurement(c: &Collected, signal_origin: &dyn Fn(&str) -> Option<SignalOrigi
             declared_by.push(json!({"what": "role", "name": role, "scope": scope("role", role)}));
         }
     }
+    let (mut resolution, mut uncertainty, mut u_source) = (Value::Null, Value::Null, "undeclared");
+    let mut instrument = instrument;
+    if let Addressed::Instrument(name) = &p.addressed {
+        declared_by.push(json!({"what": "instrument", "name": name, "scope": scope("instrument", name)}));
+        if let Some(inst) = instrument_of(name) {
+            if let Some(m) = metrology_for(&inst, &p.unit) {
+                resolution = num(m.resolution);
+                let basis = serde_json::to_value(m.basis).unwrap_or(Value::Null);
+                uncertainty = json!({"U": num(m.u_expanded), "k": num(m.k), "basis": basis});
+                u_source = "source";
+            }
+            if let Some(cal) = &inst.calibration {
+                instrument["calibration"] = calibration_json(cal);
+            }
+        }
+    }
     json!({
         "name": p.name,
         "value": p.value.map_or(Value::Null, num),
@@ -178,11 +219,11 @@ fn measurement(c: &Collected, signal_origin: &dyn Fn(&str) -> Option<SignalOrigi
         "instrument": instrument,
         "bench_image": bench_image,
         "method": {"kind": "parse", "pattern": p.pattern},
-        "resolution": null,
-        // A parse declares none, and an instrument's metrology does not reach it yet
-        // (EMB-358/EMB-360): undeclared, for a DUT's value and a bench's alike.
-        "uncertainty": null,
-        "u_source": "undeclared",
+        // A bench instrument's value takes its metrology block (decision 140); a parse declares
+        // none itself, so a DUT's value stays undeclared.
+        "resolution": resolution,
+        "uncertainty": uncertainty,
+        "u_source": u_source,
         "declared_by": declared_by,
         "incomplete": p.incomplete.iter().map(|i| incomplete_str(*i)).collect::<Vec<_>>(),
     })
@@ -213,6 +254,57 @@ mod tests {
         assert_eq!(cut.incomplete, [Incomplete::TruncatedReply]);
         let both = read(&vbus(), "vbus: 50", true, Addressed::Signal("pd".into()));
         assert_eq!(both.incomplete, [Incomplete::TruncatedReply, Incomplete::ParseFailed]);
+    }
+
+    fn dmm(cal: bool) -> Instrument {
+        use embarch_topology::hardware::instrument::{Calibration, MeasuringRange, Metrology, MetrologyBasis};
+        let mut i: Instrument = serde_json::from_value(json!({"name": "dmm", "port": {"vid": 1, "pid": 2}, "baud": 9600})).unwrap();
+        i.metrology = vec![Metrology {
+            quantity: "voltage".into(),
+            unit: "mV".into(),
+            resolution: 0.1,
+            u_expanded: 2.0,
+            k: 2.0,
+            basis: MetrologyBasis::Certificate,
+            range: MeasuringRange { min: 0.0, max: 1000.0 },
+        }];
+        if cal {
+            i.calibration = Some(Calibration { serial: "S1".into(), certificate_ref: "C-9".into(), due: "2026-01-01".into(), certificate_sha256: None });
+        }
+        i
+    }
+
+    fn bench_value(inst: Option<Instrument>, decls: &Declarations) -> Value {
+        let c = Collected {
+            step: "s".into(),
+            iteration: None,
+            at_utc_ms: 5,
+            parsed: read(&vbus(), "vbus: 5 mV", false, Addressed::Instrument("dmm".into())),
+        };
+        measurement(&c, &|_| None, &|_| inst.clone(), decls)
+    }
+
+    #[test]
+    fn an_instruments_metrology_and_calibration_reach_its_value() {
+        let decls = Declarations::new();
+        decls.record("instrument", "dmm", Scope::Person);
+        let m = bench_value(Some(dmm(true)), &decls);
+        assert_eq!(m["resolution"], 0.1);
+        assert_eq!(m["uncertainty"], json!({"U": 2, "k": 2, "basis": "certificate"}));
+        assert_eq!(m["u_source"], "source");
+        assert_eq!(m["instrument"]["calibration"]["due"], "2026-01-01");
+        assert_eq!(m["instrument"]["calibration"]["serial_checked"], false);
+        assert_eq!(m["declared_by"], json!([{"what": "instrument", "name": "dmm", "scope": "person"}]));
+    }
+
+    #[test]
+    fn an_instrument_without_metrology_or_calibration_stays_undeclared() {
+        let mut bare = dmm(false);
+        bare.metrology.clear();
+        let m = bench_value(Some(bare), &Declarations::new());
+        assert_eq!((m["u_source"].as_str(), m["uncertainty"].is_null()), (Some("undeclared"), true));
+        assert!(m["instrument"].get("calibration").is_none());
+        assert_eq!(m["declared_by"][0]["scope"], "agent");
     }
 
     #[test]
