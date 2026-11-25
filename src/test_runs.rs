@@ -677,6 +677,13 @@ fn waiting_prompt(state: &AppState) -> Value {
         Some(slot) if slot.answer.is_none() => json!({
             "prompt_id": slot.pending.prompt_id, "step": agent_text(&slot.pending.step_name), "text": agent_text(&slot.pending.text),
             "bench_config": agent_opt(&slot.pending.bench_config), "deadline_utc_ms": slot.pending.deadline_utc_ms,
+            // The kind is the run's (decision 138); `switched_on` is what Core last switched on.
+            "kind": slot.pending.kind,
+            "observation": slot.pending.observation.as_ref().map(|o| json!({
+                "name": agent_text(&o.name), "answers": o.answers.iter().map(|a| agent_text(a)).collect::<Vec<_>>(), "number": o.number,
+            })),
+            "switched_on": slot.pending.switched_on.iter()
+                .map(|o| json!({ "step": agent_text(&o.step), "target": agent_text(&o.target), "line": agent_text(&o.line) })).collect::<Vec<_>>(),
         }),
         _ => Value::Null,
     }
@@ -1095,7 +1102,8 @@ mod tests {
             study_id: "st".into(),
             pending: crate::host_study::PendingPrompt {
                 prompt_id: 1, list: HostList::Steps, step_index: 0, step_name: "set up".into(), text: "Wire it".into(), bench_config: None,
-                kind: None, observation: None, switched_on: vec![], opened_utc_ms: 0, deadline_utc_ms: 9, session: None,
+                kind: Some(embarch_study_designer::host_study::PromptKind::Observation), observation: None,
+                switched_on: vec![crate::host_study::SwitchedOn { target: "eload".into(), line: "OUTP ON".into(), step: "load on".into() }], opened_utc_ms: 0, deadline_utc_ms: 9, session: None,
             },
             answer: None,
             extra: None,
@@ -1106,6 +1114,8 @@ mod tests {
         assert_eq!((mid["state"].as_str(), mid["bench"].as_str(), mid["test"].as_str()), (Some("running"), Some("pd-sink-bench"), Some("vbus-5v-source-voltage")), "{mid}");
         assert_eq!(mid["verdicts"], json!([]));
         assert_eq!(mid["waiting_prompt"]["text"]["agent_text"], "Wire it");
+        assert_eq!(mid["waiting_prompt"]["kind"], "observation");
+        assert_eq!(mid["waiting_prompt"]["switched_on"][0]["line"]["agent_text"], "OUTP ON", "{mid}");
 
         // The fixture's test runs three times.
         for _ in 0..3 {

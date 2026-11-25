@@ -4550,6 +4550,12 @@ pub struct StudyStepEntryResponse {
     pub answered_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bench_config: Option<String>,
+    /// A `Prompt` row of a Test run's study (decision 138): the scope of the token that relayed
+    /// the answer, and an observation's recorded answer `{name, value}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4610,6 +4616,10 @@ struct EventsFileStep {
     answered_by: Option<String>,
     #[serde(default)]
     bench_config: Option<String>,
+    #[serde(default)]
+    answered_scope: Option<String>,
+    #[serde(default)]
+    observed: Option<serde_json::Value>,
 }
 
 /// Splits [`Outcome`]'s serialized form into a name and, for a `Fail`, the
@@ -4698,6 +4708,8 @@ fn steps_response(parsed: EventsFileForSteps) -> StudyStepsResponse {
                 prompt_deadline_utc_ms: s.prompt_deadline_utc_ms,
                 answered_by: s.answered_by,
                 bench_config: s.bench_config,
+                answered_scope: s.answered_scope,
+                observed: s.observed,
             }
         })
         .collect();
