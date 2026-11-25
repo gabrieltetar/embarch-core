@@ -689,6 +689,7 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("POST", "/confirmations"),
     // A prepared run is a file and its card a rendering; the go, which takes the lease, is a later unit (decision 134).
     ("POST", "/test-runs"),
+    ("GET", "/test-runs/{run_id}"),
     ("GET", "/test-runs/{run_id}/card"),
     ("GET", "/study/{study_id}/log"),
     ("POST", "/study/{study_id}/published"),

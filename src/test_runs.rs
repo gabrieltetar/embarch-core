@@ -6,8 +6,9 @@
 //! Core's record, and carries a go nonce for the person's token only.
 //!
 //! Preparing starts nothing, powers nothing and takes no bench. `POST /test-runs/{run_id}/go`
-//! spends the nonce and moves the session's lease to the run (decision 135); the executor
-//! that runs the studies (EMB-366) is not here: a started run stays so until [`end_run`].
+//! spends the nonce, moves the session's lease to the run (decision 135) and starts the executor
+//! (`test_executor.rs`, decision 136), which ends the run through [`end_run`]. `GET
+//! /test-runs/{run_id}` answers where it is.
 
 use axum::{
     extract::{Path as UrlPath, State},
@@ -326,6 +327,19 @@ fn static_card(defs: &Definitions, res: &Resolved, exp: &Expansion, studies: &BT
     })
 }
 
+/// The study each test runs, by `test_id`, as the card read it: Core's expansion of a template, else
+/// the file the caller sent. Kept so the executor runs the study the person saw (decision 136).
+fn kept_studies(exp: &Expansion, sent: &BTreeMap<String, HostStudy>) -> BTreeMap<String, HostStudy> {
+    exp.run
+        .tests
+        .iter()
+        .filter_map(|rt| {
+            let s = exp.studies.iter().find(|s| s.test_id == rt.test_id).map(|s| &s.study).or_else(|| sent.get(&rt.study.file))?;
+            Some((rt.test_id.clone(), s.clone()))
+        })
+        .collect()
+}
+
 /// The hashes a person may still owe a confirmation on, by kind and name.
 fn inputs(res: &Resolved) -> Vec<Value> {
     let mut v = vec![json!({ "kind": "suite", "name": format!("{}@{}", res.manifest.id, res.manifest.version), "hash": res.manifest_hash })];
@@ -391,6 +405,7 @@ pub async fn prepare_handler(State(state): State<AppState>, Json(req): Json<Prep
             "run": exp.run, "plan_hash": res.plan_hash, "suite_hash": res.manifest_hash,
             "lease_holder": holder, "prepared_utc_ms": crate::study::current_utc_ms(),
             "card": static_card(&defs, &res, &exp, &req.studies), "inputs": inputs(&res),
+            "studies": kept_studies(&exp, &req.studies),
         });
         write_new(&path, &record).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => (StatusCode::CONFLICT, format!("run {} is already prepared: a run id is used once", req.run.run_id)),
@@ -478,6 +493,11 @@ fn read_record(store: &std::path::Path, run_id: &str) -> Result<Value, (StatusCo
     serde_json::from_slice(&bytes).map_err(|e| internal(e.into()))
 }
 
+/// Where the executor leaves a run's verdicts when it ends.
+pub(crate) fn result_path(store: &std::path::Path, run_id: &str) -> PathBuf {
+    store.join(TEST_RUNS_DIR).join(format!("{run_id}.result.json"))
+}
+
 /// Where a go leaves its mark: written once, so a run starts once however many cards were issued.
 fn started_path(store: &std::path::Path, run_id: &str) -> PathBuf {
     store.join(TEST_RUNS_DIR).join(format!("{run_id}.started.json"))
@@ -510,6 +530,7 @@ pub async fn go_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<
         return Err((StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")));
     }
     let (defs, log, lease) = (state.definitions.clone(), state.run_log.clone(), state.lease.clone());
+    let app = state.clone();
     blocking(move || -> Reply {
         let rec = read_record(log.data_dir(), &run_id)?;
         let run_hash = rec["run_hash"].as_str().unwrap_or("").to_string();
@@ -547,9 +568,27 @@ pub async fn go_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<
         if let Err(e) = log.test_run_started(&run_id, &run_hash, scope, &session) {
             tracing::error!(run_id, "could not enter the run's start in the run log: {e:#}");
         }
+        if state.run_executor {
+            match start_executor(&app, &run_id, &rec) {
+                Ok(()) => {}
+                Err(why) => {
+                    end_run(&app, &run_id, "error", Some(&why), None);
+                    return Err(internal(anyhow::anyhow!("the run was started and could not be executed, so it was ended: {why}")));
+                }
+            }
+        }
         Ok((StatusCode::OK, Json(json!({ "run_id": run_id, "run_hash": run_hash, "state": "started", "started_utc_ms": now, "lease_holder": session }))))
     })
     .await?
+}
+
+/// Starts the executor on the run the go just started, from the record the prepare kept: its
+/// `run.json` and the study each test runs. `Err` when the record cannot be read back.
+fn start_executor(state: &AppState, run_id: &str, rec: &Value) -> Result<(), String> {
+    let run: RunJson = serde_json::from_value(rec["run"].clone()).map_err(|e| format!("the kept run.json no longer parses: {e}"))?;
+    let studies: BTreeMap<String, HostStudy> = serde_json::from_value(rec["studies"].clone()).unwrap_or_default();
+    crate::test_executor::spawn(state.clone(), run_id.to_string(), run, studies);
+    Ok(())
 }
 
 /// Ends a started run (decision 135): releases the run lock, gives the lease back to its session
@@ -566,11 +605,62 @@ pub fn end_run(state: &AppState, run_id: &str, status: &str, reason: Option<&str
     true
 }
 
+/// Where a run is: its state, the bench and test it is on, every verdict so far, and the prompt
+/// it waits on with its text (`notes/hil/03-test.md`, "A run", item 6). Either token; reads no port.
+/// A finished run answers from the result the executor kept, a prepared one from its record, `404`
+/// for a run Core has none of. `started` with no progress is a run whose Core restarted
+/// under it (`interrupted`; decision 136, open).
+// route: GET /test-runs/{run_id}
+pub async fn status_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>) -> Reply {
+    if !is_run_id(&run_id) {
+        return Err((StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")));
+    }
+    let log = state.run_log.clone();
+    let progress = state.test_progress.lock().unwrap().get(&run_id).cloned();
+    let in_flight = state.lease.run_in_flight().as_deref() == Some(run_id.as_str());
+    let waiting = if in_flight { waiting_prompt(&state) } else { Value::Null };
+    blocking(move || -> Reply {
+        let rec = read_record(log.data_dir(), &run_id)?;
+        let body = |state: &str, bench: Value, test: Value, verdicts: Value| {
+            json!({ "run_id": run_id, "run_hash": rec["run_hash"], "state": state, "bench": bench, "test": test, "verdicts": verdicts, "waiting_prompt": waiting })
+        };
+        if let Some(p) = progress {
+            let p = p.lock().unwrap();
+            let verdicts: Vec<Value> = p.results.iter().map(crate::test_executor::TestResult::to_json).collect();
+            return Ok((StatusCode::OK, Json(body(p.state, json!(p.bench), json!(p.test), verdicts.into()))));
+        }
+        if let Ok(bytes) = std::fs::read(result_path(log.data_dir(), &run_id)) {
+            let kept: Value = serde_json::from_slice(&bytes).map_err(|e| internal(e.into()))?;
+            let state = kept["status"].as_str().unwrap_or("completed").to_string();
+            return Ok((StatusCode::OK, Json(body(&state, Value::Null, Value::Null, kept["results"].clone()))));
+        }
+        let state = if started_path(log.data_dir(), &run_id).exists() { if in_flight { "started" } else { "interrupted" } } else { "prepared" };
+        Ok((StatusCode::OK, Json(body(state, Value::Null, Value::Null, json!([])))))
+    })
+    .await?
+}
+
+/// The prompt a study of the run is waiting on, its text marked as the study's.
+fn waiting_prompt(state: &AppState) -> Value {
+    match state.host_prompt.lock().unwrap().as_ref() {
+        Some(slot) if slot.answer.is_none() => json!({
+            "prompt_id": slot.pending.prompt_id, "step": agent_text(&slot.pending.step_name), "text": agent_text(&slot.pending.text),
+            "bench_config": agent_opt(&slot.pending.bench_config), "deadline_utc_ms": slot.pending.deadline_utc_ms,
+        }),
+        _ => Value::Null,
+    }
+}
+
 /// Cancels the run in flight, from either token (`403` to neither); not lease-gated, so the
 /// run's hold does not refuse it. `409` when `run_id` is not started. Recorded with the token's scope.
 // route: POST /test-runs/{run_id}/cancel
 pub async fn cancel_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>, scope: Scope) -> Reply {
     if end_run(&state, &run_id, "cancelled", Some("cancelled by request"), Some(scope)) {
+        // The study under the run stops within its step and runs its teardown; the executor sees
+        // the run is no longer in flight and marks the rest cancelled (decision 136).
+        if let Some((_, flag)) = state.host_cancel.lock().unwrap().as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         return Ok((StatusCode::OK, Json(json!({ "run_id": run_id, "state": "cancelled", "by": scope.as_str() }))));
     }
     match state.lease.run_in_flight() {
@@ -593,6 +683,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use embarch_study_designer::hil_expand::Standard;
     use embarch_study_designer::hil_test::SuiteTest;
+    use embarch_study_designer::host_study::HostList;
     use tower::ServiceExt as _;
 
     const TEST_JSON: &str = include_str!("../tests/fixtures/hil-tests/test.json");
@@ -921,6 +1012,120 @@ mod tests {
             let go = go_body(&s, &id).await;
             assert_eq!(call(&s, PERSON, "POST", &format!("/test-runs/{id}/go"), Some(go)).await.0, StatusCode::CONFLICT);
         }
+    }
+
+    /// A bench that holds `run_study` until told, so a status read can land in the middle of a test.
+    struct Held {
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        state: AppState,
+        run_id: String,
+    }
+
+    impl crate::test_executor::Env for Held {
+        fn cancelled(&self) -> bool {
+            self.state.lease.run_in_flight().as_deref() != Some(self.run_id.as_str())
+        }
+        fn precondition(&mut self, _: &embarch_study_designer::hil_expand::RunBench, _: &RunTest) -> Result<(), String> {
+            Ok(())
+        }
+        fn run_study(&mut self, _: &RunTest) -> crate::test_executor::StudyRun {
+            let _ = self.reached.send(());
+            self.release.recv().unwrap();
+            crate::test_executor::StudyRun { steps: vec![], measurements: vec![], cancelled: false, aborted: None, study_id: None }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_names_the_bench_the_test_the_verdicts_so_far_and_a_waiting_prompt() {
+        let (s, _) = ready("status", "run-s1").await;
+        let (st, prepared) = call(&s, AGENT, "GET", "/test-runs/run-s1", None).await;
+        assert_eq!((st, prepared["state"].as_str()), (StatusCode::OK, Some("prepared")), "{prepared}");
+        let go = go_body(&s, "run-s1").await;
+        assert_eq!(call(&s, PERSON, "POST", "/test-runs/run-s1/go", Some(go)).await.0, StatusCode::OK);
+        let (_, started) = call(&s, AGENT, "GET", "/test-runs/run-s1", None).await;
+        assert_eq!(started["state"], "started", "a started run with no executor yet");
+
+        let rec = read_record(s.run_log.data_dir(), "run-s1").unwrap();
+        let run: RunJson = serde_json::from_value(rec["run"].clone()).unwrap();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test_executor::Progress { state: "running", ..Default::default() }));
+        s.test_progress.lock().unwrap().insert("run-s1".into(), progress.clone());
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut env = Held { reached: reached_tx, release: release_rx, state: s.clone(), run_id: "run-s1".into() };
+        let driver = std::thread::spawn(move || {
+            crate::test_executor::drive(&run, &mut env, &progress, &embarch_study_designer::verdicts::Rules::latest(), std::time::Duration::from_secs(60))
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap()).await.unwrap();
+
+        // A study of the run is waiting on a prompt, as the real backend publishes one.
+        *s.host_prompt.lock().unwrap() = Some(crate::host_study::PromptSlot {
+            study_id: "st".into(),
+            pending: crate::host_study::PendingPrompt {
+                prompt_id: 1, list: HostList::Steps, step_index: 0, step_name: "set up".into(), text: "Wire it".into(), bench_config: None,
+                opened_utc_ms: 0, deadline_utc_ms: 9, session: None,
+            },
+            answer: None,
+            session: None,
+        });
+        let (st, mid) = call(&s, AGENT, "GET", "/test-runs/run-s1", None).await;
+        assert_eq!(st, StatusCode::OK, "{mid}");
+        assert_eq!((mid["state"].as_str(), mid["bench"].as_str(), mid["test"].as_str()), (Some("running"), Some("pd-sink-bench"), Some("vbus-5v-source-voltage")), "{mid}");
+        assert_eq!(mid["verdicts"], json!([]));
+        assert_eq!(mid["waiting_prompt"]["text"]["agent_text"], "Wire it");
+
+        // The fixture's test runs three times.
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+        }
+        let outcome = tokio::task::spawn_blocking(move || driver.join().unwrap()).await.unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        let (_, end) = call(&s, AGENT, "GET", "/test-runs/run-s1", None).await;
+        assert_eq!(end["state"], "completed");
+        assert_eq!(end["test"], Value::Null);
+        assert_eq!(end["verdicts"][0]["test_id"], "vbus-5v-source-voltage");
+        assert!(end["verdicts"][0]["verdict"].is_string(), "{end}");
+        assert_eq!(call(&s, AGENT, "GET", "/test-runs/nope", None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_finished_runs_verdicts_are_read_from_the_result_the_executor_kept() {
+        let (s, _) = ready("kept", "run-s2").await;
+        let go = go_body(&s, "run-s2").await;
+        call(&s, PERSON, "POST", "/test-runs/run-s2/go", Some(go)).await;
+        assert!(end_run(&s, "run-s2", "completed", None, None));
+        std::fs::write(
+            result_path(s.run_log.data_dir(), "run-s2"),
+            json!({ "run_id": "run-s2", "status": "completed", "results": [ { "test_id": "t", "verdict": "pass" } ] }).to_string(),
+        )
+        .unwrap();
+        let (_, body) = call(&s, AGENT, "GET", "/test-runs/run-s2", None).await;
+        assert_eq!((body["state"].as_str(), body["verdicts"][0]["verdict"].as_str()), (Some("completed"), Some("pass")));
+        // Started, not in flight, no result: Core restarted under it.
+        let (s, _) = ready("restarted", "run-s3").await;
+        let go = go_body(&s, "run-s3").await;
+        call(&s, PERSON, "POST", "/test-runs/run-s3/go", Some(go)).await;
+        s.lease.end_run("run-s3");
+        assert_eq!(call(&s, AGENT, "GET", "/test-runs/run-s3", None).await.1["state"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn a_study_cancel_is_admitted_while_a_run_holds_the_lease_and_the_rest_stays_refused() {
+        let (s, token) = ready("admitted", "run-s4").await;
+        let go = go_body(&s, "run-s4").await;
+        assert_eq!(call(&s, PERSON, "POST", "/test-runs/run-s4/go", Some(go)).await.0, StatusCode::OK);
+        // Not 409: the route is reached (no such study, `404`), with no lease token at all.
+        assert_eq!(call(&s, AGENT, "POST", "/study/nope/cancel", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(reset_with(&s, &token).await.0, StatusCode::CONFLICT, "every other gated call stays refused");
+        // A cancel of the study the run is on sets its flag, which the executor reads as the run's cancel.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *s.host_cancel.lock().unwrap() = Some(("st-1".into(), flag.clone()));
+        assert_eq!(call(&s, AGENT, "POST", "/study/st-1/cancel", None).await.0, StatusCode::ACCEPTED);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        // The run's own cancel sets the same flag, so the study under it stops within its step.
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(call(&s, AGENT, "POST", "/test-runs/run-s4/cancel", None).await.0, StatusCode::OK);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

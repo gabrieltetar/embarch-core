@@ -1394,6 +1394,46 @@ pub async fn post_host_study_handler(
     Ok((StatusCode::ACCEPTED, Json(StudyAcceptedResponse { study_id, status: "accepted" })))
 }
 
+/// What one host study run for a Test run left behind (`test_executor.rs`, decision 136).
+pub(crate) struct RanStudy {
+    pub study_id: String,
+    pub dir: PathBuf,
+    /// The study's cancel flag was set: a cancel of the study or of the run under it.
+    pub cancelled: bool,
+}
+
+/// Runs `study` to its end on the calling (blocking) thread, as `POST /host-studies` does without
+/// the route: `study_lock`, the signal check, the taps, the cancel slot, `run_job` with its
+/// teardown and seal. `Err` names why nothing ran. The caller holds the run lock; the lease is not
+/// asked, since the run is the lease's holder.
+pub(crate) fn run_study_blocking(state: &AppState, handle: &tokio::runtime::Handle, study: &HostStudy, go_by: crate::token_store::Scope) -> Result<RanStudy, String> {
+    check_study(study)?;
+    check_signals(study)?;
+    let study_id = crate::study::generate_study_id();
+    crate::study::take_study_lock(state, &study_id).map_err(|(_, m)| m)?;
+    let _hold = JobHold { lock: state.study_lock.clone(), lease: state.lease.clone(), cancel: state.host_cancel.clone(), prompt: state.host_prompt.clone() };
+    state.lease.study_started();
+    let dir = crate::study::study_results_dir(&study_id).map_err(|e| format!("{e:#}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let taps = StudyTaps::start(&state.captures, &state.tap_ports, &dir, study, &resolve_tap).map_err(|(_, m)| m)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    *state.host_cancel.lock().unwrap() = Some((study_id.clone(), cancel.clone()));
+    state.run_log.begin(&study_id, "host", go_by);
+    state.study_jobs.lock().unwrap().insert(
+        study_id.clone(),
+        StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(study.steps.len() as u32), reason: None },
+    );
+    let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "host", build: None, submitted_by: None, calls: crate::call_log::RunCalls::begin(&state.call_log) };
+    let mut backend = CoreBackend { state: state.clone(), handle: handle.clone(), study_id: study_id.clone(), prompts: 0 };
+    run_job(study, &study_id, &dir, &mut backend, &cancel, &state.study_jobs, &state.study_events, taps, Some(&seal));
+    let status = state.study_jobs.lock().unwrap().get(&study_id).map(|j| (j.status.clone(), j.reason.clone()));
+    match status {
+        Some((s, _)) if s == "completed" => Ok(RanStudy { study_id, dir, cancelled: cancel.load(Ordering::SeqCst) }),
+        Some((_, reason)) => Err(reason.unwrap_or_else(|| "the study's record could not be sealed".into())),
+        None => Err("the study's job vanished".into()),
+    }
+}
+
 // ---- the per-pass line-count view (core/116) ---------------------------------
 
 #[derive(Debug, Serialize)]

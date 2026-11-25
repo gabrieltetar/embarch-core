@@ -32,6 +32,7 @@ mod outpost_preflight;
 mod port_hold;
 mod publish;
 mod stream_store;
+mod test_executor;
 mod test_runs;
 mod study;
 mod token_store;

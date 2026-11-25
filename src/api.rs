@@ -80,6 +80,10 @@ pub struct AppState {
     pub definitions: crate::definitions::Definitions,
     /// The hash-chained log of every gated call (`call_log.rs`, decision 122).
     pub call_log: crate::call_log::CallLog,
+    /// Each started Test run's progress, for `GET /test-runs/{run_id}` (`test_executor.rs`, decision 136).
+    pub test_progress: crate::test_executor::ProgressBook,
+    /// Whether a go starts the executor. Off in the unit tests whose go has no bench behind it.
+    pub run_executor: bool,
 }
 
 impl AppState {
@@ -87,7 +91,9 @@ impl AppState {
     #[cfg(test)]
     pub fn new(token: String) -> Self {
         let person = format!("person-{token}");
-        Self::with_tokens(crate::token_store::Tokens { agent: token, person }, crate::signing::Sealer::ephemeral(), crate::run_log::RunLog::temp())
+        let mut s = Self::with_tokens(crate::token_store::Tokens { agent: token, person }, crate::signing::Sealer::ephemeral(), crate::run_log::RunLog::temp());
+        s.run_executor = false;
+        s
     }
 
     /// Constructs the `/study*`-only fields fresh — kept here so
@@ -118,6 +124,8 @@ impl AppState {
             run_lock,
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
             study_events,
+            test_progress: Arc::new(StdMutex::new(Default::default())),
+            run_executor: true,
         }
     }
 }
@@ -231,6 +239,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/confirmations/{hash}/card", get(confirmations::card_handler))
         .route("/confirmations", post(confirmations::confirm_handler))
         .route("/test-runs", post(test_runs::prepare_handler))
+        .route("/test-runs/{run_id}", get(test_runs::status_handler))
         .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
         .route("/test-runs/{run_id}/go", post(test_runs::go_handler))
         .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
@@ -334,12 +343,15 @@ async fn lease_middleware(
     if gated {
         // A Test run holds the bench from its go to its end, the gaps between its studies too, and
         // refuses the session's own token. The executor's calls (a setup call between benches,
-        // EMB-366) are admitted here, by `RUN_ADMITTED`, and nowhere else (decision 135).
+        // EMB-366) are admitted here, by `RUN_ADMITTED`, and nowhere else (decision 135). An
+        // admitted route is let through whole: the run holds the lease, so no token is asked.
         let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
-        if let Some(id) = state.run_lock.lock().unwrap().as_deref() {
+        let running = state.run_lock.lock().unwrap().clone();
+        if let Some(id) = running {
             if !matched.is_some_and(|m| RUN_ADMITTED.contains(&m)) {
-                return (StatusCode::CONFLICT, lease::run_refusal(id)).into_response();
+                return (StatusCode::CONFLICT, lease::run_refusal(&id)).into_response();
             }
+            return next.run(req).await;
         }
         if let Err(view) = state.lease.admit(lease_token(req.headers())) {
             return (StatusCode::CONFLICT, view.refusal()).into_response();
@@ -356,9 +368,11 @@ async fn lease_middleware(
     next.run(req).await
 }
 
-/// The lease-gated routes a running Test run still admits: empty until the executor (EMB-366)
-/// names its setup calls between benches. Seam, decision 135.
-const RUN_ADMITTED: &[&str] = &[];
+/// The lease-gated routes a running Test run still admits (decisions 135, 136): the cancel of a
+/// study, which stops the run's study and so the run. The setup calls between benches (Make
+/// live's declarations, an enrolment) are not named: the executor does not stop between benches
+/// to wait for them in this phase (decision 136, open).
+const RUN_ADMITTED: &[&str] = &[STUDY_CANCEL_ROUTE];
 
 /// The one lease-gated route a running study still admits (decision 95).
 const STUDY_CANCEL_ROUTE: &str = "/study/{study_id}/cancel";
@@ -3225,6 +3239,7 @@ mod tests {
         ("GET", "/confirmations/{hash}/card", "/confirmations/abc/card"),
         ("POST", "/confirmations", "/confirmations"),
         ("POST", "/test-runs", "/test-runs"),
+        ("GET", "/test-runs/{run_id}", "/test-runs/abc"),
         ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
         ("POST", "/test-runs/{run_id}/go", "/test-runs/abc/go"),
         ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
@@ -3286,7 +3301,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 63;
+    const DOCUMENTED_ROUTE_COUNT: usize = 64;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -4138,6 +4153,7 @@ mod tests {
         ("GET", "/suites"),
         ("GET", "/confirmations/pending"),
         ("POST", "/test-runs"),
+        ("GET", "/test-runs/{run_id}"),
         ("GET", "/test-runs/{run_id}/card"),
         ("POST", "/test-runs/{run_id}/cancel"),
         ("GET", "/run-log"),
