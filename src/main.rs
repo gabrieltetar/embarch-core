@@ -31,6 +31,8 @@ mod outpost_manifest;
 mod outpost_preflight;
 mod port_hold;
 mod publish;
+#[allow(dead_code)] // the smoke check and the run record call it; decision 142
+mod readback;
 mod stream_store;
 mod test_executor;
 mod test_runs;
