@@ -312,7 +312,7 @@ pub struct SealJob {
     pub build: Option<BuildClaims>,
     /// The scope of the token that submitted the study: what a measurement's
     /// `study_value` declaration was made with (decision 113). `None` for a host
-    /// study, which declares none.
+    /// study, whose parses declare no `study_value` (decision 131).
     pub submitted_by: Option<Scope>,
     /// The call log as the run began; `None` seals without a call-log range.
     pub calls: Option<crate::call_log::RunCalls>,

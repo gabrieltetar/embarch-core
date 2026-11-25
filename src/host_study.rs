@@ -340,6 +340,10 @@ pub struct StepRecord {
     /// which config was confirmed beside who confirmed it and when. Absent when it named none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bench_config: Option<String>,
+    /// The number the step's `parse` read out of the recorded reply (decision 131); absent when
+    /// the step declares none or no reply came back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsed: Option<crate::host_parse::Parsed>,
 }
 
 /// How a run ended. `completed` is whether every step ran and none stopped the study.
@@ -524,6 +528,7 @@ fn run_step<B: HostBackend>(
         prompt_id: None,
         prompt_deadline_utc_ms: None,
         bench_config: None,
+        parsed: None,
     };
     if !delayed {
         rec.result.outcome = fail("cancelled before the step ran");
@@ -536,7 +541,7 @@ fn run_step<B: HostBackend>(
                     rec.detail = detail::CANCELLED;
                 }
             }
-            HostAction::Exchange { signal, line, until, match_after_echo, refused_on, .. } => {
+            HostAction::Exchange { signal, line, until, match_after_echo, refused_on, parse } => {
                 let req = ExchangeRequest {
                     write: format!("{line}\n"),
                     until: Some(until.clone()),
@@ -558,6 +563,9 @@ fn run_step<B: HostBackend>(
                         rec.until_seen = resp.until_seen;
                         rec.echo_seen = resp.echo_seen;
                         rec.port_lost = resp.port_lost;
+                        rec.parsed = parse.as_ref().map(|p| {
+                            crate::host_parse::read(p, &rec.result.reply, rec.result.reply_truncated, crate::host_parse::Addressed::Signal(signal.clone()))
+                        });
                     }
                     Err(ExchangeFailure::PortUnavailable(msg)) => {
                         rec.result.outcome = fail("the signal's port is not available");
@@ -571,7 +579,7 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            HostAction::Instrument { instrument, line, query, .. } => {
+            HostAction::Instrument { instrument, line, query, parse } => {
                 let req = InstrumentExchange { line: line.clone(), query: *query, timeout_ms: step.timeout_ms as u64, port_wait_ms: 0 };
                 match backend.instrument(instrument, req) {
                     Ok(r) => {
@@ -584,6 +592,9 @@ fn run_step<B: HostBackend>(
                         rec.note = note;
                         rec.reply_bytes = r.reply.len();
                         rec.until_seen = r.terminated;
+                        rec.parsed = parse.as_ref().map(|p| {
+                            crate::host_parse::read(p, &rec.result.reply, rec.result.reply_truncated, crate::host_parse::Addressed::Instrument(instrument.clone()))
+                        });
                     }
                     Err(ExchangeFailure::PortUnavailable(msg)) => {
                         rec.result.outcome = fail("the instrument's port is not available");
@@ -1134,6 +1145,23 @@ pub fn run_job<B: HostBackend>(
     taps: Option<StudyTaps>,
     seal: Option<&crate::signing::SealJob>,
 ) {
+    run_job_with_origin(study, study_id, dir, backend, cancel, jobs, events_tx, taps, seal, &crate::measurements::topology_signal_origin)
+}
+
+/// [`run_job`] with the resolver of a signal's origin given, so a test names the bench.
+#[allow(clippy::too_many_arguments)]
+fn run_job_with_origin<B: HostBackend>(
+    study: &HostStudy,
+    study_id: &str,
+    dir: &FsPath,
+    backend: &mut B,
+    cancel: &AtomicBool,
+    jobs: &JobRegistry,
+    events_tx: &broadcast::Sender<StudyEvent>,
+    taps: Option<StudyTaps>,
+    seal: Option<&crate::signing::SealJob>,
+    signal_origin: &dyn Fn(&str) -> Option<crate::measurements::SignalOrigin>,
+) {
     let mut writer = match HostEventsWriter::start(dir, &study.name) {
         Ok(w) => w,
         Err(e) => {
@@ -1152,7 +1180,16 @@ pub fn run_job<B: HostBackend>(
     }
     let clock = taps.as_ref().map(|t| t.clock).unwrap_or_else(StudyClock::new);
     let mut write_err: Option<String> = None;
+    let mut parses: Vec<crate::host_parse::Collected> = Vec::new();
     let end = execute(study, backend, cancel, clock, |rec| {
+        if let Some(parsed) = &rec.parsed {
+            parses.push(crate::host_parse::Collected {
+                step: rec.result.step_name.clone(),
+                iteration: rec.result.iteration.clone(),
+                at_utc_ms: rec.ended_utc_ms,
+                parsed: parsed.clone(),
+            });
+        }
         if let Err(e) = writer.step(&rec) {
             write_err.get_or_insert(format!("{e:#}"));
         }
@@ -1180,6 +1217,13 @@ pub fn run_job<B: HostBackend>(
     }
     if let Err(e) = writer.finish(&end, &streams) {
         crate::study::fail_job(jobs, events_tx, study_id, format!("failed to finalize events.json: {e:#}"));
+        return;
+    }
+    // Before the record is signed, so it is a subject of it (decision 131).
+    let fallback = crate::signing::Declarations::new();
+    let declarations = seal.map_or(&fallback, |s| s.sealer.declarations());
+    if let Err(e) = crate::host_parse::write(dir, study_id, &parses, signal_origin, declarations) {
+        crate::study::fail_job(jobs, events_tx, study_id, format!("failed to write measurements.json: {e:#}"));
         return;
     }
     // Signed before the job reads as completed (decision 110).
@@ -1608,7 +1652,7 @@ mod tests {
             (self.before)(self.calls);
             self.calls += 1;
             let reply = self.replies.pop_front().unwrap_or(Ok(vec![]))?;
-            let mut port = Port { reads: VecDeque::from([reply]), wrote: vec![] };
+            let mut port = Port { reads: reply.chunks(512).map(<[u8]>::to_vec).collect(), wrote: vec![] };
             let got = crate::exchange::exchange_with(
                 &mut port,
                 req.write.as_bytes(),
@@ -2709,5 +2753,121 @@ mod tests {
         // A tap the study never declared is a 400.
         let bad = vec![embarch_study_designer::LineCount { name: "n".into(), tap: "nope".into(), pattern: "x".into(), kind: Default::default() }];
         assert_eq!(render_counts_for(dir.path(), "s1", Some(bad)).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- a step's declared number (decision 131) ----
+
+    use crate::measurements::SignalOrigin;
+
+    fn parse(name: &str) -> Option<embarch_study_designer::host_study::StepParse> {
+        Some(embarch_study_designer::host_study::StepParse { name: name.into(), pattern: r"vbus: (\S+) mV".into(), unit: "mV".into() })
+    }
+
+    fn parsing_ex(name: &str, signal: &str, parse_as: &str) -> HostStep {
+        let mut st = ex(name, "vbus?", "pd: ");
+        if let HostAction::Exchange { signal: sig, parse: p, .. } = &mut st.action {
+            *sig = signal.into();
+            *p = parse(parse_as);
+        }
+        st
+    }
+
+    fn parsing_inst(name: &str, parse_as: &str) -> HostStep {
+        let mut st = inst(name, "MEAS:VOLT?", true);
+        if let HostAction::Instrument { parse: p, .. } = &mut st.action {
+            *p = parse(parse_as);
+        }
+        st
+    }
+
+    /// Runs `s` to disk with the origin of every signal given; the two files it wrote.
+    fn run_to_disk(s: &HostStudy, b: &mut Script, origin: &dyn Fn(&str) -> Option<SignalOrigin>) -> (serde_json::Value, Option<serde_json::Value>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs: JobRegistry = Default::default();
+        jobs.lock().unwrap().insert("id1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: Some(1), reason: None });
+        let (tx, _rx) = broadcast::channel(16);
+        let seal = crate::signing::SealJob { sealer: crate::signing::Sealer::ephemeral(), kind: "host", build: None, submitted_by: None, calls: None };
+        run_job_with_origin(s, "id1", dir.path(), b, &AtomicBool::new(false), &jobs, &tx, None, Some(&seal), origin);
+        assert_eq!(jobs.lock().unwrap().get("id1").unwrap().status, "completed");
+        let read = |f: &str| std::fs::read(dir.path().join(f)).ok().map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap());
+        let env = read(crate::signing::RECORD_FILE).unwrap();
+        use base64::Engine as _;
+        let st: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap()).unwrap()).unwrap();
+        let subjects = st["subject"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_string()).collect();
+        (read("events.json").unwrap(), read("measurements.json"), subjects)
+    }
+
+    fn vbus_reply(v: &str) -> Result<Vec<u8>, ExchangeFailure> {
+        Ok(format!("vbus?\r\nvbus: {v} mV\r\npd: ").into_bytes())
+    }
+
+    #[test]
+    fn a_dut_signals_parse_is_recorded_beside_its_reply_and_measured_by_the_dut() {
+        let s = study(vec![parsing_ex("read", "pd", "vbus")], vec![]);
+        let mut b = Script::new(vec![vbus_reply("5012")]);
+        let (events, m, subjects) = run_to_disk(&s, &mut b, &|_| Some(SignalOrigin::Role("dut".into())));
+        assert_eq!(events["steps"][0]["parsed"], serde_json::json!({"name": "vbus", "value": 5012.0}));
+        assert!(events["steps"][0]["reply"].as_str().unwrap().contains("vbus: 5012 mV"));
+        let m = m.unwrap();
+        assert_eq!(m["behaviours"], serde_json::json!({}));
+        let one = &m["measurements"][0];
+        assert_eq!((one["name"].clone(), one["value"].clone(), one["unit"].clone()), ("vbus".into(), 5012.into(), "mV".into()));
+        assert_eq!((one["by"].clone(), one["instrument"].clone(), one["bench_image"].clone()), ("dut".into(), serde_json::Value::Null, serde_json::Value::Null));
+        assert_eq!(one["method"], serde_json::json!({"kind": "parse", "pattern": r"vbus: (\S+) mV"}));
+        assert_eq!(one["source"], serde_json::json!({"file": "events.json", "step": "read"}));
+        assert_eq!((one["u_source"].clone(), one["uncertainty"].clone(), one["incomplete"].clone()), ("undeclared".into(), serde_json::Value::Null, serde_json::json!([])));
+        assert!(subjects.contains(&"measurements.json".to_string()), "{subjects:?}");
+    }
+
+    #[test]
+    fn a_bench_boards_signal_and_an_instrument_are_measured_by_the_bench_and_named() {
+        let s = study(vec![parsing_ex("board", "pd", "a"), parsing_inst("meter", "b")], vec![]);
+        let mut b = Script::new(vec![vbus_reply("5")]);
+        b.instrument_replies = VecDeque::from([Ok(("R vbus: 7 mV", true, None))]);
+        let (_, m, _) = run_to_disk(&s, &mut b, &|_| Some(SignalOrigin::Board("0671FF".into())));
+        let m = m.unwrap();
+        let (board, meter) = (&m["measurements"][0], &m["measurements"][1]);
+        assert_eq!(board["by"], "bench");
+        assert_eq!(board["instrument"], serde_json::json!({"name": "0671FF", "kind": "board", "identity": null}));
+        assert_eq!(board["bench_image"], "unverified");
+        assert_eq!(meter["by"], "bench");
+        assert_eq!(meter["instrument"], serde_json::json!({"name": "eload", "kind": "instrument", "identity": null}));
+        assert_eq!(meter["bench_image"], serde_json::Value::Null);
+        assert_eq!(meter["value"], 7);
+        // A role other than the DUT's is a bench board too.
+        let s = study(vec![parsing_ex("board", "pd", "a")], vec![]);
+        let (_, m, _) = run_to_disk(&s, &mut Script::new(vec![vbus_reply("5")]), &|_| Some(SignalOrigin::Role("pd-bench".into())));
+        assert_eq!(m.unwrap()["measurements"][0]["instrument"]["name"], "pd-bench");
+    }
+
+    #[test]
+    fn a_cut_reply_is_truncated_reply_and_a_reply_with_no_number_is_null_and_parse_failed() {
+        let s = study(vec![parsing_ex("none", "pd", "a"), parsing_ex("cut", "pd", "b")], vec![]);
+        let long = format!("vbus?\r\nvbus: 12 mV\r\n{}\r\npd: ", "x".repeat(MAX_HOST_REPLY_LEN));
+        let mut b = Script::new(vec![Ok(b"vbus?\r\nerror no partner\r\npd: ".to_vec()), Ok(long.into_bytes())]);
+        let (events, m, _) = run_to_disk(&s, &mut b, &|_| Some(SignalOrigin::Role("dut".into())));
+        assert_eq!(events["steps"][0]["parsed"], serde_json::json!({"name": "a", "value": null, "incomplete": ["parse_failed"]}));
+        assert_eq!(events["steps"][1]["parsed"]["incomplete"], serde_json::json!(["truncated_reply"]));
+        let m = m.unwrap();
+        assert_eq!((m["measurements"][0]["value"].clone(), m["measurements"][0]["incomplete"].clone()), (serde_json::Value::Null, serde_json::json!(["parse_failed"])));
+        assert_eq!(m["measurements"][1]["incomplete"], serde_json::json!(["truncated_reply"]));
+    }
+
+    #[test]
+    fn a_host_study_with_no_parse_writes_no_measurements_file() {
+        let s = study(vec![ex("a", "x", "pd: ")], vec![]);
+        let (events, m, subjects) = run_to_disk(&s, &mut Script::new(vec![ok_reply("x", "pd: ok")]), &|_| None);
+        assert!(m.is_none() && events["steps"][0].get("parsed").is_none());
+        assert!(!subjects.contains(&"measurements.json".to_string()));
+    }
+
+    #[test]
+    fn a_pass_of_a_repeat_says_which_pass_its_number_came_from() {
+        let s = study(vec![repeat_step("r", Some(2), &[], vec![parsing_ex("read", "pd", "vbus")])], vec![]);
+        let mut b = Script::new(vec![vbus_reply("1"), vbus_reply("2")]);
+        let (_, m, _) = run_to_disk(&s, &mut b, &|_| Some(SignalOrigin::Role("dut".into())));
+        let m = m.unwrap();
+        let passes: Vec<_> = m["measurements"].as_array().unwrap().iter().map(|x| (x["value"].clone(), x["source"]["iteration"]["pass"].clone())).collect();
+        assert_eq!(passes, [(1.into(), 0.into()), (2.into(), 1.into())]);
     }
 }

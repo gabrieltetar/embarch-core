@@ -70,15 +70,39 @@ pub fn write(ended: &Ended) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let doc = compute(ended)?;
-    let path = ended.results_dir.join(FILE);
-    let tmp = ended.results_dir.join(format!("{FILE}.partial"));
-    std::fs::write(&tmp, serde_json::to_vec(&doc)?).with_context(|| format!("failed to write {}", tmp.display()))?;
+    write_file(ended.results_dir, &doc).map(Some)
+}
+
+/// Writes `doc` as the run's `measurements.json`, through a `.partial` renamed into place.
+pub(crate) fn write_file(results_dir: &Path, doc: &Value) -> Result<PathBuf> {
+    let path = results_dir.join(FILE);
+    let tmp = results_dir.join(format!("{FILE}.partial"));
+    std::fs::write(&tmp, serde_json::to_vec(doc)?).with_context(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("failed to finalize {}", path.display()))?;
-    Ok(Some(path))
+    Ok(path)
+}
+
+/// Where a declared signal leaves, read live from topology; `None` when it is not declared.
+pub(crate) fn topology_signal_origin(name: &str) -> Option<SignalOrigin> {
+    let link = embarch_topology::hardware::find_signal(name).ok().flatten()?;
+    Some(match link.origin() {
+        embarch_topology::hardware::SignalOrigin::Role(role) => SignalOrigin::Role(role.to_string()),
+        embarch_topology::hardware::SignalOrigin::Board { probe_serial } => SignalOrigin::Board(probe_serial.to_string()),
+    })
+}
+
+/// An `incomplete` mark as the file spells it.
+pub(crate) fn incomplete_str(i: Incomplete) -> &'static str {
+    match i {
+        Incomplete::TruncatedCapture => "truncated_capture",
+        Incomplete::TruncatedReply => "truncated_reply",
+        Incomplete::RecordGap => "record_gap",
+        Incomplete::ParseFailed => "parse_failed",
+    }
 }
 
 /// One integer where the value is one, because RFC 8785 prints `5`, not `5.0`.
-fn num(x: f64) -> Value {
+pub(crate) fn num(x: f64) -> Value {
     if x.is_finite() && x.fract() == 0.0 && x.abs() < 1e15 {
         Value::from(x as i64)
     } else {
@@ -306,16 +330,7 @@ fn measurement_json(
         window.insert("to_marker".into(), json!(x));
     }
 
-    let incomplete: Vec<&str> = m
-        .incomplete
-        .iter()
-        .map(|i| match i {
-            Incomplete::TruncatedCapture => "truncated_capture",
-            Incomplete::TruncatedReply => "truncated_reply",
-            Incomplete::RecordGap => "record_gap",
-            Incomplete::ParseFailed => "parse_failed",
-        })
-        .collect();
+    let incomplete: Vec<&str> = m.incomplete.iter().map(|i| incomplete_str(*i)).collect();
 
     let mut v = json!({
         "name": decl.name.as_str(),

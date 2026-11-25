@@ -2868,15 +2868,6 @@ fn write_measurements(
         return Ok(());
     }
     let fallback = crate::signing::Declarations::new();
-    let signal_origin = |name: &str| {
-        let link = embarch_topology::hardware::find_signal(name).ok().flatten()?;
-        Some(match link.origin() {
-            embarch_topology::hardware::SignalOrigin::Role(role) => crate::measurements::SignalOrigin::Role(role.to_string()),
-            embarch_topology::hardware::SignalOrigin::Board { probe_serial } => {
-                crate::measurements::SignalOrigin::Board(probe_serial.to_string())
-            }
-        })
-    };
     crate::measurements::write(&crate::measurements::Ended {
         study: &capture.study,
         results_dir,
@@ -2885,7 +2876,7 @@ fn write_measurements(
         submitted_by: seal.and_then(|s| s.submitted_by).unwrap_or(crate::token_store::Scope::Agent),
         ended_utc_ms: current_utc_ms(),
         declarations: seal.map_or(&fallback, |s| s.sealer.declarations()),
-        signal_origin: &signal_origin,
+        signal_origin: &crate::measurements::topology_signal_origin,
     })
     .map(|_| ())
 }
