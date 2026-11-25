@@ -177,6 +177,18 @@ pub fn open_samples_port(
     Ok(OpenedSamples { port_name, port, claim })
 }
 
+/// The enrolled bench's samples port among the ports the OS lists now, found but
+/// not opened: a session study (decision 127) asks it before its Start prompt, so
+/// a bench with no samples port is refused before a person fills anything in.
+/// Blocking: call from `spawn_blocking`.
+pub fn find_enrolled_samples_port() -> Result<String, SamplesPortRefusal> {
+    let control = embarch_topology::hardware::dev_bench_control_port()
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("couldn't read the dev bench's recorded control port: {e:#}")))?;
+    let ports = serialport::available_ports()
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to enumerate serial ports: {e:#}")))?;
+    find_samples_port(control.as_ref(), &ports)
+}
+
 /// The real thing: the enrolled bench's recorded identity against the ports
 /// the OS lists now, opened exclusively. Blocking: call from `spawn_blocking`.
 pub fn open_enrolled_samples_port(tap_ports: &TapPorts) -> Result<OpenedSamples, SamplesPortRefusal> {

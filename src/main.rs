@@ -19,6 +19,7 @@ mod live;
 mod logs;
 mod measurements;
 mod serial;
+mod session_run;
 mod service;
 mod run_log;
 mod signing;

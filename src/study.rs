@@ -1521,6 +1521,13 @@ pub async fn post_study_handler(
         }
     }
 
+    // A study with a session raises its Start prompt before anything is sent to the bench
+    // (decision 127), which takes a person's time, so it answers `202` first and does the rest
+    // on its own task. Everything above has already refused what it could.
+    if study.session.is_some() {
+        return start_session_study(&state, scope, study, run, seal, study_id, link, hello).await;
+    }
+
     // ---- the dev bench's samples port, for a study with an analog source ----
     //
     // **Before `StudyStart`, for two reasons.** A bench whose samples port
@@ -1660,6 +1667,7 @@ pub async fn post_study_handler(
                 analog_samples,
                 study_start_utc_ms,
                 seal,
+                None,
             )
         })
         .await;
@@ -1679,6 +1687,190 @@ pub async fn post_study_handler(
     });
 
     Ok((StatusCode::ACCEPTED, Json(StudyAcceptedResponse { study_id, status: "accepted" })))
+}
+
+// ---- a study with a session (decision 127) ----------------------------------
+
+/// What a session study's run needs beyond a plain one: the prompter that raised its Start, the
+/// session it declared, the record being kept beside the results and when the bench was started.
+struct SessionRun {
+    prompter: crate::session_run::SessionPrompter,
+    spec: embarch_study_designer::SessionSpec,
+    record: crate::session_run::SessionRecord,
+    /// When `StudyStart` went out: the cap runs from here.
+    sampling_started: Instant,
+}
+
+/// `StudyStart` as the bench is sent it: the same fields, in the same way, as the plain path's
+/// closure in [`post_study_handler`]. `validations`, `requires`, `session` and the rest of what is
+/// host-only never ride along.
+fn study_start_message(study: &Study) -> DevBenchMessage {
+    DevBenchMessage::StudyStart {
+        steps: study.steps.clone(),
+        steps_crc: study.steps_crc,
+        streams: study.streams.clone(),
+        streams_crc: study.streams_crc,
+        dev_bench_log_level: study.dev_bench_log_level,
+        protocols: study.protocols.clone(),
+        protocols_crc: study.protocols_crc,
+    }
+}
+
+/// The rest of `POST /study` for a study with a session: refuse what can be refused without a
+/// person (a bench with no samples port, a version the study does not accept), register the job,
+/// answer `202`, and leave the Start prompt, the samples port, `StudyStart` and the run to a task.
+///
+/// **The link is held open while the Start prompt waits**, which can be minutes. Whether the dev
+/// bench's link and the DUT stay up that long idle is not established by reading code and is owed
+/// to a bench run. The gate runs here, with no `StudyStart` behind it, so a version mismatch is
+/// still a `409` before anyone is asked anything.
+#[allow(clippy::too_many_arguments)]
+async fn start_session_study(
+    state: &AppState,
+    scope: crate::token_store::Scope,
+    study: Study,
+    run: StudyRunParams,
+    seal: crate::signing::SealJob,
+    study_id: String,
+    link: DevBenchLink,
+    hello: HelloAckInfo,
+) -> Result<(StatusCode, Json<StudyAcceptedResponse>), (StatusCode, String)> {
+    let release_lock = || {
+        *state.study_lock.lock().unwrap() = None;
+    };
+    if study_has_analog_source(&study) {
+        match tokio::task::spawn_blocking(crate::analog_source::find_enrolled_samples_port).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(refusal)) => {
+                release_lock();
+                return Err((refusal.status, refusal.reason));
+            }
+            Err(e) => {
+                release_lock();
+                return Err(internal_err(e));
+            }
+        }
+    }
+    let overrides = match gate_then_start(&study.requires, &hello.dev_bench_version, &run, || Ok(())) {
+        Ok(overrides) => overrides,
+        Err(rejection) => {
+            release_lock();
+            return Err(rejection);
+        }
+    };
+    let provenance = provenance_for(&study, &hello.dev_bench_version, &run, overrides);
+
+    {
+        state.run_log.begin(&study_id, "device", scope);
+        state.study_jobs.lock().unwrap().insert(
+            study_id.clone(),
+            StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(study.steps.len() as u32), reason: None },
+        );
+    }
+
+    let jobs = state.study_jobs.clone();
+    let study_lock = state.study_lock.clone();
+    let lease_slot = state.lease.clone();
+    let events_tx = state.study_events.clone();
+    let manifest_slot = state.outpost_manifest.clone();
+    let tap_ports = state.tap_ports.clone();
+    let prompts = state.host_prompt.clone();
+    let id = study_id.clone();
+
+    tokio::spawn(async move {
+        let jobs_for_panic = jobs.clone();
+        let events_tx_for_panic = events_tx.clone();
+        let id_for_panic = id.clone();
+        let prompts_for_end = prompts.clone();
+        let prompter = crate::session_run::SessionPrompter::new(prompts, events_tx.clone(), id.clone());
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_session_study(link, study, id, jobs, events_tx, provenance, manifest_slot, tap_ports, prompter, seal)
+        })
+        .await;
+
+        if let Err(join_err) = outcome {
+            fail_job(&jobs_for_panic, &events_tx_for_panic, &id_for_panic, format!("background study task panicked: {join_err:?}"));
+        }
+        // Whatever ended the study, no prompt of it stays on screen.
+        *prompts_for_end.lock().unwrap() = None;
+        lease_slot.study_ended();
+        *study_lock.lock().unwrap() = None;
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(StudyAcceptedResponse { study_id, status: "accepted" })))
+}
+
+/// A session study's run on its blocking thread: raise Start and wait, then open the samples port
+/// (**after** the answer, not before: the OS's stale input is cleared when it opens, and a person
+/// may take minutes), send `StudyStart`, and hand over to [`run_study_to_completion`].
+///
+/// A Start that is cancelled or never answered fails the job with that reason; nothing was sent
+/// to the bench and no results directory was made. `StudyStart` failing here is `failed` on the
+/// job, where the plain path answers `502` synchronously, because the `202` has gone.
+#[allow(clippy::too_many_arguments)]
+fn run_session_study(
+    mut link: DevBenchLink,
+    study: Study,
+    study_id: String,
+    jobs: JobRegistry,
+    events_tx: broadcast::Sender<StudyEvent>,
+    provenance: Provenance,
+    manifest_slot: crate::outpost_manifest::ManifestSlot,
+    tap_ports: TapPorts,
+    prompter: crate::session_run::SessionPrompter,
+    seal: crate::signing::SealJob,
+) {
+    use crate::session_run::{SessionRecord, StartOutcome, START_TIMEOUT};
+    let Some(spec) = study.session.clone() else {
+        fail_job(&jobs, &events_tx, &study_id, "a session run was started for a study with no session".to_string());
+        return;
+    };
+    let (run_values, answered_by, answered_utc_ms) = match prompter.raise_start(&spec, START_TIMEOUT) {
+        StartOutcome::Confirmed { run_values, answered_by, answered_utc_ms } => (run_values, answered_by, answered_utc_ms),
+        StartOutcome::Cancelled(by) => {
+            fail_job(&jobs, &events_tx, &study_id, format!("the session's Start prompt was cancelled (from {}); nothing was sent to the dev bench", by.as_str()));
+            return;
+        }
+        StartOutcome::TimedOut => {
+            fail_job(&jobs, &events_tx, &study_id, "no one answered the session's Start prompt within an hour; nothing was sent to the dev bench".to_string());
+            return;
+        }
+    };
+
+    let analog_samples = if study_has_analog_source(&study) {
+        match crate::analog_source::open_enrolled_samples_port(&tap_ports) {
+            Ok(opened) => Some(opened),
+            Err(refusal) => {
+                fail_job(&jobs, &events_tx, &study_id, format!("{} (after the Start prompt was answered; nothing was sent to the dev bench)", refusal.reason));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(e) = link.send(&study_start_message(&study)) {
+        fail_job(&jobs, &events_tx, &study_id, format!("failed to send StudyStart to dev-bench: {e:?}"));
+        return;
+    }
+    let sampling_started = Instant::now();
+    let study_start_utc_ms = current_utc_ms();
+    let record = SessionRecord::new(&spec, &run_values, answered_by, answered_utc_ms);
+    run_study_to_completion(
+        link,
+        study,
+        study_id,
+        jobs,
+        events_tx,
+        provenance,
+        manifest_slot,
+        tap_ports,
+        analog_samples,
+        study_start_utc_ms,
+        seal,
+        Some(SessionRun { prompter, spec, record, sampling_started }),
+    );
 }
 
 // ---- background task: run to completion, receiving results ---------------
@@ -1826,6 +2018,7 @@ fn run_study_to_completion(
     analog_samples: Option<crate::analog_source::OpenedSamples>,
     study_start_utc_ms: u64,
     seal: crate::signing::SealJob,
+    mut session: Option<SessionRun>,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -1854,6 +2047,16 @@ fn run_study_to_completion(
                 &study_id,
                 format!("failed to mark the session's recording as exempt from retention: {e:?}"),
             );
+            return;
+        }
+    }
+
+    // The run fields the person answered, beside the results before a byte is captured, so a run
+    // that fails still says what it was (decision 127).
+    if let Some(run) = session.as_mut() {
+        run.record.sampling_started_utc_ms = Some(study_start_utc_ms);
+        if let Err(e) = run.record.write(&results_dir) {
+            fail_job(&jobs, &events_tx, &study_id, format!("failed to save the session's run fields: {e:?}"));
             return;
         }
     }
@@ -2052,8 +2255,25 @@ fn run_study_to_completion(
         return;
     }
 
+    // The Done prompt goes up as sampling begins, and the cap runs from `StudyStart` (decision 127).
+    let mut session = session.map(|run| (run.prompter.begin_sampling(&run.spec, run.sampling_started), run.record));
+    let mut session_end: Option<crate::session_run::SessionEnd> = None;
+
     let outcome = loop {
-        match link.recv(deadline) {
+        // A session's Done answer and its cap are looked at before every receive, and the receive
+        // is cut to one poll so neither waits on a quiet bench.
+        let recv_deadline = match &session {
+            Some((watch, _)) => {
+                let now = Instant::now();
+                if let Some(end) = watch.poll(now) {
+                    session_end = Some(end);
+                    break Ok(());
+                }
+                watch.recv_deadline(deadline, now)
+            }
+            None => deadline,
+        };
+        match link.recv(recv_deadline) {
             Ok(Received::Message(DevBenchMessage::StepResult { step_index, result })) => {
                 let step_ended_utc_ms = current_utc_ms();
                 // `delay_before_ms` comes from the `Study` Core is holding, so
@@ -2340,6 +2560,8 @@ fn run_study_to_completion(
                     ));
                 }
             }
+            // Only the session's poll slice or its cap ran out: the watchdog's own deadline has not.
+            Ok(Received::Deadline) if session.is_some() && Instant::now() < deadline => continue,
             Ok(Received::Deadline) => {
                 // **What arrived and never became a frame goes in the failure
                 // reason, because on this link that text *is* the diagnosis.**
@@ -2383,6 +2605,20 @@ fn run_study_to_completion(
     // Whatever happened, Core's own ports close and the capture's `streams`
     // are sealed into the writer before the job's status is decided.
     stop_signal_taps(&mut signal_taps);
+    // The session ends here: the Done prompt resolves so the person sees the end, and how it
+    // ended joins the run fields beside the results. A failed write is not a failed capture.
+    if let Some((watch, mut record)) = session.take() {
+        let end = session_end.unwrap_or(if outcome.is_ok() {
+            crate::session_run::SessionEnd::StudyDone
+        } else {
+            crate::session_run::SessionEnd::Failed
+        });
+        watch.resolve(end);
+        record.end(end, current_utc_ms());
+        if let Err(e) = record.write(&results_dir) {
+            tracing::warn!(study_id, "failed to record how the session ended in session.json: {e:?}");
+        }
+    }
     let refs = finish_streams(&capture, &mut writer, &results_dir);
     // On the failure path too: a study that stopped early still captured
     // whatever ran before it did, and a trace of the run that went wrong is

@@ -44,7 +44,7 @@ use crate::study::{JobRegistry, StudyAcceptedResponse, StudyEvent, StudyJob};
 pub const STUDY_FILE: &str = "study.json";
 
 /// What ends a step's wait or a `Wait`, polled this often so a cancel is seen within it.
-const CANCEL_POLL: Duration = Duration::from_millis(20);
+pub(crate) const CANCEL_POLL: Duration = Duration::from_millis(20);
 
 /// What a step's `detail` says, in one word each. `detail` is the machine-readable half of an
 /// outcome: the same `Fail` or `TimedOut` has several causes a caller must tell apart.
@@ -179,6 +179,11 @@ pub struct PendingPrompt {
     pub bench_config: Option<String>,
     pub opened_utc_ms: u64,
     pub deadline_utc_ms: u64,
+    /// Set only on a device study's session prompt (Start or Done, decision 127): which one, and
+    /// the run fields the Start prompt asks for. Absent on a host study's `Prompt`, so those
+    /// publish the bytes they did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::session_run::SessionPromptInfo>,
 }
 
 /// The one prompt slot: what is pending and, once a person has answered, the answer, which the
@@ -188,6 +193,9 @@ pub struct PromptSlot {
     pub study_id: String,
     pub pending: PendingPrompt,
     pub answer: Option<(PromptAnswer, AnsweredBy)>,
+    /// A device study's session prompt only: the session it is for, and the run fields a Start
+    /// answer carried once it was checked (decision 127).
+    pub session: Option<crate::session_run::SessionSlot>,
 }
 
 /// Shared by the executor and `POST /study/{id}/prompt`. One at a time, like `study_lock`.
@@ -229,21 +237,51 @@ pub struct PromptAnswerBody {
     pub prompt_id: u32,
     pub answer: PromptAnswer,
     pub answered_by: AnsweredBy,
+    /// The values for a session Start prompt's run fields (decision 127). Absent, or empty, for
+    /// every other prompt; a host study's `Prompt` refuses a non-empty list.
+    #[serde(default)]
+    pub run_fields: Vec<crate::session_run::RunFieldAnswer>,
 }
 
-/// Records `body` against `study_id`'s pending prompt. `Ok(false)` when that study has no prompt
+/// [`record_answer_scoped`] as the person's token, for the tests that do not care about scope.
+/// `Ok(false)` when that study has no prompt
 /// pending; `Err` (a `409`) for an answer to another prompt or to one already answered.
+#[cfg(test)]
 pub fn record_answer(slot: &HostPrompt, study_id: &str, body: &PromptAnswerBody) -> Result<bool, String> {
+    record_answer_scoped(slot, study_id, body, crate::token_store::Scope::Person).map_err(|(_, msg)| msg)
+}
+
+/// [`record_answer`] with the scope of the token that relayed the answer, and the status each
+/// refusal takes: `409` as above; `403` for an agent's token on a session Start prompt, `400` for
+/// run fields that fail `validate_run_answers`, for a Done prompt answered `cancelled`, or for run
+/// fields on a prompt that asks for none. A refused answer leaves the prompt pending, so the
+/// person can correct it. Everything is decided under the slot's one lock.
+pub fn record_answer_scoped(
+    slot: &HostPrompt,
+    study_id: &str,
+    body: &PromptAnswerBody,
+    scope: crate::token_store::Scope,
+) -> Result<bool, (StatusCode, String)> {
     let mut g = slot.lock().unwrap();
     let Some(s) = g.as_mut().filter(|s| s.study_id == study_id) else { return Ok(false) };
     if s.pending.prompt_id != body.prompt_id {
-        return Err(format!(
-            "prompt {} is not the one waiting: prompt {} is ('{}'), so this answer was meant for a prompt that already ended",
-            body.prompt_id, s.pending.prompt_id, s.pending.text
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "prompt {} is not the one waiting: prompt {} is ('{}'), so this answer was meant for a prompt that already ended",
+                body.prompt_id, s.pending.prompt_id, s.pending.text
+            ),
         ));
     }
     if let Some((answer, by)) = s.answer {
-        return Err(format!("prompt {} was already answered ({answer:?}, from {})", body.prompt_id, by.as_str()));
+        return Err((StatusCode::CONFLICT, format!("prompt {} was already answered ({answer:?}, from {})", body.prompt_id, by.as_str())));
+    }
+    match (s.session.as_mut(), s.pending.session.as_ref()) {
+        (Some(session), Some(info)) => session.check_answer(info.phase, body, scope)?,
+        _ if !body.run_fields.is_empty() => {
+            return Err((StatusCode::BAD_REQUEST, "this prompt asks for no run fields, so the answer must carry none".to_string()))
+        }
+        _ => {}
     }
     s.answer = Some((body.answer, body.answered_by));
     Ok(true)
@@ -335,7 +373,7 @@ impl StudyClock {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     crate::exchange::utc_ms()
 }
 
@@ -1214,8 +1252,9 @@ impl HostBackend for CoreBackend {
             bench_config: req.bench_config,
             opened_utc_ms: opened,
             deadline_utc_ms: opened + req.timeout_ms as u64,
+            session: None,
         };
-        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.study_id.clone(), pending: pending.clone(), answer: None });
+        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.study_id.clone(), pending: pending.clone(), answer: None, session: None });
         let _ = self.state.study_events.send(StudyEvent::PromptPending { study_id: self.study_id.clone(), prompt: pending.clone() });
         let end = wait_for_answer(&self.state.host_prompt, pending.prompt_id, Duration::from_millis(req.timeout_ms as u64), cancel);
         let _ = self.state.study_events.send(StudyEvent::PromptResolved {
@@ -1424,10 +1463,11 @@ pub struct PromptAnswerResponse {
 // route: POST /study/{study_id}/prompt
 pub async fn answer_prompt_handler(
     State(state): State<AppState>,
+    scope: crate::token_store::Scope,
     Path(study_id): Path<String>,
     Json(body): Json<PromptAnswerBody>,
 ) -> Result<Json<PromptAnswerResponse>, (StatusCode, String)> {
-    match record_answer(&state.host_prompt, &study_id, &body) {
+    match record_answer_scoped(&state.host_prompt, &study_id, &body, scope) {
         Ok(true) => {
             return Ok(Json(PromptAnswerResponse {
                 study_id,
@@ -1437,14 +1477,14 @@ pub async fn answer_prompt_handler(
                 status: "recorded",
             }))
         }
-        Err(msg) => return Err((StatusCode::CONFLICT, msg)),
+        Err(refusal) => return Err(refusal),
         Ok(false) => {}
     }
     let job = state.study_jobs.lock().unwrap().get(&study_id).cloned();
     match job {
         Some(j) if j.status == "running" => Err((
             StatusCode::CONFLICT,
-            format!("study '{study_id}' has no prompt waiting: it was answered, it timed out, or the study is a bench study"),
+            format!("study '{study_id}' has no prompt waiting: it was answered, it timed out, or the study is a bench study with no session"),
         )),
         Some(j) => Err((StatusCode::CONFLICT, format!("study '{study_id}' is not running (status: {}); there is no prompt to answer", j.status))),
         None => Err((StatusCode::NOT_FOUND, format!("no study '{study_id}' is known to this Core"))),
@@ -1777,12 +1817,13 @@ mod tests {
             bench_config: None,
             opened_utc_ms: 1,
             deadline_utc_ms: 2,
+            session: None,
         };
-        Arc::new(StdMutex::new(Some(PromptSlot { study_id: study_id.into(), pending, answer: None })))
+        Arc::new(StdMutex::new(Some(PromptSlot { study_id: study_id.into(), pending, answer: None, session: None })))
     }
 
     fn body(prompt_id: u32, answer: PromptAnswer) -> PromptAnswerBody {
-        PromptAnswerBody { prompt_id, answer, answered_by: AnsweredBy::Ui }
+        PromptAnswerBody { prompt_id, answer, answered_by: AnsweredBy::Ui, run_fields: vec![] }
     }
 
     #[test]
@@ -1920,19 +1961,19 @@ mod tests {
     async fn the_prompt_route_records_an_answer_or_says_why_not() {
         let state = AppState::new("t".into());
         *state.host_prompt.lock().unwrap() = slot_with("h1", 1).lock().unwrap().clone();
-        let ok = answer_prompt_handler(State(state.clone()), Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap();
+        let ok = answer_prompt_handler(State(state.clone()), crate::token_store::Scope::Person, Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap();
         assert_eq!(ok.0.status, "recorded");
-        let e = answer_prompt_handler(State(state.clone()), Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        let e = answer_prompt_handler(State(state.clone()), crate::token_store::Scope::Person, Path("h1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT);
         *state.host_prompt.lock().unwrap() = None;
         state.study_jobs.lock().unwrap().insert("r1".into(), StudyJob { status: "running".into(), current_step: None, total_steps: None, reason: None });
         state.study_jobs.lock().unwrap().insert("d1".into(), StudyJob { status: "completed".into(), current_step: None, total_steps: None, reason: None });
-        let e = answer_prompt_handler(State(state.clone()), Path("r1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        let e = answer_prompt_handler(State(state.clone()), crate::token_store::Scope::Person, Path("r1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT);
         assert!(e.1.contains("no prompt waiting"), "{}", e.1);
-        let e = answer_prompt_handler(State(state.clone()), Path("d1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        let e = answer_prompt_handler(State(state.clone()), crate::token_store::Scope::Person, Path("d1".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT);
-        let e = answer_prompt_handler(State(state), Path("nope".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
+        let e = answer_prompt_handler(State(state), crate::token_store::Scope::Person, Path("nope".into()), Json(body(1, PromptAnswer::Confirmed))).await.unwrap_err();
         assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
