@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "test_id": "vbus-5v-source-voltage",
+  "title": "A source's VBUS holds 5 V at the default contract",
+  "study": { "file": "vbus-5v.study.json", "hash": "3f1c0f6a0d1b4e0d9d2a8f7e6c5b4a392817060504030201f0e0d0c0b0a09080" },
+  "requirements": ["vbus-default-5v", "vbus-ripple"],
+  "revision_range": { "from": "3.0", "to": null },
+  "bench": { "name": "pd-sink-bench", "config": "default" },
+  "precondition": "reset",
+  "requires": ["capability-source-pdo"],
+  "run_count": 3,
+  "limits": [
+    { "measurement": "vbus_mean", "limit": { "kind": "band", "lo": 4.75, "hi": 5.25 } },
+    { "measurement": "vbus_ripple", "limit": { "kind": "at_most", "max": 0.05 } },
+    { "measurement": "led_state", "limit": { "kind": "expect", "value": "green" } }
+  ],
+  "decision_rule": { "kind": "guard_band", "w_multiple": 1.0 },
+  "setup_terms": [ { "name": "cable_drop", "unit": "V", "u": 0.005, "k": 2.0 } ],
+  "sources": [
+    { "measurement": "dut_vbus_report", "unit": "V", "range_min": 0.0, "range_max": 20.0, "resolution": 0.01, "u": 0.05, "k": 2.0 }
+  ],
+  "tags": ["vbus", "source"]
+}

@@ -21,7 +21,7 @@ clap = { version = "4.6.2", features = ["derive"] }
 # retired that feature along with the rest of post-hoc validation (the
 # `SignalCheck` evaluation it would have run was never built), so the
 # dependency now says what it actually wants.
-embarch-study-designer = { path = "../embarch-study-designer", features = ["std", "reducers", "hil-image"] }
+embarch-study-designer = { path = "../embarch-study-designer", features = ["std", "reducers", "hil-image", "hil-test"] }
 # study.rs constructs embarch-study-designer types' heapless::Vec fields
 # (e.g. StudyResult.steps) directly — same heapless version, so Cargo unifies
 # features with embarch-study-designer's own "serde"-enabled dependency.

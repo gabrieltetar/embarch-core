@@ -1,0 +1,11 @@
+{
+  "name": "vbus-5v",
+  "steps": [
+    { "name": "set up", "action": { "Prompt": { "text": "Wire the partner to port 1", "kind": "setup" } }, "timeout_ms": 60000 },
+    { "name": "stand clear", "action": { "Prompt": { "text": "Hands off the bench", "kind": "clearance" } }, "timeout_ms": 60000 },
+    { "name": "output on", "action": { "Instrument": { "instrument": "supply", "line": "OUTP ON" } }, "timeout_ms": 2000 },
+    { "name": "read vbus", "action": { "Instrument": { "instrument": "dmm", "line": "MEAS:VOLT?", "query": true, "parse": { "name": "vbus_mean", "pattern": "([0-9.]+)", "unit": "V" } } }, "timeout_ms": 2000 },
+    { "name": "status", "action": { "Exchange": { "signal": "partner", "line": "status", "until": "ok" } }, "timeout_ms": 2000 },
+    { "name": "led", "action": { "Prompt": { "text": "Is the LED green?", "kind": "observation", "answer": { "name": "led_state", "answers": ["green", "off"] } } }, "timeout_ms": 60000 }
+  ]
+}

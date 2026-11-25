@@ -5,6 +5,8 @@ mod bootload;
 mod call_log;
 mod capture;
 mod chip_resolve;
+mod confirmations;
+mod definitions;
 mod dev_bench_link;
 mod dev_bench_log;
 mod elevate;

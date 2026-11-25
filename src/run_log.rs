@@ -276,6 +276,32 @@ impl RunLog {
         self.append(body).map_err(internal)
     }
 
+    /// Records a person's confirmation of what hashes to `sha256` (decision 133):
+    /// the kind of definition, the token's scope and the surface the caller
+    /// names (a label, never trusted to mean anything: the scope is the token's).
+    /// `core_holds` is set for a suite only: whether Core holds that version.
+    pub fn confirm(&self, kind: &str, sha256: &str, scope: Scope, surface: &str, core_holds: Option<bool>) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({
+            "type": "confirmed", "kind": kind, "sha256": sha256,
+            "scope": scope.as_str(), "surface": surface, "at_utc_ms": now_ms(),
+        });
+        if let Some(h) = core_holds {
+            body["core_holds"] = h.into();
+        }
+        self.append(body)
+    }
+
+    /// Every hash a `confirmed` entry binds. A log that does not verify is an error.
+    pub fn confirmed_hashes(&self) -> Result<HashSet<String>> {
+        self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
+        Ok(self
+            .lines()?
+            .iter()
+            .filter(|l| l["entry"]["type"] == "confirmed")
+            .filter_map(|l| l["entry"]["sha256"].as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Appends the entry `build` makes, under the write lock, from the log as it
     /// stands: every line before the new one, and the head they end at. A run
     /// that ends meanwhile cannot slip between the head a publish records and

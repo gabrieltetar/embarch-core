@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, call_log, chip_resolve, hardware, host_study, lease, logs, publish, run_log, serial, study};
+use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, publish, run_log, serial, study};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -74,6 +74,8 @@ pub struct AppState {
     pub sealer: crate::signing::Sealer,
     /// The hash-chained run log (`run_log.rs`, decision 111).
     pub run_log: crate::run_log::RunLog,
+    /// Core's definitions, premade suites and confirmation nonces (`definitions.rs`, decision 133).
+    pub definitions: crate::definitions::Definitions,
     /// The hash-chained log of every gated call (`call_log.rs`, decision 122).
     pub call_log: crate::call_log::CallLog,
 }
@@ -97,6 +99,7 @@ impl AppState {
             person_only: crate::token_store::mode() == "service",
             sealer,
             call_log: crate::call_log::CallLog::at(run_log.data_dir().to_path_buf()),
+            definitions: crate::definitions::Definitions::from_env(run_log.data_dir()),
             run_log,
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
@@ -217,6 +220,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/prompt", post(host_study::answer_prompt_handler))
         .route("/study/{study_id}/line-counts", get(host_study::line_counts_handler).post(host_study::line_counts_rerender_handler))
         .route("/call-log", get(call_log::call_log_handler))
+        .route("/definitions", post(confirmations::post_definition_handler))
+        .route("/definitions/{hash}", get(confirmations::get_definition_handler))
+        .route("/suites", get(confirmations::suites_handler))
+        .route("/confirmations/pending", get(confirmations::pending_handler))
+        .route("/confirmations/{hash}/card", get(confirmations::card_handler))
+        .route("/confirmations", post(confirmations::confirm_handler))
         .route("/run-log", get(run_log::run_log_handler))
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
@@ -283,9 +292,13 @@ async fn person_middleware(
 ) -> Response {
     let scope = req.extensions().get::<crate::token_store::Scope>().copied();
     let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
-    if let (true, Some(crate::token_store::Scope::Agent), Some(path)) = (state.person_only, scope, matched) {
-        if crate::token_store::is_person_route(req.method().as_str(), path) {
+    if let (Some(crate::token_store::Scope::Agent), Some(path)) = (scope, matched) {
+        if state.person_only && crate::token_store::is_person_route(req.method().as_str(), path) {
             return (StatusCode::FORBIDDEN, crate::token_store::PERSON_REFUSAL).into_response();
+        }
+        // On every Core, not only an attested one (decision 133).
+        if crate::token_store::is_confirmation_route(req.method().as_str(), path) {
+            return (StatusCode::FORBIDDEN, crate::token_store::CONFIRMATION_REFUSAL).into_response();
         }
     }
     next.run(req).await
@@ -3180,6 +3193,12 @@ mod tests {
         ("GET", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("POST", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("GET", "/call-log", "/call-log"),
+        ("POST", "/definitions", "/definitions"),
+        ("GET", "/definitions/{hash}", "/definitions/abc"),
+        ("GET", "/suites", "/suites"),
+        ("GET", "/confirmations/pending", "/confirmations/pending"),
+        ("GET", "/confirmations/{hash}/card", "/confirmations/abc/card"),
+        ("POST", "/confirmations", "/confirmations"),
         ("GET", "/run-log", "/run-log"),
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
@@ -3238,7 +3257,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 53;
+    const DOCUMENTED_ROUTE_COUNT: usize = 59;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3449,6 +3468,7 @@ mod tests {
             handler_name.strip_prefix("run_log::"),
             handler_name.strip_prefix("publish::"),
         ) {
+            _ if handler_name.starts_with("confirmations::") => (include_str!("confirmations.rs"), &handler_name["confirmations::".len()..]),
             (Some(stripped), _, _, _) => (include_str!("study.rs"), stripped),
             (_, Some(stripped), _, _) => (include_str!("host_study.rs"), stripped),
             (_, _, Some(stripped), _) => (include_str!("run_log.rs"), stripped),
@@ -4083,6 +4103,10 @@ mod tests {
         ("GET", "/study/{study_id}/line-counts"),
         ("POST", "/study/{study_id}/line-counts"),
         ("GET", "/call-log"),
+        ("POST", "/definitions"),
+        ("GET", "/definitions/{hash}"),
+        ("GET", "/suites"),
+        ("GET", "/confirmations/pending"),
         ("GET", "/run-log"),
         ("GET", "/study/{study_id}/log"),
         ("POST", "/study/{study_id}/published"),
@@ -4106,9 +4130,9 @@ mod tests {
     /// `AUTH_CASES` row is in exactly one of `PERSON_ROUTES` / `AGENT_ROUTES`.
     #[test]
     fn every_route_is_either_the_persons_or_the_agents() {
-        use crate::token_store::PERSON_ROUTES;
+        use crate::token_store::{CONFIRMATION_ROUTES, PERSON_ROUTES};
         for (method, path, _) in AUTH_CASES {
-            let person = PERSON_ROUTES.iter().any(|(m, p)| m == method && p == path);
+            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).any(|(m, p)| m == method && p == path);
             let agent = AGENT_ROUTES.iter().any(|(m, p)| m == method && p == path);
             assert!(
                 person ^ agent,
@@ -4117,7 +4141,7 @@ mod tests {
                  Core takes it only from the person (decision 132)"
             );
         }
-        for (method, path) in PERSON_ROUTES.iter().chain(AGENT_ROUTES) {
+        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(AGENT_ROUTES) {
             assert!(
                 AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is in a scope list but is not a registered route"

@@ -554,6 +554,13 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("GET", "/run-log"),
     // Reads Core's own call log, never a port (decision 122).
     ("GET", "/call-log"),
+    // Definitions, premade suites and confirmations are files and the run log (decision 133).
+    ("POST", "/definitions"),
+    ("GET", "/definitions/{hash}"),
+    ("GET", "/suites"),
+    ("GET", "/confirmations/pending"),
+    ("GET", "/confirmations/{hash}/card"),
+    ("POST", "/confirmations"),
     ("GET", "/study/{study_id}/log"),
     ("POST", "/study/{study_id}/published"),
     ("POST", "/study/{study_id}/discard"),

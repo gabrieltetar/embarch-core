@@ -172,6 +172,23 @@ pub const PERSON_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/bootload/ports"),
 ];
 
+/// The routes only the person's token takes, on **every** Core, a development one included
+/// (decision 133): a confirmation card's data with its nonce, and the confirmation itself.
+/// Stricter than [`PERSON_ROUTES`], which a development Core serves to either token: a
+/// confirmation an agent could make is no confirmation.
+pub const CONFIRMATION_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/confirmations/{hash}/card"),
+    ("POST", "/confirmations"),
+];
+
+/// The `403` body of a [`CONFIRMATION_ROUTES`] refusal.
+pub const CONFIRMATION_REFUSAL: &str = "a confirmation is the person's act on every Core: confirm it in embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may list what waits and propose a definition, never obtain a card's nonce or confirm";
+
+/// Whether `method` on the registered path pattern `path` is in [`CONFIRMATION_ROUTES`].
+pub fn is_confirmation_route(method: &str, path: &str) -> bool {
+    CONFIRMATION_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
+}
+
 /// The `403` body: names where the person acts.
 pub const PERSON_REFUSAL: &str = "this route is the person's on an attested Core: declare it in embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may only propose it";
 

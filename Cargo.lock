@@ -871,6 +871,7 @@ dependencies = [
  "postcard",
  "regex",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
 ]
 

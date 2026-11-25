@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "usb-pd-r3.2",
+  "version": "0.1.0",
+  "validated_with": "embarch-0.9.0",
+  "tests": [
+    { "test_id": "vbus-5v-source-voltage", "file": "tests/vbus-5v-source-voltage.json", "hash": "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11" }
+  ],
+  "benches": [
+    {
+      "name": "pd-sink-bench",
+      "description": { "slug": "pd-sink-bench", "parts": [ { "id": "partner", "template": "nucleo-g0b1re" }, { "id": "unit", "template": "generic-board", "role": "dut" } ], "configs": [ { "name": "default", "cables": [] } ] },
+      "boards": [
+        { "part": "partner", "idle": "idle", "hello": "hello", "read_only": ["status", "vbus"], "preconditions": ["reset", "detach"] }
+      ]
+    }
+  ]
+}
