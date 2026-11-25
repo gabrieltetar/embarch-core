@@ -31,10 +31,13 @@ pub const RECORD_FILE: &str = "record.dsse.json";
 /// The first line of the one frame the challenge route signs.
 pub const CHALLENGE_TAG: &str = "embarch-core-auth-v1";
 
-/// The key file, beside the token files (`token_store::local_data_dir`).
+/// The key file, in the store (`token_store::store_dir`).
 pub fn signing_key_path() -> Result<PathBuf> {
-    Ok(crate::token_store::local_data_dir()?.join("signing-key"))
+    Ok(crate::token_store::store_dir()?.join("signing-key"))
 }
+
+/// The public half beside the key, as 64 hex characters of the raw key.
+const PUBLIC_KEY_FILE: &str = "public-key";
 
 // ---- the key ----------------------------------------------------------------
 
@@ -73,7 +76,9 @@ impl CoreKey {
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&bytes);
             tracing::info!(path = %path.display(), "reusing the existing signing key");
-            return Ok(Self::from_seed(seed));
+            let key = Self::from_seed(seed);
+            key.write_public_key(path)?;
+            return Ok(key);
         }
         let mut seed = [0u8; 32];
         rand::fill(&mut seed);
@@ -86,7 +91,20 @@ impl CoreKey {
         #[cfg(windows)]
         crate::token_store::restrict_token_file_permissions(path)?;
         tracing::info!(path = %path.display(), "generated a new signing key");
-        Ok(Self::from_seed(seed))
+        let key = Self::from_seed(seed);
+        key.write_public_key(path)?;
+        Ok(key)
+    }
+
+    /// Writes `public-key` beside the key at `key_path` if it is not there
+    /// (a key made before the file existed gets one on its next start).
+    fn write_public_key(&self, key_path: &Path) -> Result<()> {
+        let path = key_path.with_file_name(PUBLIC_KEY_FILE);
+        if !path.exists() {
+            std::fs::write(&path, self.public_key_hex())
+                .with_context(|| format!("failed to write the public key at {}", path.display()))?;
+        }
+        Ok(())
     }
 
     /// SHA-256 of the raw public key, as 64 lowercase hex: the DSSE `keyid`
@@ -310,7 +328,7 @@ impl Sealer {
         Self::new(CoreKey::ephemeral())
     }
 
-    /// The key from the store beside the token files, made on first start.
+    /// The key from the store, made on first start.
     pub fn resolve() -> Result<Self> {
         let path = signing_key_path()?;
         let key = CoreKey::load_or_create(&path)?;
@@ -351,6 +369,7 @@ impl Sealer {
         let call_log = job.calls.as_ref().and_then(|c| c.at_end()).map(|(v, _)| v);
         let mut observed = serde_json::json!({
             "core": { "version": env!("CARGO_PKG_VERSION") },
+            "mode": crate::token_store::mode(),
             "provenance": provenance,
             "image_status": "unverified",
             "declarations": self.declarations.snapshot(),
@@ -453,6 +472,8 @@ struct ChallengeResponse {
     /// The exact text that was signed.
     frame: String,
     core_nonce: String,
+    /// `service` or `development`: Core's own word, outside the signed frame.
+    mode: &'static str,
     keyid: String,
     public_key: String,
     /// Lowercase hex of the 64-byte Ed25519 signature over `frame`.
@@ -485,6 +506,7 @@ async fn challenge_handler(
     Ok(Json(ChallengeResponse {
         frame,
         core_nonce,
+        mode: crate::token_store::mode(),
         keyid: state.sealer.key().keyid().to_string(),
         public_key: state.sealer.key().public_key_hex(),
         signature,
@@ -665,6 +687,28 @@ mod tests {
         assert!(CoreKey::load_or_create(&path).is_err());
     }
 
+    #[test]
+    fn public_key_file_hashes_to_the_keyid_and_two_stores_differ() {
+        let a = std::env::temp_dir().join(format!("embarch-sign-a-{}", std::process::id()));
+        let b = std::env::temp_dir().join(format!("embarch-sign-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        let ka = CoreKey::load_or_create(&a.join("signing-key")).unwrap();
+        let kb = CoreKey::load_or_create(&b.join("signing-key")).unwrap();
+        assert_ne!(ka.keyid(), kb.keyid());
+
+        let public = std::fs::read_to_string(a.join("public-key")).unwrap();
+        assert_eq!(public, ka.public_key_hex());
+        assert_eq!(hex(&Sha256::digest(unhex(&public).unwrap())), ka.keyid());
+
+        // A key from before the file existed gets one on its next start.
+        std::fs::remove_file(a.join("public-key")).unwrap();
+        CoreKey::load_or_create(&a.join("signing-key")).unwrap();
+        assert_eq!(std::fs::read_to_string(a.join("public-key")).unwrap(), public);
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
     // ---- the challenge ----
 
     fn router() -> (Router, Sealer) {
@@ -702,6 +746,7 @@ mod tests {
         let sig = Signature::from_slice(&unhex(body["signature"].as_str().unwrap()).unwrap()).unwrap();
         VerifyingKey::from_bytes(&vk_bytes).unwrap().verify(frame.as_bytes(), &sig).unwrap();
         assert_eq!(body["keyid"], sealer.key().keyid());
+        assert_eq!(body["mode"], "development");
 
         // each answer carries a fresh Core nonce
         let (_, again) = post_challenge(&app, &nonce, None).await;

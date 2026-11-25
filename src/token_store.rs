@@ -17,15 +17,124 @@ pub fn local_data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from("/var/lib/embarch"))
 }
 
-/// The agent's machine-wide token file: `local_data_dir()/token`. The one
-/// file every existing caller discovers (`embarch-token.md` §2).
-fn token_file_path() -> Result<PathBuf> {
-    Ok(local_data_dir()?.join("token"))
+/// Where Core keeps its state, chosen once at start by `run`'s flags
+/// (decision 134). `Legacy` is every path under `local_data_dir()`, as before
+/// the flags existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreLayout {
+    /// Neither flag: today's layout, reported as `development`.
+    Legacy,
+    /// `--service`: the signing key, `public-key`, both logs and the identity
+    /// store in `<data dir>/store/`; tokens and results stay in the data dir.
+    Service,
+    /// `--store <dir>`: everything, tokens and results included, in `<dir>`.
+    Development(PathBuf),
 }
 
-/// The person's token file, beside the agent's: `local_data_dir()/person-token`.
+impl StoreLayout {
+    /// `service` for `--service`, else `development`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            StoreLayout::Service => "service",
+            _ => "development",
+        }
+    }
+
+    fn store_in(&self, data: PathBuf) -> PathBuf {
+        match self {
+            StoreLayout::Legacy => data,
+            StoreLayout::Service => data.join(STORE_DIR),
+            StoreLayout::Development(dir) => dir.clone(),
+        }
+    }
+
+    fn tokens_in(&self, data: PathBuf) -> PathBuf {
+        match self {
+            StoreLayout::Development(dir) => dir.clone(),
+            _ => data,
+        }
+    }
+}
+
+/// The store's folder name under the data directory with `--service`.
+pub const STORE_DIR: &str = "store";
+
+static LAYOUT: std::sync::OnceLock<StoreLayout> = std::sync::OnceLock::new();
+
+/// The layout this process runs with; `Legacy` until [`init_store`] says otherwise.
+pub fn layout() -> &'static StoreLayout {
+    LAYOUT.get_or_init(|| StoreLayout::Legacy)
+}
+
+/// `service` or `development`: what `GET /status` and the challenge answer call this Core.
+pub fn mode() -> &'static str {
+    layout().mode()
+}
+
+/// Fixes the layout for this process and points the identity store at
+/// `<store>/topology` (`embarch-topology`'s `set_data_dir`). `--service` never
+/// creates its store: a missing one is a start failure naming the elevated
+/// install. `--store` creates its folder. Called once, before anything reads a
+/// path; `Legacy` changes nothing.
+pub fn init_store(layout: StoreLayout) -> Result<()> {
+    match &layout {
+        StoreLayout::Legacy => {}
+        StoreLayout::Service => {
+            require_store(&layout.store_in(local_data_dir()?))?;
+        }
+        StoreLayout::Development(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create the development store {}", dir.display()))?;
+        }
+    }
+    if layout != StoreLayout::Legacy {
+        embarch_topology::hardware::set_data_dir(store_dir_of(&layout)?.join("topology"))?;
+    }
+    LAYOUT
+        .set(layout)
+        .map_err(|_| anyhow::anyhow!("the store layout was already chosen for this process"))
+}
+
+/// `--service` never creates its store; the elevated install does.
+fn require_store(store: &Path) -> Result<()> {
+    anyhow::ensure!(
+        store.is_dir(),
+        "the service store {} does not exist; `run --service` never creates it. \
+         It is made by the elevated install (run the installer from an elevated shell)",
+        store.display()
+    );
+    Ok(())
+}
+
+fn store_dir_of(layout: &StoreLayout) -> Result<PathBuf> {
+    Ok(layout.store_in(local_data_dir()?))
+}
+
+/// Holds `signing-key`, `public-key`, `run-log.jsonl`, `call-log.jsonl`,
+/// `flashed-images.jsonl` and `topology/`.
+pub fn store_dir() -> Result<PathBuf> {
+    store_dir_of(layout())
+}
+
+/// Where the token pair lives.
+pub fn token_dir() -> Result<PathBuf> {
+    Ok(layout().tokens_in(local_data_dir()?))
+}
+
+/// The root of `<id>/` run directories (`study_results/`).
+pub fn results_root() -> Result<PathBuf> {
+    Ok(layout().tokens_in(local_data_dir()?).join("study_results"))
+}
+
+/// The agent's token file: `token_dir()/token`. The one file every existing
+/// caller discovers (`embarch-token.md` §2).
+fn token_file_path() -> Result<PathBuf> {
+    Ok(token_dir()?.join("token"))
+}
+
+/// The person's token file, beside the agent's: `token_dir()/person-token`.
 fn person_token_file_path() -> Result<PathBuf> {
-    Ok(local_data_dir()?.join("person-token"))
+    Ok(token_dir()?.join("person-token"))
 }
 
 /// Which of the two tokens authenticated a request (decision 109). Core is
@@ -227,6 +336,43 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("embarch-token-store-test-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn the_layouts_place_every_path_as_decision_134_says() {
+        let data = PathBuf::from("/data");
+        let dev = StoreLayout::Development(PathBuf::from("/dev-store"));
+
+        assert_eq!(StoreLayout::Legacy.store_in(data.clone()), data);
+        assert_eq!(StoreLayout::Legacy.tokens_in(data.clone()), data);
+        assert_eq!(StoreLayout::Service.store_in(data.clone()), data.join("store"));
+        assert_eq!(StoreLayout::Service.tokens_in(data.clone()), data, "the service keeps its tokens in the data dir");
+        assert_eq!(dev.store_in(data.clone()), PathBuf::from("/dev-store"));
+        assert_eq!(dev.tokens_in(data), PathBuf::from("/dev-store"));
+
+        assert_eq!(StoreLayout::Service.mode(), "service");
+        assert_eq!(dev.mode(), "development");
+        assert_eq!(StoreLayout::Legacy.mode(), "development");
+    }
+
+    #[test]
+    fn a_missing_service_store_is_refused_naming_the_elevated_install() {
+        let dir = temp_path("no-store");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = require_store(&dir.join("store")).unwrap_err().to_string();
+        assert!(err.contains("elevated install"), "got: {err}");
+        assert!(!dir.exists(), "refusing must not create anything");
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        require_store(&dir.join("store")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn this_process_is_legacy_until_a_layout_is_chosen() {
+        assert_eq!(layout(), &StoreLayout::Legacy);
+        assert_eq!(store_dir().unwrap(), local_data_dir().unwrap());
+        assert_eq!(results_root().unwrap(), local_data_dir().unwrap().join("study_results"));
+        assert_eq!(mode(), "development");
     }
 
     #[test]

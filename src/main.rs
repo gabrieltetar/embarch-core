@@ -80,6 +80,15 @@ enum Command {
         bind: String,
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// The attested Core: keep the signing key, both logs and the
+        /// identity store in `<data dir>/store/`, which `run` never creates
+        /// (the elevated install does). Reported as `service`.
+        #[arg(long, conflicts_with = "store")]
+        service: bool,
+        /// A development Core: keep the token pair, signing key, logs,
+        /// results and identity store in this folder, created if missing.
+        #[arg(long, value_name = "DIR")]
+        store: Option<PathBuf>,
     },
     /// Install embarch-core as a background OS service (Windows Service
     /// via sc.exe, or systemd on Linux) and start it immediately.
@@ -215,7 +224,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { bind, port } => {
+        Command::Run { bind, port, service, store } => {
+            token_store::init_store(match (service, store) {
+                (true, _) => token_store::StoreLayout::Service,
+                (false, Some(dir)) => token_store::StoreLayout::Development(dir),
+                (false, None) => token_store::StoreLayout::Legacy,
+            })?;
             #[cfg(windows)]
             if let Some(result) = service::windows::try_dispatch(bind.clone(), port) {
                 return result;

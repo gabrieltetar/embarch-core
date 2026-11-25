@@ -816,7 +816,7 @@ pub(crate) fn current_utc_ms() -> u64 {
 }
 
 fn study_results_root() -> anyhow::Result<PathBuf> {
-    Ok(token_store::local_data_dir()?.join("study_results"))
+    token_store::results_root()
 }
 
 pub(crate) fn study_results_dir(study_id: &str) -> anyhow::Result<PathBuf> {

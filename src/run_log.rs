@@ -34,6 +34,7 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 #[derive(Clone)]
 pub struct RunLog {
     data_dir: PathBuf,
+    results_root: PathBuf,
     /// The kind (`device` or `host`) of each run in flight, by study id. A run
     /// is entered into the log when it ends, once, and only if it began here.
     pending: Arc<StdMutex<HashMap<String, (&'static str, Scope)>>>,
@@ -109,12 +110,23 @@ fn now_ms() -> u64 {
 impl RunLog {
     /// A log under `data_dir`: `run-log.jsonl`, with the runs' directories in
     /// `data_dir/study_results/<id>/`.
+    #[cfg(test)]
     pub fn at(data_dir: PathBuf) -> Self {
-        Self { data_dir, pending: Arc::default(), write: Arc::default() }
+        let results_root = data_dir.join("study_results");
+        Self::at_with_results(data_dir, results_root)
     }
 
+    /// A log in `data_dir` whose runs' directories are under `results_root`.
+    pub fn at_with_results(data_dir: PathBuf, results_root: PathBuf) -> Self {
+        Self { data_dir, results_root, pending: Arc::default(), write: Arc::default() }
+    }
+
+    /// The log in the store, the runs in the results root (`token_store`).
     pub fn resolve() -> Result<Self> {
-        Ok(Self::at(crate::token_store::local_data_dir()?))
+        Ok(Self::at_with_results(
+            crate::token_store::store_dir()?,
+            crate::token_store::results_root()?,
+        ))
     }
 
     /// A log in a fresh temporary directory, for `AppState::new`.
@@ -138,7 +150,7 @@ impl RunLog {
     }
 
     pub(crate) fn run_dir(&self, study_id: &str) -> PathBuf {
-        self.data_dir.join("study_results").join(study_id)
+        self.results_root.join(study_id)
     }
 
     /// A run has started: it will be entered when it ends, with the scope of

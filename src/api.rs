@@ -487,6 +487,12 @@ struct StatusResponse {
     /// The last image Core flashed (or bootloaded) per chip since it started
     /// (decision 93). Empty means unknown, not "nothing flashed".
     last_images: Vec<lease::FlashedImage>,
+    /// `service` (`run --service`) or `development` (decision 134).
+    mode: &'static str,
+    /// SHA-256 of Core's raw public key, hex: the fingerprint a client pins.
+    keyid: String,
+    /// The id of the study running now, or `null`.
+    study_in_flight: Option<String>,
 }
 
 /// Hashes `std::env::current_exe()`'s bytes once and caches the result —
@@ -524,6 +530,14 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResp
         binary_sha256: binary_sha256(),
         lease: state.lease.view(),
         last_images: state.images.all(),
+        mode: crate::token_store::mode(),
+        keyid: state.sealer.key().keyid().to_string(),
+        study_in_flight: state
+            .study_lock
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|h| h != study::HELLO_HOLDER),
     }))
 }
 
@@ -3578,6 +3592,9 @@ mod tests {
             binary_sha256: Some("a".repeat(64)),
             lease: None,
             last_images: Vec::new(),
+            mode: "development",
+            keyid: "k".repeat(64),
+            study_in_flight: None,
         })
         .unwrap();
 
@@ -3593,16 +3610,44 @@ mod tests {
             [
                 "binary_sha256",
                 "core_version",
+                "keyid",
                 "last_images",
                 "lease",
+                "mode",
                 "probes",
                 "status",
                 "study_designer_schema_version",
+                "study_in_flight",
             ],
             "GET /status's field set changed — update embarch-doc/embarch-core/interfaces.md's \
              /status row in the same commit"
         );
         assert_eq!(json["core_version"], "9.9.9");
+    }
+
+    /// `mode`, `keyid` and `study_in_flight` (decision 134): the study id while
+    /// one holds the lock, `null` otherwise and during the dev-bench hello.
+    #[tokio::test]
+    async fn status_carries_mode_keyid_and_the_study_in_flight() {
+        let state = AppState::new("test-token".to_string());
+        let keyid = state.sealer.key().keyid().to_string();
+        let get = |state: AppState| async move {
+            let response = build_router(state)
+                .oneshot(Request::builder().uri("/status").header("authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let idle = get(state.clone()).await;
+        assert_eq!(idle["mode"], "development");
+        assert_eq!(idle["keyid"], keyid);
+        assert!(idle["study_in_flight"].is_null());
+
+        *state.study_lock.lock().unwrap() = Some(study::HELLO_HOLDER.to_string());
+        assert!(get(state.clone()).await["study_in_flight"].is_null());
+        *state.study_lock.lock().unwrap() = Some("study-abc".to_string());
+        assert_eq!(get(state).await["study_in_flight"], "study-abc");
     }
 
     /// The served `core_version` is the compiled-in crate version, not a
