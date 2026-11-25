@@ -100,7 +100,10 @@ enum Producer {
 fn producer(tap: &StreamTap, ended: &Ended) -> Producer {
     match &tap.source {
         StreamSource::GattNotify { .. } => Producer::Dut { role: embarch_topology::hardware::DUT_ROLE },
-        StreamSource::GattTranscript | StreamSource::DevBenchLog | StreamSource::PowerFrontEnd { .. } => {
+        StreamSource::GattTranscript
+        | StreamSource::DevBenchLog
+        | StreamSource::PowerFrontEnd { .. }
+        | StreamSource::AnalogInput { .. } => {
             Producer::Bench { name: "dev-bench".to_string(), signal: None }
         }
         StreamSource::Signal { name } => match (ended.signal_origin)(name.as_str()) {
@@ -533,6 +536,7 @@ mod tests {
             dev_bench_log_level: DevBenchLogLevel::default(),
             decoders,
             record_checks: Default::default(),
+            session: None,
             measurements,
         }
     }

@@ -435,6 +435,11 @@ fn validate_study(study: &Study) -> Result<(), String> {
     // close. Computed by the crate, not restated.
     validate_record_checks(&study.record_checks).map_err(|e| e.to_string())?;
 
+    // `embarch-study-designer` decisions 105 and 106: an analog tap needs its
+    // block check and a capped session, or Core would record a stream no
+    // record check names and nothing stops. After the two above.
+    study.validate_analog_capture().map_err(|e| e.to_string())?;
+
     // `embarch-study-designer` decisions 99 and 100: a declaration Core could
     // not compute, or would compute over the wrong numbers, is refused here
     // rather than as a `measurements.json` that says `parse_failed` at the end.
@@ -1703,6 +1708,48 @@ struct Capture {
     ///
     /// Empty for a study with no trace tap, which costs nothing.
     outpost: StdMutex<HashMap<u8, crate::outpost_manifest::LiveDecoder>>,
+    /// One decoder per framed analog tap (a tap an `AnalogBlocks` record check
+    /// names), keyed by `StreamTap.id`. **Per capture, never per read**: a
+    /// block is longer than one read, so its partial bytes and the index
+    /// tracker live here (EMB-475).
+    analog: StdMutex<HashMap<u8, crate::analog_tap::AnalogTapDecoder>>,
+}
+
+/// Ids of the taps a study's `AnalogBlocks` record checks name, with each
+/// one's layout. The one place "this tap is framed" is decided, so the reader
+/// that must not split at newlines, the decoder and the store's rotation
+/// exemption agree.
+fn framed_analog_taps(study: &Study) -> Vec<(u8, u8, u16)> {
+    study
+        .record_checks
+        .iter()
+        .filter_map(|c| match c.framing {
+            embarch_study_designer::RecordFraming::AnalogBlocks { channels, samples_per_block } => {
+                Some((c.stream_id, channels, samples_per_block))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The decoders for `study`'s framed taps. A layout the study's own validation
+/// accepted cannot fail here; one that does is logged and left undecoded
+/// (its raw bytes are still kept).
+fn build_analog_decoders(study: &Study) -> HashMap<u8, crate::analog_tap::AnalogTapDecoder> {
+    let mut out = HashMap::new();
+    for (id, channels, frames) in framed_analog_taps(study) {
+        let declared_hz = study.streams.iter().find(|t| t.id == id).and_then(|t| match t.source {
+            StreamSource::AnalogInput { sample_hz, .. } => Some(sample_hz),
+            _ => None,
+        });
+        match crate::analog_tap::AnalogTapDecoder::new(channels, frames, declared_hz) {
+            Ok(decoder) => {
+                out.insert(id, decoder);
+            }
+            Err(_) => tracing::error!(id, "an AnalogBlocks layout with no channel or frame; its tap is recorded raw and not decoded"),
+        }
+    }
+    out
 }
 
 /// Advance both of a run's step counters now that the step at `step_index`
@@ -1770,6 +1817,20 @@ fn run_study_to_completion(
         return;
     }
 
+    // A session's recording is exempt from retention (EMB-469 decision 13).
+    // Marked before the sweep and before any byte is captured.
+    if study.session.is_some() {
+        if let Err(e) = stream_store::mark_session_recording(&results_dir) {
+            fail_job(
+                &jobs,
+                &events_tx,
+                &study_id,
+                format!("failed to mark the session's recording as exempt from retention: {e:?}"),
+            );
+            return;
+        }
+    }
+
     // Retention across runs (decision 30): run
     // once per submitted study, immediately after this study's own directory
     // exists, so `keep` is exact and counts the run in progress rather than
@@ -1835,11 +1896,14 @@ fn run_study_to_completion(
 
     // `streams/` and its index, before a single byte has arrived (decision
     // 30(b)). One file per tap, named by the tap.
-    let store = match StreamStore::create(
+    let analog = build_analog_decoders(&study);
+    let framed_ids: Vec<u8> = analog.keys().copied().collect();
+    let store = match StreamStore::create_framed(
         &results_dir,
         &taps,
         &study.decoders,
         stream_store::stream_max_bytes(),
+        &framed_ids,
     ) {
         Ok(store) => store,
         Err(e) => {
@@ -1887,6 +1951,7 @@ fn run_study_to_completion(
         store: StdMutex::new(store),
         open_step_index: AtomicU32::new(0),
         outpost: StdMutex::new(outpost),
+        analog: StdMutex::new(analog),
     });
 
     // Which taps dev-bench currently has open, by `StreamTap.id`. Purely
@@ -2296,10 +2361,37 @@ fn run_study_to_completion(
 /// diagnostic artifact, and a diagnostic that omits what the capture
 /// actually produced is worth less than one that includes it.
 fn finish_streams(capture: &Capture, writer: &mut EventsJsonWriter, results_dir: &FsPath) -> Vec<StreamRef> {
+    finish_analog_taps(capture);
     let mut refs = capture.store.lock().unwrap().refs();
     verify_declared_records(results_dir, &capture.study.record_checks, &mut refs);
     writer.set_streams(refs.clone());
     refs
+}
+
+/// Closes every framed analog tap's decoder: a record still held when the
+/// capture ends is recorded as refused, not silently dropped.
+fn finish_analog_taps(capture: &Capture) {
+    let mut decoders = capture.analog.lock().unwrap();
+    let core_rx_utc_ms = current_utc_ms();
+    for (id, decoder) in decoders.iter_mut() {
+        record_analog_events(capture, *id, &decoder.finish(), core_rx_utc_ms);
+    }
+}
+
+/// Writes the `events.csv` rows of `events` for tap `id`.
+fn record_analog_events(
+    capture: &Capture,
+    id: u8,
+    events: &[crate::analog_tap::AnalogEvent],
+    core_rx_utc_ms: u64,
+) {
+    let rows: String = events
+        .iter()
+        .flat_map(|e| crate::analog_tap::event_rows(e, core_rx_utc_ms))
+        .collect();
+    if !rows.is_empty() {
+        capture.store.lock().unwrap().write_analog_events(id, &rows);
+    }
 }
 
 /// Computes the study's declared measurements over its closed captures and
@@ -2900,11 +2992,14 @@ fn read_signal_tap(
         match port.read(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
-                // One record per line (core/101): a read holding several
-                // lines would otherwise give them all one receive time. The
-                // raw bytes are unchanged; only the record boundaries move.
+                // One record per line for a `Text` tap (core/101): a read
+                // holding several lines would otherwise give them all one
+                // receive time. Any other tap's read is one record, whole: a
+                // framed block's int16 samples hold `0x0A` bytes, so a line
+                // split would cut every block (EMB-475). The raw bytes are
+                // unchanged; only the record boundaries move.
                 let rx_utc_ms = current_utc_ms();
-                for piece in buf[..n].split_inclusive(|b| *b == b'\n') {
+                for piece in split_read(&tap.encoding, &buf[..n]) {
                     let record = StreamRecord {
                         // Core is the node that received these bytes, so Core
                         // stamps them (`embarch-study-designer` spec.md §4.8).
@@ -2926,6 +3021,15 @@ fn read_signal_tap(
                 return;
             }
         }
+    }
+}
+
+/// How one read of a signal tap becomes records: one per line for a `Text`
+/// tap, the whole read for every other encoding.
+fn split_read<'a>(encoding: &StreamEncoding, bytes: &'a [u8]) -> Vec<&'a [u8]> {
+    match encoding {
+        StreamEncoding::Text => bytes.split_inclusive(|b| *b == b'\n').collect(),
+        _ => vec![bytes],
     }
 }
 
@@ -3091,8 +3195,31 @@ fn write_stream_record(capture: &Capture, tap: &StreamTap, record: &StreamRecord
             );
         }
         StreamEncoding::Raw => {
-            // Nothing declared, so nothing rendered. `Raw` is the honest
-            // default for a payload nobody gave a meaning.
+            // Nothing declared, so nothing rendered, unless an `AnalogBlocks`
+            // record check names this tap: then its bytes are framed blocks,
+            // decoded here record by verified record (EMB-475). The raw bytes
+            // were written above, whole, whatever this finds.
+            let events = {
+                let mut decoders = capture.analog.lock().unwrap();
+                decoders.get_mut(&tap.id).map(|d| (d.push(&record.bytes, core_rx_utc_ms), d.rate_hz()))
+            };
+            if let Some((events, rate_hz)) = events {
+                for event in &events {
+                    if let crate::analog_tap::AnalogEvent::Block(block) = event {
+                        // The live view's batch, as blocks arrive: raw codes
+                        // stamped by index at the declared rate (decision 11
+                        // draws min and max per column from these).
+                        let _ = capture.events_tx.send(StudyEvent::SampleBatch {
+                            study_id: capture.study_id.clone(),
+                            stream_id: tap.id,
+                            stream_name: tap.name.as_str().to_string(),
+                            samples: block.samples(rate_hz, core_rx_utc_ms),
+                            core_rx_utc_ms,
+                        });
+                    }
+                }
+                record_analog_events(capture, tap.id, &events, core_rx_utc_ms);
+            }
         }
     }
 }
@@ -4452,7 +4579,8 @@ fn read_studies(
     protected: &std::collections::HashSet<String>,
     cache: &StudiesCache,
 ) -> anyhow::Result<Vec<(String, StudyDiskSummary)>> {
-    let (dirs, _) = crate::run_log::retained(stream_store::study_result_dirs(root)?, keep, protected);
+    let protected = stream_store::with_session_recordings(root, protected);
+    let (dirs, _) = crate::run_log::retained(stream_store::study_result_dirs(root)?, keep, &protected);
 
     let mut out = Vec::with_capacity(dirs.len());
     let mut cache = cache.lock().unwrap();
@@ -4859,7 +4987,9 @@ mod tests {
         // actually routes on.
         let mut taps: Vec<StreamTap> = study.streams.iter().cloned().collect();
         taps.push(dev_bench_log_tap(&study.streams));
-        let store = StreamStore::create(dir, &taps, &study.decoders, 0).unwrap();
+        let framed_ids: Vec<u8> = framed_analog_taps(&study).iter().map(|f| f.0).collect();
+        let store = StreamStore::create_framed(dir, &taps, &study.decoders, 0, &framed_ids).unwrap();
+        let study_for_decoders = study.clone();
         let (events_tx, _rx) = broadcast::channel(64);
         let outpost = taps
             .iter()
@@ -4875,6 +5005,7 @@ mod tests {
             store: StdMutex::new(store),
             open_step_index: AtomicU32::new(0),
             outpost: StdMutex::new(outpost),
+            analog: StdMutex::new(build_analog_decoders(&study_for_decoders)),
         }
     }
 
@@ -4927,7 +5058,112 @@ mod tests {
             dev_bench_log_level: Default::default(),
             record_checks: Default::default(),
             measurements: Default::default(),
+            session: None,
         }
+    }
+
+    // ---- framed analog taps (EMB-475) ----
+
+    #[test]
+    fn only_a_text_tap_is_split_at_newlines() {
+        let bytes = [1u8, 0x0A, 2, 0x0A, 3];
+        let text = split_read(&StreamEncoding::Text, &bytes);
+        assert_eq!(text, vec![&[1u8, 0x0A][..], &[2, 0x0A][..], &[3][..]]);
+        // A framed tap's samples hold 0x0A; its read is one record.
+        assert_eq!(split_read(&StreamEncoding::Raw, &bytes), vec![&bytes[..]]);
+    }
+
+    fn analog_study() -> Study {
+        let mut study = study_with_taps(
+            &[1_000],
+            &[tap(
+                0,
+                "mic",
+                StreamSource::AnalogInput { sample_hz: 32_000, channel: 0 },
+                StreamEncoding::Raw,
+            )],
+        );
+        study
+            .record_checks
+            .push(embarch_study_designer::RecordCheck {
+                stream_id: 0,
+                framing: embarch_study_designer::RecordFraming::AnalogBlocks {
+                    channels: 1,
+                    samples_per_block: 256,
+                },
+            })
+            .unwrap();
+        study
+    }
+
+    fn analog_block(index: u32, edge: bool) -> Vec<u8> {
+        use embarch_study_designer::analog::{encode_block, EventWord};
+        let codes: Vec<i16> = (0..256).map(|i| 0x0A0A_i16.wrapping_add(i)).collect();
+        let events = if edge { EventWord::new(1, 4, true) } else { EventWord::from_raw(0) };
+        let mut out = vec![0u8; 528];
+        encode_block(&mut out, index, events, &codes, 1, 256).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_framed_tap_records_raw_feeds_the_live_view_and_places_a_gap_and_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), analog_study());
+        let mut rx = capture.events_tx.subscribe();
+        let tap = capture.study.streams[0].clone();
+
+        // Blocks 0, 1, 3 (block 2 dropped); block 1 carries a marker edge.
+        let mut stream = Vec::new();
+        for (n, edge) in [(0u32, false), (1, true), (3, false)] {
+            stream.extend(analog_block(n * 256, edge));
+        }
+        let mut batches = 0;
+        for read in stream.chunks(512) {
+            let bytes = heapless::Vec::from_slice(read).unwrap();
+            write_stream_record(&capture, &tap, &StreamRecord { rx_utc_ms: 0, bytes });
+            while let Ok(event) = rx.try_recv() {
+                if let StudyEvent::SampleBatch { samples, stream_id, .. } = event {
+                    assert_eq!(stream_id, 0);
+                    assert_eq!(samples.len(), 256);
+                    assert_eq!(samples[1].value, f32::from(0x0A0B_i16));
+                    batches += 1;
+                }
+            }
+        }
+        finish_analog_taps(&capture);
+
+        assert_eq!(batches, 3, "a batch per verified block, as it arrives");
+
+        let streams = dir.path().join("streams");
+        assert_eq!(std::fs::read(streams.join("mic.bin")).unwrap(), stream, "raw bytes kept whole");
+        let events = std::fs::read_to_string(streams.join("mic.events.csv")).unwrap();
+        let rows: Vec<Vec<&str>> = events.lines().skip(1).map(|l| l.split(',').collect()).collect();
+        assert_eq!(rows.len(), 2, "{events}");
+        // Marker: block 1 starts at sample 256, edge at frame 4, level high.
+        assert_eq!(rows[0][..4], ["marker", "260", "1", "528"]);
+        // Gap: block 2 (index 512) missing, 256 samples, seen at block 3.
+        assert_eq!(rows[1][..4], ["gap", "512", "256", "1056"]);
+    }
+
+    #[test]
+    fn a_framed_tap_records_a_corrupted_block_as_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = test_capture(dir.path(), analog_study());
+        let tap = capture.study.streams[0].clone();
+        let mut stream = analog_block(0, false);
+        let mut bad = analog_block(256, false);
+        bad[50] ^= 0xFF;
+        stream.extend(bad);
+        stream.extend(analog_block(512, false));
+        for read in stream.chunks(300) {
+            let bytes = heapless::Vec::from_slice(read).unwrap();
+            write_stream_record(&capture, &tap, &StreamRecord { rx_utc_ms: 0, bytes });
+        }
+        finish_analog_taps(&capture);
+        let events =
+            std::fs::read_to_string(dir.path().join("streams").join("mic.events.csv")).unwrap();
+        assert!(events.contains("refused_crc,,528,528,"), "{events}");
+        assert!(events.contains("gap,256,256,1056,"), "{events}");
     }
 
     // ---- write_struct_rows (`embarch-study-designer` decision 52) ----
@@ -7353,6 +7589,7 @@ mod tests {
                     rendered_file: Some("outpost.trace.csv".to_string()),
                     encoding: StreamEncoding::OutpostTrace,
                     arrival_file: Some("outpost.arrival.csv".to_string()),
+                    events_file: None,
                     note: Some("decoded but NOT named: manifest build_id \"a\" != firmware build_id \"b\"".to_string()),
                     named: Some(false),
                     timed: Some(true),
@@ -7366,6 +7603,7 @@ mod tests {
                     rendered_file: Some("power.csv".to_string()),
                     encoding: StreamEncoding::Raw,
                     arrival_file: None,
+                    events_file: None,
                     note: None,
                     named: None,
                     timed: None,
@@ -7413,6 +7651,7 @@ mod tests {
                 rendered_file: None,
                 encoding: StreamEncoding::Raw,
                 arrival_file: None,
+                events_file: None,
                 note: None,
                 named: None,
                 timed: None,

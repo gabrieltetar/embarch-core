@@ -188,6 +188,13 @@ pub struct StreamIndexEntry {
     /// bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrival_file: Option<String>,
+    /// `kind,sample_index,value,raw_offset,core_rx_utc_ms` — the gaps,
+    /// refusals and marker edges of a **framed analog tap**, placed by sample
+    /// index (EMB-475). `None` for every other tap. The samples themselves
+    /// are in `raw_file`: at audio rate a row per sample would be hundreds of
+    /// megabytes for a five-minute session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_file: Option<String>,
     pub encoding: StreamEncoding,
     /// Why this tap's rendering is missing, incomplete, unnamed or untimed —
     /// set only when there is something to say. An `OutpostTrace` tap decoded
@@ -502,6 +509,10 @@ struct TapFiles {
     rendered: Option<SegmentedFile>,
     /// Only an `OutpostTrace` tap has one: see [`ArrivalLog`].
     arrival: Option<ArrivalLog>,
+    /// Only a framed analog tap has one, and it is never rotated: a row is
+    /// ~40 bytes against a block of 528, and losing the early rows would
+    /// shift every later sample index's meaning.
+    events: Option<SegmentedFile>,
     /// `StreamClose.dropped > 0` — data the *source* lost before it ever
     /// reached Core. A different loss from a retention rotation, reported
     /// through the same `StreamRef.truncated` flag because a reader's
@@ -644,6 +655,20 @@ impl StreamStore {
         decoders: &[StructLayout],
         max_bytes: u64,
     ) -> anyhow::Result<Self> {
+        Self::create_framed(results_dir, taps, decoders, max_bytes, &[])
+    }
+
+    /// [`create`](Self::create) for a study with framed analog taps (`framed`
+    /// is their ids). A framed tap gets an events file, and its raw file is
+    /// **never rotated**: a session's recording is exempt from retention
+    /// (EMB-469 decision 13), and rotation would delete its oldest minutes.
+    pub fn create_framed(
+        results_dir: &Path,
+        taps: &[StreamTap],
+        decoders: &[StructLayout],
+        max_bytes: u64,
+        framed: &[u8],
+    ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
 
         let dir = results_dir.join(STREAMS_DIR);
@@ -676,10 +701,13 @@ impl StreamStore {
                 _ => None,
             };
             let arrival_file = arrival_kind.map(|_| format!("{stem}.arrival.csv"));
+            let is_framed = framed.contains(&tap.id);
+            let events_file = is_framed.then(|| format!("{stem}.events.csv"));
+            let raw_max_bytes = if is_framed { 0 } else { max_bytes };
 
             files.push(TapFiles {
                 name: tap.name.as_str().to_string(),
-                raw: SegmentedFile::new(&dir, &raw_file, None, max_bytes),
+                raw: SegmentedFile::new(&dir, &raw_file, None, raw_max_bytes),
                 rendered: rendered_file
                     .as_ref()
                     .map(|f| {
@@ -697,6 +725,9 @@ impl StreamStore {
                     frames: 0,
                     pending: 0,
                     offset: 0,
+                }),
+                events: events_file.as_ref().map(|f| {
+                    SegmentedFile::new(&dir, f, Some(crate::analog_tap::EVENTS_HEADER.to_string()), 0)
                 }),
                 lost_at_source: false,
                 write_failed: false,
@@ -723,6 +754,7 @@ impl StreamStore {
                 raw_file,
                 rendered_file,
                 arrival_file,
+                events_file,
                 encoding: tap.encoding,
                 note,
                 named: None,
@@ -827,6 +859,26 @@ impl StreamStore {
                 "failed to append arrival stamps to {}: {e:?}; those frames will render \
                  without a time",
                 arrival.file.live.display()
+            );
+        }
+    }
+
+    /// Appends `events.csv` rows (already `\n`-terminated) for a framed
+    /// analog tap. A failed append marks the capture truncated, because a
+    /// missing gap row reads as a clean recording.
+    pub fn write_analog_events(&mut self, id: u8, rows: &str) {
+        let Some(tap) = self.taps.get_mut(usize::from(id)) else {
+            return;
+        };
+        let Some(events) = tap.events.as_mut() else {
+            return;
+        };
+        if let Err(e) = events.write(rows.as_bytes()) {
+            tap.write_failed = true;
+            tracing::error!(
+                name = tap.name.as_str(),
+                "failed to append analog events to {}: {e:?}",
+                events.live.display()
             );
         }
     }
@@ -975,7 +1027,8 @@ pub fn sweep_study_results(root: &Path, keep: usize, protected: &std::collection
         return Ok(0);
     }
 
-    let (_, gone) = crate::run_log::retained(study_result_dirs(root)?, keep, protected);
+    let protected = with_session_recordings(root, protected);
+    let (_, gone) = crate::run_log::retained(study_result_dirs(root)?, keep, &protected);
 
     let mut removed = 0;
     for (_, path) in gone {
@@ -988,6 +1041,40 @@ pub fn sweep_study_results(root: &Path, keep: usize, protected: &std::collection
         }
     }
     Ok(removed)
+}
+
+/// The file in a results directory that says its run was a session: a Start
+/// prompt, a capture, a Done prompt (EMB-475; the owner's EMB-469 decision 13).
+pub const SESSION_KEEP_FILE: &str = "session.keep";
+
+/// Marks `results_dir` as a session's recording, which retention never
+/// removes. Written when the study starts, before a byte is captured, so a
+/// crash mid-session leaves a directory still kept. A failure is returned:
+/// the caller must not start a recording it cannot protect without saying so.
+pub fn mark_session_recording(results_dir: &Path) -> std::io::Result<()> {
+    fs::write(
+        results_dir.join(SESSION_KEEP_FILE),
+        "a session's recording: exempt from the keep-last-N sweep (embarch-core decision 124)\n",
+    )
+}
+
+/// `protected` plus every directory under `root` marked by
+/// [`mark_session_recording`]. A session's recording is protected like an
+/// unpublished run: never removed, and not counted toward `keep`. Shared by
+/// the sweep and `GET /studies`, so the listing shows what the sweep keeps.
+pub fn with_session_recordings(
+    root: &Path,
+    protected: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out = protected.clone();
+    for (_, path) in study_result_dirs(root).unwrap_or_default() {
+        if path.join(SESSION_KEEP_FILE).is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Every study results directory under `root`, **newest first**, paired with
@@ -1544,6 +1631,58 @@ mod tests {
     fn sweeping_a_results_root_that_does_not_exist_yet_is_not_a_failure() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(sweep_study_results(&root.path().join("never-written"), 5, &Default::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_sessions_recording_survives_the_sweep_and_does_not_count_toward_keep() {
+        let root = tempfile::tempdir().unwrap();
+        let ids: Vec<String> = (0..5u8).map(|i| format!("{:032x}", i)).collect();
+        for (rank, id) in ids.iter().enumerate() {
+            make_result_dir(root.path(), id, 1_000 + rank as u64);
+        }
+        // The oldest run is a session's recording.
+        mark_session_recording(&root.path().join(&ids[0])).unwrap();
+
+        let removed = sweep_study_results(root.path(), 2, &Default::default()).unwrap();
+        // The recording is spared and is not one of the two kept: the two
+        // newest others stay, and the two between are swept.
+        assert_eq!(removed, 2);
+        assert!(root.path().join(&ids[0]).exists(), "the session's recording must survive");
+        assert!(root.path().join(&ids[3]).exists() && root.path().join(&ids[4]).exists());
+        assert!(!root.path().join(&ids[1]).exists() && !root.path().join(&ids[2]).exists());
+        // And an unmarked oldest run is swept, as before.
+        let other = tempfile::tempdir().unwrap();
+        for (rank, id) in ids.iter().enumerate() {
+            make_result_dir(other.path(), id, 1_000 + rank as u64);
+        }
+        sweep_study_results(other.path(), 2, &Default::default()).unwrap();
+        assert!(!other.path().join(&ids[0]).exists());
+    }
+
+    #[test]
+    fn a_framed_taps_raw_file_is_never_rotated_and_it_gets_an_events_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let taps = [
+            tap(0, "mic", StreamSource::AnalogInput { sample_hz: 32_000, channel: 0 }, StreamEncoding::Raw),
+            tap(1, "other", StreamSource::DevBenchLog, StreamEncoding::Raw),
+        ];
+        // A 4-byte cap rotates every unframed write.
+        let mut store = StreamStore::create_framed(dir.path(), &taps, &[], 4, &[0]).unwrap();
+        for _ in 0..5 {
+            store.write_raw(0, &[0xAB; 8]);
+            store.write_raw(1, &[0xCD; 8]);
+        }
+        store.write_analog_events(0, "gap,512,256,1056,1\n");
+        let refs = store.refs();
+        assert!(!refs[0].truncated, "a session's recording is never rotated");
+        assert!(refs[1].truncated, "an ordinary tap still is");
+        let streams = dir.path().join(STREAMS_DIR);
+        assert_eq!(fs::read(streams.join("mic.bin")).unwrap().len(), 40);
+        let events = fs::read_to_string(streams.join("mic.events.csv")).unwrap();
+        assert_eq!(events, format!("{}\ngap,512,256,1056,1\n", crate::analog_tap::EVENTS_HEADER));
+        let index = read_index(&streams).unwrap().unwrap();
+        assert_eq!(index.streams[0].events_file.as_deref(), Some("mic.events.csv"));
+        assert_eq!(index.streams[1].events_file, None);
     }
 
     // ---- env knobs ---------------------------------------------------------
