@@ -44,6 +44,9 @@ const MAX_NAME_BYTES: usize = 200;
 
 type Failure = (StatusCode, String);
 
+/// The stable `code` of the measurements route's `422` (core decision 141).
+const NO_MEASUREMENTS_CODE: &str = "no_measurements";
+
 fn internal(e: impl std::fmt::Display) -> Failure {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
 }
@@ -614,8 +617,9 @@ pub async fn file_handler(
 /// the study ended, with no publish and no revision (decision 121). The same
 /// run directory the publish routes read; nothing is recomputed. Three distinct
 /// refusals: `404` no such run, `409` the study has not ended, `422` no file was written (the
-/// study declared no measurements, failed, or is a host study), and `410` the
-/// run's files are gone.
+/// study declared no measurements, failed, or is a host study with no `parse`; the body is JSON
+/// `{error, code: "no_measurements"}`), and `410` the run's files are gone. A host study's file is
+/// served like a device study's: it sits in the same run directory.
 // route: GET /study/{study_id}/measurements
 pub async fn measurements_handler(State(state): State<AppState>, UrlPath(study_id): UrlPath<String>) -> Result<Response, Failure> {
     if state.study_jobs.lock().unwrap().get(&study_id).is_some_and(|j| j.status == "running") {
@@ -623,7 +627,7 @@ pub async fn measurements_handler(State(state): State<AppState>, UrlPath(study_i
     }
     let st = state.clone();
     let id = study_id.clone();
-    let out = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, Failure> {
+    let out = tokio::task::spawn_blocking(move || -> Result<Result<Vec<u8>, String>, Failure> {
         let lines = st.run_log.lines().map_err(internal)?;
         let entered = lines.iter().any(|l| l["entry"]["type"] == "run" && l["entry"]["study_id"] == id.as_str());
         if !entered {
@@ -631,10 +635,10 @@ pub async fn measurements_handler(State(state): State<AppState>, UrlPath(study_i
         }
         let dir = st.run_log.run_dir(&id);
         match std::fs::read(dir.join(crate::measurements::FILE)) {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok(Ok(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if dir.join("events.json").is_file() {
-                    Err((StatusCode::UNPROCESSABLE_ENTITY, format!("study {id} has no {}: it declared no measurements, did not complete, or is a host study", crate::measurements::FILE)))
+                    Ok(Err(format!("study {id} has no {}: it declared no measurements, did not complete, or is a host study with no parse step", crate::measurements::FILE)))
                 } else {
                     Err((StatusCode::GONE, format!("study {id}'s files are gone (discarded or swept by retention)")))
                 }
@@ -644,7 +648,10 @@ pub async fn measurements_handler(State(state): State<AppState>, UrlPath(study_i
     })
     .await
     .map_err(internal)??;
-    Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
+    match out {
+        Ok(bytes) => Ok(([(header::CONTENT_TYPE, "application/json")], bytes).into_response()),
+        Err(message) => Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": message, "code": NO_MEASUREMENTS_CODE }))).into_response()),
+    }
 }
 
 #[cfg(test)]
@@ -1020,13 +1027,22 @@ mod tests {
         finished_run(&state, "completed", r#""Pass""#, Scope::Agent);
         let (s, b) = send(&state, "GET", &uri, "agent", "").await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(String::from_utf8_lossy(&b).contains("declared no measurements"));
+        let body: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(body["code"], "no_measurements");
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("declared no measurements") && msg.contains("host study with no parse step"), "{msg}");
+        assert!(!msg.contains("cannot have"), "{msg}");
         // With the file Core wrote, the bytes come back unchanged, no publish run.
         let written = br#"{"schema":1,  "behaviours":{"x":[1,2]}}"#;
         std::fs::write(state.run_log.run_dir(ID).join(crate::measurements::FILE), written).unwrap();
         let (s, b) = send(&state, "GET", &uri, "agent", "").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b, written);
+        // A host study's file (decision 131: a parse per pass of a `Repeat`) is served the same way.
+        let host = br#"{"schema":1,"measurements":[{"name":"v","source":{"file":"events.json","step":"read","iteration":2}}]}"#;
+        std::fs::write(state.run_log.run_dir(ID).join(crate::measurements::FILE), host).unwrap();
+        let (s, b) = send(&state, "GET", &uri, "agent", "").await;
+        assert_eq!((s, b.as_slice()), (StatusCode::OK, host.as_slice()));
         // A study still running refuses, even with a file on disk.
         state.study_jobs.lock().unwrap().insert(ID.to_string(), crate::study::StudyJob { status: "running".into(), current_step: None, total_steps: None, reason: None });
         let (s, b) = send(&state, "GET", &uri, "agent", "").await;
