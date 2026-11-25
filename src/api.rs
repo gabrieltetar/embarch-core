@@ -524,7 +524,7 @@ struct StatusResponse {
     /// The last image Core flashed (or bootloaded) per chip since it started
     /// (decision 93). Empty means unknown, not "nothing flashed".
     last_images: Vec<lease::FlashedImage>,
-    /// `service` (`run --service`) or `development` (decision 134).
+    /// `service` (`run --service`) or `development` (decision 129).
     mode: &'static str,
     /// SHA-256 of Core's raw public key, hex: the fingerprint a client pins.
     keyid: String,
@@ -3670,7 +3670,7 @@ mod tests {
         assert_eq!(json["core_version"], "9.9.9");
     }
 
-    /// `mode`, `keyid` and `study_in_flight` (decision 134): the study id while
+    /// `mode`, `keyid` and `study_in_flight` (decision 129): the study id while
     /// one holds the lock, `null` otherwise and during the dev-bench hello.
     #[tokio::test]
     async fn status_carries_mode_keyid_and_the_study_in_flight() {

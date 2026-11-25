@@ -18,7 +18,7 @@ pub fn local_data_dir() -> Result<PathBuf> {
 }
 
 /// Where Core keeps its state, chosen once at start by `run`'s flags
-/// (decision 134). `Legacy` is every path under `local_data_dir()`, as before
+/// (decision 129). `Legacy` is every path under `local_data_dir()`, as before
 /// the flags existed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreLayout {
