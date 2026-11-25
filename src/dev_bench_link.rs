@@ -149,6 +149,40 @@ pub enum Received {
     Deadline,
 }
 
+/// What a study's run loop needs of the dev-bench link, so a test can drive the loop with a
+/// scripted bench instead of a serial port (decision 128). [`DevBenchLink`] is the only
+/// implementation in the service.
+pub trait BenchLink {
+    /// Sends one message to the bench.
+    fn send(&mut self, msg: &DevBenchMessage) -> Result<()>;
+    /// Waits for the next frame until `deadline`.
+    fn recv(&mut self, deadline: Instant) -> Result<Received>;
+    /// How many frames arrived and would not decode.
+    fn undecodable_frames(&self) -> u64;
+    /// The unframed bytes read, shortened for a failure reason.
+    fn unframed_tail(&self) -> Option<String>;
+    /// The unframed bytes read, in full, for the debug file.
+    fn unframed_tail_full(&self) -> Option<String>;
+}
+
+impl BenchLink for DevBenchLink {
+    fn send(&mut self, msg: &DevBenchMessage) -> Result<()> {
+        DevBenchLink::send(self, msg)
+    }
+    fn recv(&mut self, deadline: Instant) -> Result<Received> {
+        DevBenchLink::recv(self, deadline)
+    }
+    fn undecodable_frames(&self) -> u64 {
+        DevBenchLink::undecodable_frames(self)
+    }
+    fn unframed_tail(&self) -> Option<String> {
+        DevBenchLink::unframed_tail(self)
+    }
+    fn unframed_tail_full(&self) -> Option<String> {
+        DevBenchLink::unframed_tail_full(self)
+    }
+}
+
 impl DevBenchLink {
     /// Opens `port_name` at [`DEV_BENCH_BAUD`]. Does not send `Hello` or do
     /// anything else protocol-level — that's `study.rs`'s job.

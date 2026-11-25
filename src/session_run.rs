@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use embarch_study_designer::{validate_run_answers, RunFieldValue, SessionSpec};
 use serde::{Deserialize, Serialize};
 use std::path::Path as FsPath;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -150,6 +151,8 @@ pub enum StartOutcome {
     Cancelled(AnsweredBy),
     /// Nobody answered within [`START_TIMEOUT`].
     TimedOut,
+    /// `POST /study/{id}/cancel` came while the prompt waited (decision 128).
+    StudyCancelled,
 }
 
 /// How a session's sampling ended.
@@ -159,6 +162,8 @@ pub enum SessionEnd {
     Done(AnsweredBy),
     /// The cap came first.
     Cap,
+    /// `POST /study/{id}/cancel` (decision 128).
+    Cancelled,
     /// The bench said the study was done (every step reported) before either.
     StudyDone,
     /// The run failed.
@@ -171,6 +176,7 @@ impl SessionEnd {
         match self {
             SessionEnd::Done(_) => "confirmed",
             SessionEnd::Cap => "timed_out",
+            SessionEnd::Cancelled => "study_cancelled",
             SessionEnd::StudyDone => "study_ended",
             SessionEnd::Failed => "study_failed",
         }
@@ -181,6 +187,7 @@ impl SessionEnd {
         match self {
             SessionEnd::Done(_) => "done",
             SessionEnd::Cap => "cap",
+            SessionEnd::Cancelled => "cancelled",
             SessionEnd::StudyDone => "study_done",
             SessionEnd::Failed => "failed",
         }
@@ -223,7 +230,14 @@ impl SessionPrompter {
     /// Raises the Start prompt and waits for an answer that passed `validate_run_answers` (an
     /// answer that fails never lands: the route refuses it and the prompt stays), for a cancel,
     /// or for [`START_TIMEOUT`]. Blocking: call it off the async runtime.
+    #[cfg(test)]
     pub fn raise_start(&self, spec: &SessionSpec, timeout: Duration) -> StartOutcome {
+        self.raise_start_unless_cancelled(spec, timeout, None)
+    }
+
+    /// [`Self::raise_start`], also ending when `cancel` is set (the study's cancel route): the
+    /// prompt resolves `study_cancelled` and nothing was sent to the bench.
+    pub fn raise_start_unless_cancelled(&self, spec: &SessionSpec, timeout: Duration, cancel: Option<&AtomicBool>) -> StartOutcome {
         let opened = now_ms();
         let pending = PendingPrompt {
             prompt_id: START_PROMPT_ID,
@@ -255,6 +269,7 @@ impl SessionPrompter {
                         Some((StartOutcome::Confirmed { run_values, answered_by: by, answered_utc_ms: now_ms() }, "confirmed", Some(by)))
                     }
                     Some((PromptAnswer::Cancelled, by)) => Some((StartOutcome::Cancelled(by), "cancelled", Some(by))),
+                    None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => Some((StartOutcome::StudyCancelled, "study_cancelled", None)),
                     None if Instant::now() >= deadline => Some((StartOutcome::TimedOut, "timed_out", None)),
                     None => None,
                 };
@@ -355,9 +370,13 @@ pub struct SessionRecord {
     /// When the bench was told to start: the cap runs from here.
     pub sampling_started_utc_ms: Option<u64>,
     pub ended_utc_ms: Option<u64>,
-    /// `done`, `cap`, `study_done` or `failed`.
+    /// `done`, `cap`, `cancelled`, `study_done` or `failed`.
     pub ended_by: Option<&'static str>,
     pub done_answered_by: Option<AnsweredBy>,
+    /// What closed the run after Core asked the bench to stop (decision 128): `study_done` (the
+    /// bench answered), `timeout` (it did not within the bound) or `send_failed`. Absent when the
+    /// bench's own `StudyDone` came first and no stop was sent.
+    pub stop_closed_by: Option<&'static str>,
 }
 
 impl SessionRecord {
@@ -379,6 +398,7 @@ impl SessionRecord {
             ended_utc_ms: None,
             ended_by: None,
             done_answered_by: None,
+            stop_closed_by: None,
         }
     }
 

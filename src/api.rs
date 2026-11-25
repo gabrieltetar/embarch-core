@@ -57,6 +57,9 @@ pub struct AppState {
     pub tap_ports: study::TapPorts,
     /// The cancel flag of the host study in flight (`host_study.rs`, decision 95).
     pub host_cancel: crate::host_study::HostCancel,
+    /// The cancel flag of the device study in flight (`study.rs`, decision 128): the same shape as
+    /// `host_cancel`, held apart so a host study's cancel path is not touched.
+    pub device_cancel: crate::host_study::HostCancel,
     /// The host study's pending `Prompt` and its answer (`host_study.rs`, decision 105).
     pub host_prompt: crate::host_study::HostPrompt,
     /// Background captures by signal name (`capture.rs`, decision 92).
@@ -95,6 +98,7 @@ impl AppState {
             outpost_manifest: crate::outpost_manifest::ManifestSlot::new(),
             tap_ports: study::TapPorts::default(),
             host_cancel: Arc::new(StdMutex::new(None)),
+            device_cancel: Arc::new(StdMutex::new(None)),
             host_prompt: Arc::new(StdMutex::new(None)),
             captures: crate::capture::CaptureRegistry::default(),
             lease: lease::LeaseSlot::watching(study_lock.clone()),

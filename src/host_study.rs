@@ -1503,10 +1503,12 @@ pub struct CancelResponse {
     status: &'static str,
 }
 
-/// `POST /study/{id}/cancel`: asks the running host study to stop. `202` once the flag is set:
-/// the step in flight finishes (an exchange cannot be interrupted, so within its `timeout_ms`),
-/// the remaining steps are skipped and the teardown runs. `409` for a study that is not a running
-/// host study, `404` for an id Core has never seen.
+/// `POST /study/{id}/cancel`: asks the running study to stop. `202` once the flag is set. A host
+/// study's step in flight finishes (an exchange cannot be interrupted, so within its `timeout_ms`),
+/// the remaining steps are skipped and the teardown runs. A device study (decision 128, any
+/// device study, session or not) is sent `StudyStop { Cancel }` within one poll and ends on the
+/// bench's `StudyDone` or a bounded timeout. Either token may cancel (decision 128). `409` for a
+/// study that is not running, `404` for an id Core has never seen.
 // route: POST /study/{study_id}/cancel
 pub async fn cancel_study_handler(
     State(state): State<AppState>,
@@ -1518,11 +1520,17 @@ pub async fn cancel_study_handler(
             return Ok((StatusCode::ACCEPTED, Json(CancelResponse { study_id, status: "cancelling" })));
         }
     }
+    if let Some((id, flag)) = state.device_cancel.lock().unwrap().as_ref() {
+        if *id == study_id {
+            flag.store(true, Ordering::SeqCst);
+            return Ok((StatusCode::ACCEPTED, Json(CancelResponse { study_id, status: "cancelling" })));
+        }
+    }
     let job = state.study_jobs.lock().unwrap().get(&study_id).cloned();
     match job {
         Some(j) if j.status == "running" => Err((
             StatusCode::CONFLICT,
-            format!("study '{study_id}' is a running bench study; only a host study can be cancelled"),
+            format!("study '{study_id}' is running but holds no cancel flag, so Core cannot stop it from here"),
         )),
         Some(j) => Err((StatusCode::CONFLICT, format!("study '{study_id}' is not running (status: {}); nothing to cancel", j.status))),
         None => Err((StatusCode::NOT_FOUND, format!("no study '{study_id}' is known to this Core"))),
@@ -2354,7 +2362,7 @@ mod tests {
         state.study_jobs.lock().unwrap().insert("d1".into(), StudyJob { status: "completed".into(), current_step: None, total_steps: None, reason: None });
         let e = cancel_study_handler(State(state.clone()), Path("b1".into())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT);
-        assert!(e.1.contains("bench study"));
+        assert!(e.1.contains("no cancel flag"));
         assert_eq!(cancel_study_handler(State(state.clone()), Path("d1".into())).await.unwrap_err().0, StatusCode::CONFLICT);
         assert_eq!(cancel_study_handler(State(state), Path("nope".into())).await.unwrap_err().0, StatusCode::NOT_FOUND);
     }

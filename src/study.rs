@@ -25,7 +25,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use embarch_study_designer::{
     limits::{MAX_FIRMWARE_VERSION_LEN, MAX_VERSION_OVERRIDES},
     dev_bench_log_tap, protocols_crc, requirement_satisfied, samples_in, steps_crc, streams_crc,
-    csv_cell_ok, validate_protocol, validate_record_checks, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Outcome, Provenance,
+    csv_cell_ok, StopReason, validate_protocol, validate_record_checks, validate_taps, Action, DevBenchMessage, GattTranscriptEntry, Outcome, Provenance,
     Requirements, Sample,
     StepResult, StreamEncoding, StreamRecord, StreamRef, StreamSource, StreamTap, Study,
     VersionOverride, VersionSource, VersionSubject,
@@ -33,7 +33,7 @@ use embarch_study_designer::{
 };
 
 use crate::api::{internal_err, AppState};
-use crate::dev_bench_link::{DevBenchLink, Received};
+use crate::dev_bench_link::{BenchLink, DevBenchLink, Received};
 use crate::stream_store::{self, StreamStore};
 use crate::token_store;
 
@@ -955,6 +955,75 @@ const POST_ACK_DRAIN_MS: u64 = 250;
 /// known fault produces (one per failing step) and far below a spin.
 const MAX_UNDECODABLE_FRAMES: u64 = 10;
 
+/// How long Core keeps reading after it sends `StudyStop`, for the bench's `StudyDone` (and, ahead
+/// of it, each open tap's `StreamClose`). The bench's teardown clears its bonds and may take up to
+/// about 2 s before it sends `StudyDone`; the rest is margin for the link and for a `StreamClose`
+/// flush. Reasoned from that figure, not measured: a real bench run owes the real time (decision
+/// 128). Bounded because a bench that never answers must not hold the study lock.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What closed a run after Core sent `StudyStop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopClose {
+    /// The bench answered with `StudyDone`; every tap's `StreamClose` came before it.
+    StudyDone,
+    /// [`STOP_TIMEOUT`] passed with no `StudyDone`.
+    Timeout,
+    /// `StudyStop` could not be written to the link.
+    SendFailed,
+}
+
+impl StopClose {
+    /// What `session.json` records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopClose::StudyDone => "study_done",
+            StopClose::Timeout => "timeout",
+            StopClose::SendFailed => "send_failed",
+        }
+    }
+}
+
+/// The stop Core has asked for and is waiting on the bench to confirm.
+struct Stopping {
+    reason: StopReason,
+    deadline: Instant,
+}
+
+/// The `StudyStop` reason for a session's end: what ended the capture is what the bench is told.
+fn stop_reason_of(end: crate::session_run::SessionEnd) -> StopReason {
+    use crate::session_run::SessionEnd;
+    match end {
+        SessionEnd::Done(_) => StopReason::Done,
+        SessionEnd::Cap => StopReason::Cap,
+        SessionEnd::Cancelled => StopReason::Cancel,
+        // Not reachable: a watch's poll answers Done or Cap, and the others are set after the loop.
+        SessionEnd::StudyDone | SessionEnd::Failed => StopReason::Cancel,
+    }
+}
+
+/// How a run ends once a stop was asked for. `completed` is the bench's own `StudyDone` flag when
+/// it came. **A bench that finished on its own first (`completed: true`) is a finished study**,
+/// whatever Core had asked: the stop raced the end and lost harmlessly. Otherwise a cancel is a
+/// failure that says so, and a Done or the cap is a completed run (the session asked for the
+/// early end) whether or not the bench confirmed; `session.json` and the log say which.
+fn stop_outcome(reason: StopReason, close: StopClose, completed: Option<bool>, stop_timeout: Duration) -> Result<(), String> {
+    if completed == Some(true) {
+        return Ok(());
+    }
+    match reason {
+        StopReason::Cap | StopReason::Done => Ok(()),
+        StopReason::Cancel => Err(match close {
+            StopClose::StudyDone => "cancelled: the bench stopped the study and answered with StudyDone".to_string(),
+            StopClose::Timeout => format!(
+                "cancelled: the bench did not answer StudyStop with StudyDone within {} ms; Core closed the capture anyway and the bench may still be running its study",
+                stop_timeout.as_millis()
+            ),
+            StopClose::SendFailed => "cancelled: StudyStop could not be sent to the bench; it may still be running its study".to_string(),
+        }),
+    }
+}
+
 /// Reads whatever `LogLine`s dev-bench sends immediately after `HelloAck`, into
 /// the debug file, before this function's caller does anything else with the
 /// link.
@@ -1648,6 +1717,8 @@ pub async fn post_study_handler(
     let manifest_slot = state.outpost_manifest.clone();
     let tap_ports = state.tap_ports.clone();
     let study_id_for_task = study_id.clone();
+    let cancel = register_device_cancel(&state, &study_id);
+    let device_cancel = state.device_cancel.clone();
 
     tokio::spawn(async move {
         let jobs_for_panic = jobs.clone();
@@ -1668,6 +1739,7 @@ pub async fn post_study_handler(
                 study_start_utc_ms,
                 seal,
                 None,
+                cancel,
             )
         })
         .await;
@@ -1683,10 +1755,19 @@ pub async fn post_study_handler(
 
         // Before the lock clears, so the idle clock restarts while the run still counts (decision 123).
         lease_slot.study_ended();
+        *device_cancel.lock().unwrap() = None;
         *study_lock.lock().unwrap() = None;
     });
 
     Ok((StatusCode::ACCEPTED, Json(StudyAcceptedResponse { study_id, status: "accepted" })))
+}
+
+/// Registers the cancel flag of the device study now running, for `POST /study/{id}/cancel` to set.
+/// One at a time, like the study lock; the study's task clears it when the run ends.
+fn register_device_cancel(state: &AppState, study_id: &str) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    *state.device_cancel.lock().unwrap() = Some((study_id.to_string(), flag.clone()));
+    flag
 }
 
 // ---- a study with a session (decision 127) ----------------------------------
@@ -1776,6 +1857,8 @@ async fn start_session_study(
     let tap_ports = state.tap_ports.clone();
     let prompts = state.host_prompt.clone();
     let id = study_id.clone();
+    let cancel = register_device_cancel(state, &study_id);
+    let device_cancel = state.device_cancel.clone();
 
     tokio::spawn(async move {
         let jobs_for_panic = jobs.clone();
@@ -1785,7 +1868,7 @@ async fn start_session_study(
         let prompter = crate::session_run::SessionPrompter::new(prompts, events_tx.clone(), id.clone());
 
         let outcome = tokio::task::spawn_blocking(move || {
-            run_session_study(link, study, id, jobs, events_tx, provenance, manifest_slot, tap_ports, prompter, seal)
+            run_session_study(link, study, id, jobs, events_tx, provenance, manifest_slot, tap_ports, prompter, seal, cancel)
         })
         .await;
 
@@ -1795,6 +1878,7 @@ async fn start_session_study(
         // Whatever ended the study, no prompt of it stays on screen.
         *prompts_for_end.lock().unwrap() = None;
         lease_slot.study_ended();
+        *device_cancel.lock().unwrap() = None;
         *study_lock.lock().unwrap() = None;
     });
 
@@ -1820,16 +1904,21 @@ fn run_session_study(
     tap_ports: TapPorts,
     prompter: crate::session_run::SessionPrompter,
     seal: crate::signing::SealJob,
+    cancel: Arc<AtomicBool>,
 ) {
     use crate::session_run::{SessionRecord, StartOutcome, START_TIMEOUT};
     let Some(spec) = study.session.clone() else {
         fail_job(&jobs, &events_tx, &study_id, "a session run was started for a study with no session".to_string());
         return;
     };
-    let (run_values, answered_by, answered_utc_ms) = match prompter.raise_start(&spec, START_TIMEOUT) {
+    let (run_values, answered_by, answered_utc_ms) = match prompter.raise_start_unless_cancelled(&spec, START_TIMEOUT, Some(&cancel)) {
         StartOutcome::Confirmed { run_values, answered_by, answered_utc_ms } => (run_values, answered_by, answered_utc_ms),
         StartOutcome::Cancelled(by) => {
             fail_job(&jobs, &events_tx, &study_id, format!("the session's Start prompt was cancelled (from {}); nothing was sent to the dev bench", by.as_str()));
+            return;
+        }
+        StartOutcome::StudyCancelled => {
+            fail_job(&jobs, &events_tx, &study_id, "the study was cancelled while its Start prompt waited; nothing was sent to the dev bench".to_string());
             return;
         }
         StartOutcome::TimedOut => {
@@ -1870,6 +1959,7 @@ fn run_session_study(
         study_start_utc_ms,
         seal,
         Some(SessionRun { prompter, spec, record, sampling_started }),
+        cancel,
     );
 }
 
@@ -2005,9 +2095,14 @@ fn advance_step_counters(capture: &Capture, jobs: &JobRegistry, study_id: &str, 
 /// (`embarch-study-designer` spec.md §5.1 steps 8+, §5.2, and
 /// `decisions 30/31`). Entirely blocking — called from `spawn_blocking` by
 /// [`post_study_handler`].
+///
+/// **Core asks the bench to stop** at a session's Done, at its cap, and on `POST /study/{id}/cancel`
+/// (decision 128): it sends `StudyStop` with the reason, keeps reading (the taps' `StreamClose` and
+/// the samples port's bytes still arrive) until the bench's `StudyDone` or [`STOP_TIMEOUT`], and
+/// only then closes its own ports. `cancel` is the flag the route sets.
 #[allow(clippy::too_many_arguments)]
 fn run_study_to_completion(
-    mut link: DevBenchLink,
+    link: DevBenchLink,
     study: Study,
     study_id: String,
     jobs: JobRegistry,
@@ -2018,7 +2113,8 @@ fn run_study_to_completion(
     analog_samples: Option<crate::analog_source::OpenedSamples>,
     study_start_utc_ms: u64,
     seal: crate::signing::SealJob,
-    mut session: Option<SessionRun>,
+    session: Option<SessionRun>,
+    cancel: Arc<AtomicBool>,
 ) {
     let results_dir = match study_results_dir(&study_id) {
         Ok(dir) => dir,
@@ -2027,6 +2123,35 @@ fn run_study_to_completion(
             return;
         }
     };
+    let sweep_root = study_results_root().ok();
+    run_study_in(
+        link, study, study_id, results_dir, sweep_root, jobs, events_tx, provenance, manifest_slot, tap_ports, analog_samples,
+        study_start_utc_ms, Some(seal), session, cancel, STOP_TIMEOUT,
+    );
+}
+
+/// [`run_study_to_completion`] once its results directory is known, over any [`BenchLink`]: the
+/// seam a test drives with a scripted bench. `sweep_root` is where retention runs (none in a test)
+/// and `seal` is `None` where there is no signing key's directory to write to.
+#[allow(clippy::too_many_arguments)]
+fn run_study_in<L: BenchLink>(
+    mut link: L,
+    study: Study,
+    study_id: String,
+    results_dir: PathBuf,
+    sweep_root: Option<PathBuf>,
+    jobs: JobRegistry,
+    events_tx: broadcast::Sender<StudyEvent>,
+    provenance: Provenance,
+    manifest_slot: crate::outpost_manifest::ManifestSlot,
+    tap_ports: TapPorts,
+    analog_samples: Option<crate::analog_source::OpenedSamples>,
+    study_start_utc_ms: u64,
+    seal: Option<crate::signing::SealJob>,
+    mut session: Option<SessionRun>,
+    cancel: Arc<AtomicBool>,
+    stop_timeout: Duration,
+) {
     if let Err(e) = std::fs::create_dir_all(&results_dir) {
         fail_job(
             &jobs,
@@ -2066,7 +2191,7 @@ fn run_study_to_completion(
     // exists, so `keep` is exact and counts the run in progress rather than
     // being one out. A sweep that fails is logged and ignored — losing disk
     // hygiene is not a reason to lose a capture.
-    if let Ok(root) = study_results_root() {
+    if let Some(root) = sweep_root {
         retention_sweep(&root, stream_store::study_results_keep(), crate::run_log::protected_ids());
     }
 
@@ -2259,19 +2384,46 @@ fn run_study_to_completion(
     let mut session = session.map(|run| (run.prompter.begin_sampling(&run.spec, run.sampling_started), run.record));
     let mut session_end: Option<crate::session_run::SessionEnd> = None;
 
+    // Set once Core has sent `StudyStop`: from then on the loop only waits for the bench's
+    // `StudyDone`, still keeping every tap's bytes, and `stop_close` says how that wait ended.
+    let mut stopping: Option<Stopping> = None;
+    let mut stop_close: Option<StopClose> = None;
+
     let outcome = loop {
-        // A session's Done answer and its cap are looked at before every receive, and the receive
-        // is cut to one poll so neither waits on a quiet bench.
-        let recv_deadline = match &session {
-            Some((watch, _)) => {
+        // The cancel flag, a session's Done answer and its cap are looked at before every receive,
+        // and the receive is cut to one poll so none of them waits on a quiet bench. A cancel wins
+        // a tie with Done: it is the explicit one.
+        let recv_deadline = match &stopping {
+            Some(s) => s.deadline,
+            None => {
                 let now = Instant::now();
-                if let Some(end) = watch.poll(now) {
+                let wanted = if cancel.load(Ordering::SeqCst) {
+                    Some(crate::session_run::SessionEnd::Cancelled)
+                } else {
+                    session.as_ref().and_then(|(watch, _)| watch.poll(now))
+                };
+                if let Some(end) = wanted {
                     session_end = Some(end);
-                    break Ok(());
+                    let reason = stop_reason_of(end);
+                    match link.send(&DevBenchMessage::StudyStop { reason }) {
+                        Ok(()) => {
+                            tracing::info!(study_id, ?reason, "sent StudyStop; waiting for the bench's StudyDone");
+                            crate::dev_bench_log::note(Some(&study_id), &format!("StudyStop sent ({reason:?}); waiting for StudyDone"));
+                            stopping = Some(Stopping { reason, deadline: now + stop_timeout });
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(study_id, ?reason, "failed to send StudyStop: {e:?}");
+                            stop_close = Some(StopClose::SendFailed);
+                            break stop_outcome(reason, StopClose::SendFailed, None, stop_timeout);
+                        }
+                    }
                 }
-                watch.recv_deadline(deadline, now)
+                match &session {
+                    Some((watch, _)) => watch.recv_deadline(deadline, now),
+                    None => deadline.min(now + crate::host_study::CANCEL_POLL),
+                }
             }
-            None => deadline,
         };
         match link.recv(recv_deadline) {
             Ok(Received::Message(DevBenchMessage::StepResult { step_index, result })) => {
@@ -2319,6 +2471,12 @@ fn run_study_to_completion(
             }
             Ok(Received::Message(DevBenchMessage::StudyDone { completed })) => {
                 tracing::info!(study_id, completed, "study run finished (StudyDone)");
+                // A `StudyDone` after Core's `StudyStop` is the bench's answer; one that was already
+                // on its way is the study's own end, and `stop_outcome` treats both as done.
+                if let Some(s) = &stopping {
+                    stop_close = Some(StopClose::StudyDone);
+                    break stop_outcome(s.reason, StopClose::StudyDone, Some(completed), stop_timeout);
+                }
                 // **`completed` is not decoration, and ignoring it reported a
                 // dead study as a successful one.** dev-bench sets it false
                 // exactly when it stopped early because a step failed with
@@ -2560,8 +2718,27 @@ fn run_study_to_completion(
                     ));
                 }
             }
-            // Only the session's poll slice or its cap ran out: the watchdog's own deadline has not.
-            Ok(Received::Deadline) if session.is_some() && Instant::now() < deadline => continue,
+            // The bench did not answer `StudyStop` in time: the capture is closed regardless.
+            Ok(Received::Deadline) if stopping.is_some() => {
+                let (reason, stop_deadline) = stopping.as_ref().map(|s| (s.reason, s.deadline)).expect("guarded by is_some");
+                if Instant::now() < stop_deadline {
+                    continue;
+                }
+                let open: Vec<u8> = open_taps.iter().copied().collect();
+                tracing::warn!(
+                    study_id,
+                    ?open,
+                    "the bench did not answer StudyStop with StudyDone in time; closing the capture anyway"
+                );
+                crate::dev_bench_log::note(
+                    Some(&study_id),
+                    &format!("no StudyDone within {} ms of StudyStop; taps still open: {open:?}", stop_timeout.as_millis()),
+                );
+                stop_close = Some(StopClose::Timeout);
+                break stop_outcome(reason, StopClose::Timeout, None, stop_timeout);
+            }
+            // Only a poll slice or the session's cap ran out: the watchdog's own deadline has not.
+            Ok(Received::Deadline) if Instant::now() < deadline => continue,
             Ok(Received::Deadline) => {
                 // **What arrived and never became a frame goes in the failure
                 // reason, because on this link that text *is* the diagnosis.**
@@ -2615,6 +2792,7 @@ fn run_study_to_completion(
         });
         watch.resolve(end);
         record.end(end, current_utc_ms());
+        record.stop_closed_by = stop_close.map(StopClose::as_str);
         if let Err(e) = record.write(&results_dir) {
             tracing::warn!(study_id, "failed to record how the session ended in session.json: {e:?}");
         }
@@ -2626,11 +2804,11 @@ fn run_study_to_completion(
     render_outpost_traces(&results_dir, &capture.taps, study_manifest.as_ref());
 
     match outcome {
-        Ok(()) => match write_measurements(&capture, &refs, &results_dir, &study_id, Some(&seal)) {
+        Ok(()) => match write_measurements(&capture, &refs, &results_dir, &study_id, seal.as_ref()) {
             // A run whose declared measurements cannot be computed fails
             // rather than completes without them, as an unsignable one does.
             Err(e) => fail_job(&jobs, &events_tx, &study_id, format!("failed to write measurements.json: {e:?}")),
-            Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer, Some(&seal)),
+            Ok(()) => finish_job(&jobs, &events_tx, &study_id, writer, seal.as_ref()),
         },
         Err(reason) => fail_job(&jobs, &events_tx, &study_id, reason),
     }
@@ -5294,6 +5472,7 @@ mod tests {
         Action, BleRole,
     };
     use heapless::Vec as HVec;
+    use std::collections::VecDeque;
 
     fn step(name: &str, timeout_ms: u32) -> embarch_study_designer::Step {
         embarch_study_designer::Step {
@@ -8314,5 +8493,331 @@ mod tests {
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(seen.lock().unwrap().as_deref(), Some(HELLO_HOLDER));
         assert!(state.study_lock.lock().unwrap().is_none());
+    }
+
+    // ---- stopping the bench (decision 128) ----------------------------------------------------
+
+    /// What the scripted bench does when it is sent `StudyStop`.
+    #[derive(Clone, Copy)]
+    enum OnStop {
+        /// Closes every open tap, then `StudyDone { completed: false }`, `after` later.
+        Answer { after: Duration },
+        /// A `LogLine` and nothing else: the study it was told to stop is not running.
+        LogLineOnly,
+        /// Nothing at all.
+        Silent,
+    }
+
+    /// A bench Core talks to over [`BenchLink`]: messages become readable at a time, and a
+    /// `StudyStop` is answered as scripted. Every message it hands out and every one sent to it
+    /// is kept, in order.
+    struct FakeBench {
+        queue: VecDeque<(Instant, DevBenchMessage)>,
+        on_stop: OnStop,
+        open_taps: Vec<u8>,
+        sent: Arc<StdMutex<Vec<DevBenchMessage>>>,
+        delivered: Arc<StdMutex<Vec<DevBenchMessage>>>,
+    }
+
+    impl BenchLink for FakeBench {
+        fn send(&mut self, msg: &DevBenchMessage) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(msg.clone());
+            if let DevBenchMessage::StudyStop { .. } = msg {
+                let now = Instant::now();
+                match self.on_stop {
+                    OnStop::Answer { after } => {
+                        for id in self.open_taps.drain(..) {
+                            self.queue.push_back((now + after, DevBenchMessage::StreamClose { id, dropped: 0 }));
+                        }
+                        self.queue.push_back((now + after, DevBenchMessage::StudyDone { completed: false }));
+                    }
+                    OnStop::LogLineOnly => {
+                        let text = heapless::String::try_from("no study running").unwrap();
+                        self.queue.push_back((now, DevBenchMessage::LogLine { text }));
+                    }
+                    OnStop::Silent => {}
+                }
+            }
+            Ok(())
+        }
+
+        fn recv(&mut self, deadline: Instant) -> anyhow::Result<Received> {
+            loop {
+                let now = Instant::now();
+                if let Some((at, _)) = self.queue.front() {
+                    if *at <= now {
+                        let (_, msg) = self.queue.pop_front().unwrap();
+                        self.delivered.lock().unwrap().push(msg.clone());
+                        return Ok(Received::Message(msg));
+                    }
+                }
+                if now >= deadline {
+                    return Ok(Received::Deadline);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn undecodable_frames(&self) -> u64 {
+            0
+        }
+        fn unframed_tail(&self) -> Option<String> {
+            None
+        }
+        fn unframed_tail_full(&self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A run in flight on its own thread, over a scripted bench.
+    struct Rig {
+        dir: tempfile::TempDir,
+        jobs: JobRegistry,
+        cancel: Arc<AtomicBool>,
+        prompts: crate::host_study::HostPrompt,
+        sent: Arc<StdMutex<Vec<DevBenchMessage>>>,
+        delivered: Arc<StdMutex<Vec<DevBenchMessage>>>,
+        run: std::thread::JoinHandle<()>,
+        started: Instant,
+    }
+
+    fn session_spec(max_duration_ms: u32) -> embarch_study_designer::SessionSpec {
+        embarch_study_designer::SessionSpec {
+            start_text: heapless::String::try_from("Place the sensor").unwrap(),
+            run_fields: heapless::Vec::new(),
+            done_text: heapless::String::try_from("Recording finished").unwrap(),
+            max_duration_ms,
+            export_dir: heapless::String::try_from("exports/mic").unwrap(),
+        }
+    }
+
+    /// Starts `run_study_in` over a bench that has `StreamOpen`ed tap 0 and is sampling.
+    /// `session_cap_ms` makes it a session study with that cap; `ready` are messages the bench
+    /// has already queued, each readable after the given delay.
+    fn start_run(on_stop: OnStop, session_cap_ms: Option<u32>, ready: Vec<(Duration, DevBenchMessage)>, stop_timeout: Duration) -> Rig {
+        let mut study = study_with_taps(&[60_000], &[tap(0, "mic", StreamSource::AnalogInput { sample_hz: 32_000, channel: 0 }, StreamEncoding::Raw)]);
+        let spec = session_cap_ms.map(session_spec);
+        study.session = spec.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = empty_registry();
+        jobs.lock().unwrap().insert("s1".to_string(), running_job(1));
+        let (events_tx, _rx) = broadcast::channel(64);
+        let prompts: crate::host_study::HostPrompt = Arc::new(StdMutex::new(None));
+        let started = Instant::now();
+        let mut queue = VecDeque::new();
+        queue.push_back((started, DevBenchMessage::StreamOpen { id: 0 }));
+        for (after, msg) in ready {
+            queue.push_back((started + after, msg));
+        }
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let delivered = Arc::new(StdMutex::new(Vec::new()));
+        let bench = FakeBench { queue, on_stop, open_taps: vec![0], sent: sent.clone(), delivered: delivered.clone() };
+        let session = spec.map(|spec| {
+            let prompter = crate::session_run::SessionPrompter::new(prompts.clone(), events_tx.clone(), "s1".to_string());
+            let record = crate::session_run::SessionRecord::new(&spec, &[], crate::host_study::AnsweredBy::Ui, 0);
+            SessionRun { prompter, spec, record, sampling_started: started }
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let provenance = provenance_for(&study, "gbench1", &no_run_params(), Default::default());
+        let results_dir = dir.path().to_path_buf();
+        let run = {
+            let (jobs, cancel) = (jobs.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                run_study_in(
+                    bench,
+                    study,
+                    "s1".to_string(),
+                    results_dir,
+                    None,
+                    jobs,
+                    events_tx,
+                    provenance,
+                    crate::outpost_manifest::ManifestSlot::new(),
+                    TapPorts::default(),
+                    None,
+                    current_utc_ms(),
+                    None,
+                    session,
+                    cancel,
+                    stop_timeout,
+                )
+            })
+        };
+        Rig { dir, jobs, cancel, prompts, sent, delivered, run, started }
+    }
+
+    impl Rig {
+        fn finish(self) -> (StudyJob, Vec<DevBenchMessage>, Vec<DevBenchMessage>, Duration, tempfile::TempDir) {
+            self.run.join().unwrap();
+            let elapsed = self.started.elapsed();
+            let job = self.jobs.lock().unwrap().get("s1").cloned().unwrap();
+            let sent = self.sent.lock().unwrap().clone();
+            let delivered = self.delivered.lock().unwrap().clone();
+            (job, sent, delivered, elapsed, self.dir)
+        }
+
+        fn answer_done(&self) {
+            for _ in 0..500 {
+                if let Some(p) = crate::host_study::pending_prompt(&self.prompts, "s1") {
+                    let body = crate::host_study::PromptAnswerBody {
+                        prompt_id: p.prompt_id,
+                        answer: crate::host_study::PromptAnswer::Confirmed,
+                        answered_by: crate::host_study::AnsweredBy::Ui,
+                        run_fields: Vec::new(),
+                    };
+                    assert_eq!(crate::host_study::record_answer_scoped(&self.prompts, "s1", &body, crate::token_store::Scope::Person), Ok(true));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the Done prompt was never raised");
+        }
+    }
+
+    fn session_json(dir: &tempfile::TempDir) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join(crate::session_run::SESSION_FILE)).unwrap()).unwrap()
+    }
+
+    fn stops(sent: &[DevBenchMessage]) -> Vec<StopReason> {
+        sent.iter()
+            .filter_map(|m| match m {
+                DevBenchMessage::StudyStop { reason } => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const LONG: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn done_sends_studystop_done_and_ends_the_run_on_the_benchs_studydone_after_its_streamclose() {
+        let rig = start_run(OnStop::Answer { after: Duration::from_millis(250) }, Some(600_000), vec![], LONG);
+        rig.answer_done();
+        let (job, sent, delivered, elapsed, dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Done]);
+        assert_eq!(job.status, "completed", "{:?}", job.reason);
+        // Core waited for the bench's answer rather than closing at once, and took the tap's
+        // close before the `StudyDone` that ends the run.
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        let tail: Vec<_> = delivered.iter().rev().take(2).collect();
+        assert!(matches!(tail[0], DevBenchMessage::StudyDone { completed: false }), "{tail:?}");
+        assert!(matches!(tail[1], DevBenchMessage::StreamClose { id: 0, dropped: 0 }), "{tail:?}");
+        let session = session_json(&dir);
+        assert_eq!((session["ended_by"].as_str(), session["stop_closed_by"].as_str()), (Some("done"), Some("study_done")));
+    }
+
+    #[test]
+    fn the_cap_sends_studystop_cap_and_ends_the_run_on_studydone() {
+        let rig = start_run(OnStop::Answer { after: Duration::from_millis(50) }, Some(150), vec![], LONG);
+        let (job, sent, _delivered, elapsed, dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Cap]);
+        assert_eq!(job.status, "completed", "{:?}", job.reason);
+        assert!(elapsed >= Duration::from_millis(200), "the cap, then the bench's answer: {elapsed:?}");
+        let session = session_json(&dir);
+        assert_eq!((session["ended_by"].as_str(), session["stop_closed_by"].as_str()), (Some("cap"), Some("study_done")));
+    }
+
+    #[test]
+    fn cancel_sends_studystop_cancel_for_a_session_and_for_a_plain_device_study() {
+        // A session study.
+        let rig = start_run(OnStop::Answer { after: Duration::from_millis(20) }, Some(600_000), vec![], LONG);
+        rig.cancel.store(true, Ordering::SeqCst);
+        let (job, sent, _d, _e, dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Cancel]);
+        assert_eq!(job.status, "failed");
+        assert!(job.reason.as_deref().unwrap().contains("cancelled"), "{:?}", job.reason);
+        let session = session_json(&dir);
+        assert_eq!((session["ended_by"].as_str(), session["stop_closed_by"].as_str()), (Some("cancelled"), Some("study_done")));
+        // A study with no session: the same message, the same end.
+        let rig = start_run(OnStop::Answer { after: Duration::from_millis(20) }, None, vec![], LONG);
+        std::thread::sleep(Duration::from_millis(60));
+        rig.cancel.store(true, Ordering::SeqCst);
+        let (job, sent, delivered, _e, _dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Cancel]);
+        assert_eq!(job.status, "failed");
+        assert!(job.reason.as_deref().unwrap().contains("answered with StudyDone"), "{:?}", job.reason);
+        assert!(matches!(delivered.last(), Some(DevBenchMessage::StudyDone { completed: false })));
+    }
+
+    #[test]
+    fn a_bench_that_never_answers_ends_the_run_on_the_timeout() {
+        let t = Duration::from_millis(300);
+        let rig = start_run(OnStop::Silent, Some(600_000), vec![], t);
+        rig.answer_done();
+        let (job, sent, _d, elapsed, dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Done]);
+        // The session asked for the early end, so the capture is kept and the run completes; the
+        // record says the bench never confirmed.
+        assert_eq!(job.status, "completed", "{:?}", job.reason);
+        assert!(elapsed >= t && elapsed < t + Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(session_json(&dir)["stop_closed_by"].as_str(), Some("timeout"));
+        // A cancel that gets no answer is a failure that says so.
+        let rig = start_run(OnStop::Silent, None, vec![], t);
+        rig.cancel.store(true, Ordering::SeqCst);
+        let (job, _s, _d, _e, _dir) = rig.finish();
+        assert_eq!(job.status, "failed");
+        assert!(job.reason.as_deref().unwrap().contains("did not answer StudyStop"), "{:?}", job.reason);
+    }
+
+    #[test]
+    fn a_stop_that_races_the_studys_own_end_is_harmless() {
+        // The bench's own `StudyDone { completed: true }` is already on its way when the stop goes
+        // out, and a no-study-running bench answers the stop with a log line only.
+        let own_end = (Duration::from_millis(40), DevBenchMessage::StudyDone { completed: true });
+        let rig = start_run(OnStop::LogLineOnly, None, vec![own_end.clone()], LONG);
+        rig.cancel.store(true, Ordering::SeqCst);
+        let (job, sent, _d, elapsed, _dir) = rig.finish();
+        assert_eq!(stops(&sent), [StopReason::Cancel], "the stop was sent before the end was readable");
+        assert_eq!(job.status, "completed", "a study that finished on its own is finished: {:?}", job.reason);
+        assert!(elapsed < Duration::from_secs(5));
+        // The same race for a session's Done.
+        let rig = start_run(OnStop::LogLineOnly, Some(600_000), vec![own_end], LONG);
+        rig.answer_done();
+        let (job, _s, _d, _e, dir) = rig.finish();
+        assert_eq!(job.status, "completed", "{:?}", job.reason);
+        assert_eq!(session_json(&dir)["stop_closed_by"].as_str(), Some("study_done"));
+        // And a stop never goes out once the bench's `StudyDone` has been read.
+        let early = (Duration::from_millis(0), DevBenchMessage::StudyDone { completed: true });
+        let rig = start_run(OnStop::LogLineOnly, Some(600_000), vec![early], LONG);
+        let (job, sent, _d, _e, dir) = rig.finish();
+        assert_eq!(stops(&sent), []);
+        assert_eq!(job.status, "completed");
+        let session = session_json(&dir);
+        assert_eq!((session["ended_by"].as_str(), session["stop_closed_by"].is_null()), (Some("study_done"), true));
+    }
+
+    #[test]
+    fn the_route_sets_a_device_studys_flag_and_leaves_a_host_studys_alone() {
+        let state = AppState::new("t".into());
+        let host = Arc::new(AtomicBool::new(false));
+        let device = Arc::new(AtomicBool::new(false));
+        *state.host_cancel.lock().unwrap() = Some(("h1".into(), host.clone()));
+        *state.device_cancel.lock().unwrap() = Some(("d1".into(), device.clone()));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let call = |id: &str| rt.block_on(crate::host_study::cancel_study_handler(State(state.clone()), Path(id.to_string())));
+        assert_eq!(call("d1").unwrap().0, StatusCode::ACCEPTED);
+        assert!(device.load(Ordering::SeqCst) && !host.load(Ordering::SeqCst), "a device cancel touches only the device flag");
+        assert_eq!(call("h1").unwrap().0, StatusCode::ACCEPTED);
+        assert!(host.load(Ordering::SeqCst));
+        assert_eq!(call("nope").unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_cancel_during_the_start_prompt_ends_the_wait_and_sends_nothing() {
+        let prompts: crate::host_study::HostPrompt = Arc::new(StdMutex::new(None));
+        let (tx, mut rx) = broadcast::channel(16);
+        let prompter = crate::session_run::SessionPrompter::new(prompts.clone(), tx, "s1".to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiting = {
+            let (cancel, spec) = (cancel.clone(), session_spec(1000));
+            std::thread::spawn(move || prompter.raise_start_unless_cancelled(&spec, Duration::from_secs(30), Some(&cancel)))
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!waiting.is_finished());
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(waiting.join().unwrap(), crate::session_run::StartOutcome::StudyCancelled);
+        assert!(prompts.lock().unwrap().is_none());
+        let _pending = rx.try_recv().unwrap();
+        assert_eq!(serde_json::to_value(rx.try_recv().unwrap()).unwrap()["answer"].as_str(), Some("study_cancelled"));
     }
 }
