@@ -409,6 +409,22 @@ impl Definitions {
         read_test(&suite.dir, file).ok()
     }
 
+    /// The manifest of the premade suite `id` at `version`, read from the checkout.
+    pub fn premade_suite(&self, id: &str, version: &str) -> Option<SuiteManifest> {
+        let (suites, _) = self.suites();
+        let suite = suites.iter().find(|s| s.id == id && s.version == version)?;
+        serde_json::from_slice(&std::fs::read(suite.dir.join(SUITE_FILE)).ok()?).ok()
+    }
+
+    /// The premade test whose definition hash is `hash`, from any suite of the checkout.
+    pub fn premade_test(&self, hash: &str) -> Option<TestDef> {
+        let (suites, _) = self.suites();
+        let suite = suites.iter().find(|s| s.tests.iter().any(|t| t.sha256 == hash))?;
+        let manifest: SuiteManifest = serde_json::from_slice(&std::fs::read(suite.dir.join(SUITE_FILE)).ok()?).ok()?;
+        let line = manifest.tests.iter().find(|t| t.hash == hash)?;
+        read_test(&suite.dir, &line.file).ok()
+    }
+
     /// The data of a card: the definition, and for a copy its diff against the premade test it names.
     pub fn card(&self, hash: &str, stored: &serde_json::Value) -> serde_json::Value {
         let mut card = serde_json::json!({ "hash": hash, "kind": stored["kind"], "definition": stored["definition"] });

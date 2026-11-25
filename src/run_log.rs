@@ -302,6 +302,20 @@ impl RunLog {
             .collect())
     }
 
+    /// Every `confirmed` entry as `(hash, at_utc_ms, surface)`, oldest first. A log that does not verify is an error.
+    pub fn confirmations(&self) -> Result<Vec<(String, u64, String)>> {
+        self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
+        Ok(self
+            .lines()?
+            .iter()
+            .filter(|l| l["entry"]["type"] == "confirmed")
+            .filter_map(|l| {
+                let e = &l["entry"];
+                Some((e["sha256"].as_str()?.to_string(), e["at_utc_ms"].as_u64()?, e["surface"].as_str().unwrap_or("").to_string()))
+            })
+            .collect())
+    }
+
     /// Appends the entry `build` makes, under the write lock, from the log as it
     /// stands: every line before the new one, and the head they end at. A run
     /// that ends meanwhile cannot slip between the head a publish records and

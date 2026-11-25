@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, publish, run_log, serial, study};
+use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, publish, run_log, serial, study, test_runs};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -226,6 +226,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/confirmations/pending", get(confirmations::pending_handler))
         .route("/confirmations/{hash}/card", get(confirmations::card_handler))
         .route("/confirmations", post(confirmations::confirm_handler))
+        .route("/test-runs", post(test_runs::prepare_handler))
+        .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
         .route("/run-log", get(run_log::run_log_handler))
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
@@ -3199,6 +3201,8 @@ mod tests {
         ("GET", "/confirmations/pending", "/confirmations/pending"),
         ("GET", "/confirmations/{hash}/card", "/confirmations/abc/card"),
         ("POST", "/confirmations", "/confirmations"),
+        ("POST", "/test-runs", "/test-runs"),
+        ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
         ("GET", "/run-log", "/run-log"),
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
@@ -3257,7 +3261,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 59;
+    const DOCUMENTED_ROUTE_COUNT: usize = 61;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3469,6 +3473,7 @@ mod tests {
             handler_name.strip_prefix("publish::"),
         ) {
             _ if handler_name.starts_with("confirmations::") => (include_str!("confirmations.rs"), &handler_name["confirmations::".len()..]),
+            _ if handler_name.starts_with("test_runs::") => (include_str!("test_runs.rs"), &handler_name["test_runs::".len()..]),
             (Some(stripped), _, _, _) => (include_str!("study.rs"), stripped),
             (_, Some(stripped), _, _) => (include_str!("host_study.rs"), stripped),
             (_, _, Some(stripped), _) => (include_str!("run_log.rs"), stripped),
@@ -4107,6 +4112,8 @@ mod tests {
         ("GET", "/definitions/{hash}"),
         ("GET", "/suites"),
         ("GET", "/confirmations/pending"),
+        ("POST", "/test-runs"),
+        ("GET", "/test-runs/{run_id}/card"),
         ("GET", "/run-log"),
         ("GET", "/study/{study_id}/log"),
         ("POST", "/study/{study_id}/published"),
