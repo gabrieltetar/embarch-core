@@ -153,6 +153,16 @@ impl DevBenchLink {
     /// Opens `port_name` at [`DEV_BENCH_BAUD`]. Does not send `Hello` or do
     /// anything else protocol-level — that's `study.rs`'s job.
     ///
+    /// **The same call opens a CDC ACM control port** (decision 62), found by
+    /// its recorded USB identity in `embarch-topology`'s detection rather than
+    /// here. This function still passes [`DEV_BENCH_BAUD`] and asks for
+    /// hardware flow control, because `serialport` requires a baud at open and
+    /// does not know which kind of port it is opening. A CDC ACM port carries
+    /// bytes over USB, so what the baud means there is the device's to say;
+    /// whether it has any effect is not established by this code and is owed to
+    /// a bench run. If the port does not assert CTS, the probe below already
+    /// falls back to no flow control with a warning.
+    ///
     /// **Reading happens on a dedicated thread, and that is a fix rather than
     /// tidiness.** `study.rs`'s loop calls `write_stream_record` inline for
     /// every record a `StreamChunkBatch` carries, so for the duration of each

@@ -1528,12 +1528,58 @@ async fn unenroll_by_probe_handler(
 /// detection's undeclared fallback guesses the lowest interface and lands on
 /// a port that accepts bytes and never answers. Either field may be sent
 /// alone; sending neither is a 400 rather than a silent no-op.
+///
+/// `control_port` records the USB identity of a bench whose control link is a
+/// CDC ACM port, not a SEGGER J-Link UART (decision 62): detection then finds
+/// the bench by it and never by the SEGGER VID, and `interface` inside it says
+/// which of a composite device's ports. `clear_control_port` forgets it and
+/// returns detection to the SEGGER VID. Both are additions; a request without
+/// them behaves exactly as before.
 #[derive(Deserialize)]
 struct SetDevBenchLinkRequest {
     #[serde(default)]
     serial: Option<String>,
     #[serde(default)]
     interface: Option<u8>,
+    #[serde(default)]
+    control_port: Option<ControlPortRequest>,
+    #[serde(default)]
+    clear_control_port: bool,
+}
+
+#[derive(Deserialize)]
+struct ControlPortRequest {
+    vid: u16,
+    pid: u16,
+    #[serde(default)]
+    serial: Option<String>,
+    #[serde(default)]
+    interface: Option<u8>,
+}
+
+/// What a `POST /dev-bench/link` asks of the recorded control port.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlPortChange {
+    Leave,
+    Record(embarch_topology::hardware::UsbPortId),
+    Clear,
+}
+
+fn control_port_change(
+    control_port: Option<ControlPortRequest>,
+    clear: bool,
+) -> Result<ControlPortChange, String> {
+    match (control_port, clear) {
+        (Some(_), true) => Err("'control_port' and 'clear_control_port' contradict each other".to_string()),
+        (Some(c), false) => Ok(ControlPortChange::Record(embarch_topology::hardware::UsbPortId {
+            vid: c.vid,
+            pid: c.pid,
+            serial: c.serial.filter(|s| !s.is_empty()),
+            interface: c.interface,
+        })),
+        (None, true) => Ok(ControlPortChange::Clear),
+        (None, false) => Ok(ControlPortChange::Leave),
+    }
 }
 
 // route: POST /dev-bench/link
@@ -1543,12 +1589,16 @@ async fn set_dev_bench_link_handler(
     Json(req): Json<SetDevBenchLinkRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let _guard = acquire_hw_lock(&state, "POST /dev-bench/link").await?;
-    let SetDevBenchLinkRequest { serial, interface } = req;
+    let SetDevBenchLinkRequest { serial, interface, control_port, clear_control_port } = req;
+    let control_change =
+        control_port_change(control_port, clear_control_port).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    if serial.is_none() && interface.is_none() {
+    if serial.is_none() && interface.is_none() && control_change == ControlPortChange::Leave {
         return Err((
             StatusCode::BAD_REQUEST,
-            "POST /dev-bench/link needs at least one of 'serial' or 'interface'".to_string(),
+            "POST /dev-bench/link needs at least one of 'serial', 'interface', 'control_port' or \
+             'clear_control_port'"
+                .to_string(),
         ));
     }
 
@@ -1558,6 +1608,13 @@ async fn set_dev_bench_link_handler(
         }
         if let Some(interface) = interface {
             embarch_topology::hardware::set_dev_bench_link_port_interface(interface)?;
+        }
+        match control_change {
+            ControlPortChange::Leave => {}
+            ControlPortChange::Record(id) => embarch_topology::hardware::set_dev_bench_control_port(id)?,
+            ControlPortChange::Clear => {
+                embarch_topology::hardware::clear_dev_bench_control_port()?;
+            }
         }
         Ok(())
     })
@@ -4051,5 +4108,68 @@ mod tests {
         assert_eq!(take(&router, "a", 0).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(take(&router, "a", lease::MAX_TTL_S + 1).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(take(&router, " ", 5).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- EMB-472: the control port's USB identity ----
+
+    fn fake_port(name: &str, vid: u16, pid: u16, serial: &str, interface: u8) -> serialport::SerialPortInfo {
+        serialport::SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: serialport::SerialPortType::UsbPort(serialport::UsbPortInfo {
+                vid,
+                pid,
+                serial_number: Some(serial.to_string()),
+                manufacturer: None,
+                product: None,
+                interface: Some(interface),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_link_request_without_control_port_fields_changes_nothing_there() {
+        // A bench enrolled before the change posts `{serial, interface}` only.
+        let req: SetDevBenchLinkRequest = serde_json::from_str(r#"{"serial":"D607104","interface":2}"#).unwrap();
+        assert!(req.control_port.is_none() && !req.clear_control_port);
+        assert_eq!(control_port_change(req.control_port, req.clear_control_port), Ok(ControlPortChange::Leave));
+    }
+
+    #[test]
+    fn a_control_port_request_records_its_usb_identity_and_clearing_contradicts_it() {
+        let req: SetDevBenchLinkRequest =
+            serde_json::from_str(r#"{"control_port":{"vid":12259,"pid":256,"serial":"ABCD","interface":0}}"#).unwrap();
+        let change = control_port_change(req.control_port, false).unwrap();
+        assert_eq!(
+            change,
+            ControlPortChange::Record(embarch_topology::hardware::UsbPortId {
+                vid: 0x2fe3,
+                pid: 0x0100,
+                serial: Some("ABCD".to_string()),
+                interface: Some(0),
+            })
+        );
+        let both: SetDevBenchLinkRequest =
+            serde_json::from_str(r#"{"control_port":{"vid":1,"pid":2},"clear_control_port":true}"#).unwrap();
+        assert!(control_port_change(both.control_port, both.clear_control_port).is_err());
+    }
+
+    /// Fake enumeration: one composite device (control, samples and SMP ports
+    /// under one serial) beside a SEGGER J-Link. The recorded identity finds
+    /// the control port and never the samples or SMP port; the J-Link is not
+    /// what a native-USB bench is found by.
+    #[test]
+    fn a_bench_enrolled_with_a_usb_identity_is_found_by_it_and_not_by_its_sibling_ports() {
+        use embarch_topology::hardware::{select_control_port, UsbPortId};
+        let ports = vec![
+            fake_port("COM3", 0x1366, 0x0105, "001057729826", 0),
+            fake_port("COM10", 0x2fe3, 0x0100, "ABCD", 0),
+            fake_port("COM11", 0x2fe3, 0x0100, "ABCD", 2),
+            fake_port("COM12", 0x2fe3, 0x0100, "ABCD", 4),
+        ];
+        let id = |interface| UsbPortId { vid: 0x2fe3, pid: 0x0100, serial: Some("ABCD".into()), interface };
+        assert_eq!(select_control_port(&ports, &id(Some(0))).unwrap().port_name, "COM10");
+        assert_ne!(select_control_port(&ports, &id(Some(0))).unwrap().port_name, "COM11");
+        // Without an interface, three ports match: refused, not guessed.
+        assert!(select_control_port(&ports, &id(None)).is_err());
     }
 }
