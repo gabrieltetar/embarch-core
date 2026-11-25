@@ -243,6 +243,8 @@ mod tests {
             ack_ok: acks.then(|| "Rexecu success".into()),
             ack_err: acks.then(|| "Rexecu err".into()),
             safe_off: Vec::new(),
+            metrology: Vec::new(),
+            calibration: None,
         }
     }
 
