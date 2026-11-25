@@ -1,5 +1,5 @@
 //! Decoding a framed analog tap, one verified record at a time (EMB-475,
-//! decision 124; the owner's EMB-469 decisions 7, 8 and 13).
+//! decision 125; the owner's EMB-469 decisions 7, 8 and 13).
 //!
 //! A tap whose study declares an `AnalogBlocks` record check carries binary
 //! blocks, not lines: its int16 samples contain `0x0A` as often as any other

@@ -1054,7 +1054,7 @@ pub const SESSION_KEEP_FILE: &str = "session.keep";
 pub fn mark_session_recording(results_dir: &Path) -> std::io::Result<()> {
     fs::write(
         results_dir.join(SESSION_KEEP_FILE),
-        "a session's recording: exempt from the keep-last-N sweep (embarch-core decision 124)\n",
+        "a session's recording: exempt from the keep-last-N sweep (embarch-core decision 125)\n",
     )
 }
 
