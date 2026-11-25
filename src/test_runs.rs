@@ -76,6 +76,18 @@ fn agent_opt(s: &Option<String>) -> Value {
     s.as_deref().map(agent_text).unwrap_or(Value::Null)
 }
 
+/// A free value somebody other than Core wrote (a capability's value, a hook's
+/// `{"shell": cmd}`, a derived test's field), with every string inside it marked
+/// as `agent_text`. Object keys stay plain; numbers, booleans and null pass.
+fn agent_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) => agent_text(s),
+        Value::Array(a) => Value::Array(a.iter().map(agent_value).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), agent_value(v))).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Whether `id` is safe as a file name.
 fn is_run_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_RUN_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -260,8 +272,14 @@ fn origin(defs: &Definitions, def: &TestDef, hash: &str) -> (&'static str, Optio
     match def.derived_from.as_deref() {
         None => ("custom", None),
         Some(from) => match defs.premade_original(from) {
-            Some(original) => ("derived", Some(json!({ "from": agent_text(from), "fields": derived_diff(def, &original) }))),
-            None => ("derived", Some(json!({ "from": agent_text(from), "unavailable": format!("Core holds no premade test {from}") }))),
+            Some(original) => {
+                let fields: Vec<Value> = derived_diff(def, &original)
+                    .iter()
+                    .map(|d| json!({ "field": agent_text(&d.field), "old": agent_value(&d.old), "new": agent_value(&d.new) }))
+                    .collect();
+                ("derived", Some(json!({ "from": agent_text(from), "fields": fields })))
+            }
+            None => ("derived", Some(json!({ "from": agent_text(from), "unavailable": "Core holds no premade test of that id" }))),
         },
     }
 }
@@ -299,8 +317,8 @@ fn static_card(defs: &Definitions, res: &Resolved, exp: &Expansion, studies: &BT
         "standard": { "name": agent_text(&run.standard.name) },
         "dut": {
             "declared_serial": agent_text(&run.dut.declared_serial), "board_revision": agent_text(&run.dut.board_revision),
-            "capabilities": run.dut.capabilities.iter().map(|c| json!({ "name": agent_text(&c.name), "value": c.value, "provenance": c.provenance })).collect::<Vec<_>>(),
-            "hooks": run.dut.hooks.iter().map(|h| json!({ "name": agent_text(&h.name), "maps_to": h.maps_to })).collect::<Vec<_>>(),
+            "capabilities": run.dut.capabilities.iter().map(|c| json!({ "name": agent_text(&c.name), "value": agent_value(&c.value), "provenance": c.provenance })).collect::<Vec<_>>(),
+            "hooks": run.dut.hooks.iter().map(|h| json!({ "name": agent_text(&h.name), "maps_to": agent_value(&h.maps_to) })).collect::<Vec<_>>(),
         },
         "stop_on_fail": run.options.stop_on_fail,
         "benches": benches, "tests": tests, "duration_bound_ms": duration_bound(run),
@@ -562,6 +580,7 @@ mod tests {
         let names: Vec<(&str, &str)> =
             c["unconfirmed"].as_array().unwrap().iter().map(|u| (u["kind"].as_str().unwrap(), u["name"]["agent_text"].as_str().unwrap())).collect();
         assert_eq!(names, [("suite", "usb-pd-r3.2@0.1.0"), ("capability", "role"), ("test", "vbus-5v-source-voltage")]);
+        assert_eq!(c["dut"]["capabilities"][0]["value"]["agent_text"], "source", "a capability's value is the agent's text");
 
         // The person's token: a nonce, valid once, for this run and hash.
         let (st, mine) = call(&s, PERSON, "GET", "/test-runs/run-1/card", None).await;
@@ -621,6 +640,14 @@ mod tests {
         later["run"]["run_id"] = "run-5".into();
         let (st, why) = call(&s, AGENT, "POST", "/test-runs", Some(later)).await;
         assert_eq!(st, StatusCode::CREATED, "{why}");
+    }
+
+    #[test]
+    fn every_string_in_a_free_value_is_marked() {
+        let hook = json!({ "shell": "reboot now" });
+        assert_eq!(agent_value(&hook), json!({ "shell": { "agent_text": "reboot now" } }));
+        let nested = json!([1, true, null, { "k": ["a"] }]);
+        assert_eq!(agent_value(&nested), json!([1, true, null, { "k": [{ "agent_text": "a" }] }]));
     }
 
     #[test]
