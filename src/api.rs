@@ -30,6 +30,8 @@ pub struct AppState {
     /// The agent's token, and the person's (decision 109); either
     /// authenticates, and `auth_middleware` records which one matched.
     pub tokens: crate::token_store::Tokens,
+    /// With `--service`, the identity routes answer `403` to the agent's token (decision 132).
+    pub person_only: bool,
     pub hw_lock: Arc<Mutex<()>>,
     /// The route currently holding `hw_lock`, or `None` when it's free.
     /// Kept in a plain `std::sync::Mutex` rather than folded into `hw_lock`
@@ -92,6 +94,7 @@ impl AppState {
         let images = lease::ImageLog::at(run_log.data_dir());
         Self {
             tokens,
+            person_only: crate::token_store::mode() == "service",
             sealer,
             call_log: crate::call_log::CallLog::at(run_log.data_dir().to_path_buf()),
             run_log,
@@ -232,6 +235,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/stream/{name}/arrivals", get(study::stream_arrivals_handler))
         .route("/study/{study_id}/stream/{name}/load", get(study::stream_load_handler))
         .layer(middleware::from_fn_with_state(state.clone(), lease_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), person_middleware))
         // Outside the lease layer, so a refusal is logged too (decision 122).
         .layer(middleware::from_fn_with_state(state.clone(), call_log::call_log_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -243,7 +247,7 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Simple bearer-token check, against two tokens: the match is recorded as
 /// a `token_store::Scope` request extension for every handler to take
-/// (decision 109). Nothing is refused by scope. This is deliberately not OAuth or anything
+/// (decision 109). Only `person_middleware` refuses by scope (decision 132). This is deliberately not OAuth or anything
 /// fancy — Core may end up reachable over a real network (WSL-to-Windows,
 /// or a LAN if Core moves to a Pi), so "open to whoever can see the port"
 /// isn't good enough even at single-engineer scale.
@@ -267,6 +271,24 @@ async fn auth_middleware(
         }
         None => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+/// On a `--service` Core, refuses an identity route (`token_store::PERSON_ROUTES`) to the
+/// agent's token with `403` naming the person's surfaces (decision 132). Runs inside
+/// `auth_middleware` and outside the lease layer, so the refusal precedes any `409`.
+async fn person_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let scope = req.extensions().get::<crate::token_store::Scope>().copied();
+    let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
+    if let (true, Some(crate::token_store::Scope::Agent), Some(path)) = (state.person_only, scope, matched) {
+        if crate::token_store::is_person_route(req.method().as_str(), path) {
+            return (StatusCode::FORBIDDEN, crate::token_store::PERSON_REFUSAL).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Refuses a hardware route's request without the live lease's token, `409`
@@ -4020,6 +4042,127 @@ mod tests {
                 AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is in a lease list but is not a registered route"
             );
+        }
+    }
+
+    /// Every `AUTH_CASES` route the agent's token reaches on a service Core; the rest are
+    /// `token_store::PERSON_ROUTES` (decision 132).
+    const AGENT_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/status"),
+        ("POST", "/lease"),
+        ("GET", "/lease"),
+        ("PUT", "/lease"),
+        ("DELETE", "/lease"),
+        ("POST", "/flash"),
+        ("POST", "/reset"),
+        ("POST", "/bootload"),
+        ("GET", "/bootload/ports"),
+        ("GET", "/serial-log"),
+        ("GET", "/dev-bench/port"),
+        ("GET", "/dev-bench/hello"),
+        ("POST", "/resolve-chip"),
+        ("GET", "/probes/enrolled"),
+        ("GET", "/signals"),
+        ("POST", "/signals/{name}/exchange"),
+        ("POST", "/signals/{name}/capture"),
+        ("GET", "/signals/{name}/capture"),
+        ("DELETE", "/signals/{name}/capture"),
+        ("GET", "/instruments"),
+        ("POST", "/instruments/{name}/exchange"),
+        ("POST", "/live/mem-read"),
+        ("POST", "/live/core-state"),
+        ("GET", "/serial-ports"),
+        ("POST", "/validate"),
+        ("GET", "/alerts"),
+        ("GET", "/logs/recent"),
+        ("GET", "/studies"),
+        ("POST", "/study"),
+        ("POST", "/host-studies"),
+        ("POST", "/study/{study_id}/cancel"),
+        ("POST", "/study/{study_id}/prompt"),
+        ("GET", "/study/{study_id}/line-counts"),
+        ("POST", "/study/{study_id}/line-counts"),
+        ("GET", "/call-log"),
+        ("GET", "/run-log"),
+        ("GET", "/study/{study_id}/log"),
+        ("POST", "/study/{study_id}/published"),
+        ("POST", "/study/{study_id}/discard"),
+        ("POST", "/study/{study_id}/adopt"),
+        ("POST", "/study/{study_id}/report-data"),
+        ("POST", "/study/{study_id}/publish"),
+        ("PUT", "/study/{study_id}/restore/{*name}"),
+        ("GET", "/study/{study_id}/publish/{revision}/files/{*name}"),
+        ("GET", "/study/{study_id}/measurements"),
+        ("GET", "/study/{study_id}"),
+        ("GET", "/study/{study_id}/events"),
+        ("GET", "/study/{study_id}/steps"),
+        ("GET", "/study/{study_id}/streams"),
+        ("GET", "/study/{study_id}/stream/{name}"),
+        ("GET", "/study/{study_id}/stream/{name}/arrivals"),
+        ("GET", "/study/{study_id}/stream/{name}/load"),
+    ];
+
+    /// A new route cannot be added without deciding whether it is the person's: every
+    /// `AUTH_CASES` row is in exactly one of `PERSON_ROUTES` / `AGENT_ROUTES`.
+    #[test]
+    fn every_route_is_either_the_persons_or_the_agents() {
+        use crate::token_store::PERSON_ROUTES;
+        for (method, path, _) in AUTH_CASES {
+            let person = PERSON_ROUTES.iter().any(|(m, p)| m == method && p == path);
+            let agent = AGENT_ROUTES.iter().any(|(m, p)| m == method && p == path);
+            assert!(
+                person ^ agent,
+                "{method} {path} must be in exactly one of `token_store::PERSON_ROUTES` / \
+                 `AGENT_ROUTES` (person: {person}, agent: {agent}) — decide whether an attested \
+                 Core takes it only from the person (decision 132)"
+            );
+        }
+        for (method, path) in PERSON_ROUTES.iter().chain(AGENT_ROUTES) {
+            assert!(
+                AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
+                "{method} {path} is in a scope list but is not a registered route"
+            );
+        }
+    }
+
+    /// Decision 132: on a service Core each person's route is `403` to the agent's token and
+    /// names the person's surfaces; on a development Core it is served; the person's token
+    /// is served in both. "Served" is anything but `401`/`403`: the empty body is rejected
+    /// by the handler before it touches anything.
+    #[tokio::test]
+    async fn identity_routes_are_the_persons_on_a_service_core() {
+        for service in [true, false] {
+            let mut state = AppState::new("test-token".to_string());
+            state.person_only = service;
+            let router = build_router(state);
+            for (method, path) in crate::token_store::PERSON_ROUTES {
+                let uri = AUTH_CASES.iter().find(|(m, p, _)| m == method && p == path).unwrap().2;
+                for (bearer, refused) in [("test-token", service), ("person-test-token", false)] {
+                    let r = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(*method)
+                                .uri(uri)
+                                .header("authorization", format!("Bearer {bearer}"))
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = r.status();
+                    let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+                    if refused {
+                        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} (service {service}, {bearer})");
+                        assert!(String::from_utf8_lossy(&body).contains("embarch-ui"), "{method} {path}: the refusal names the person's surfaces");
+                    } else {
+                        assert!(
+                            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                            "{method} {path} (service {service}, {bearer}) answered {status}"
+                        );
+                    }
+                }
+            }
         }
     }
 

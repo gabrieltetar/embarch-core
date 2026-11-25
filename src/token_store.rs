@@ -155,6 +155,31 @@ impl Scope {
     }
 }
 
+/// The routes an attested (`--service`) Core takes only from the person's token (decision
+/// 132): which board, probe, instrument or signal is which is the person's act, and the
+/// agent only proposes it. A development Core serves them to either token.
+pub const PERSON_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/probes/enroll"),
+    ("DELETE", "/probes/enrolled/{role}"),
+    ("PUT", "/probes/enrolled/{role}/board"),
+    ("DELETE", "/probes/by-serial/{serial}"),
+    ("POST", "/dev-bench/link"),
+    ("POST", "/signals"),
+    ("DELETE", "/signals/{name}"),
+    ("PUT", "/instruments"),
+    ("DELETE", "/instruments/{name}"),
+    ("PUT", "/bootload/ports"),
+    ("DELETE", "/bootload/ports"),
+];
+
+/// The `403` body: names where the person acts.
+pub const PERSON_REFUSAL: &str = "this route is the person's on an attested Core: declare it in embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may only propose it";
+
+/// Whether `method` on the registered path pattern `path` is in [`PERSON_ROUTES`].
+pub fn is_person_route(method: &str, path: &str) -> bool {
+    PERSON_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
+}
+
 /// A handler takes `scope: Scope` to read what `auth_middleware` recorded.
 /// A request that reached a handler has been authenticated, so the extension
 /// is always present; its absence is a router wired without the middleware.
