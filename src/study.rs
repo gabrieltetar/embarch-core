@@ -1521,6 +1521,31 @@ pub async fn post_study_handler(
         }
     }
 
+    // ---- the dev bench's samples port, for a study with an analog source ----
+    //
+    // **Before `StudyStart`, for two reasons.** A bench whose samples port
+    // is absent never starts a step (a refusal here is the same shape as the
+    // version gate's), and the start header is written when the source
+    // starts, so the port has to be open and its stale input cleared by then
+    // or the header lands on a closed port (decision 126). Held, exclusively,
+    // until the run ends.
+    let analog_samples = if study_has_analog_source(&study) {
+        let tap_ports = state.tap_ports.clone();
+        match tokio::task::spawn_blocking(move || crate::analog_source::open_enrolled_samples_port(&tap_ports)).await {
+            Ok(Ok(opened)) => Some(opened),
+            Ok(Err(refusal)) => {
+                release_lock();
+                return Err((refusal.status, refusal.reason));
+            }
+            Err(e) => {
+                release_lock();
+                return Err(internal_err(e));
+            }
+        }
+    } else {
+        None
+    };
+
     let steps = study.steps.clone();
     let steps_crc_value = study.steps_crc;
     let streams = study.streams.clone();
@@ -1632,6 +1657,7 @@ pub async fn post_study_handler(
                 provenance,
                 manifest_slot,
                 tap_ports,
+                analog_samples,
                 study_start_utc_ms,
                 seal,
             )
@@ -1797,6 +1823,7 @@ fn run_study_to_completion(
     provenance: Provenance,
     manifest_slot: crate::outpost_manifest::ManifestSlot,
     tap_ports: TapPorts,
+    analog_samples: Option<crate::analog_source::OpenedSamples>,
     study_start_utc_ms: u64,
     seal: crate::signing::SealJob,
 ) {
@@ -1999,6 +2026,23 @@ fn run_study_to_completion(
     // posture the reserved `dev-bench` tap and `outpost.arrival.csv` already
     // take.
     let mut step_started_utc_ms = study_start_utc_ms;
+
+    // The samples port's reader, in the same map so every exit that stops
+    // Core's own ports stops it too: the end, a failure, a timeout. Held
+    // for the whole run, not by `StreamScope`, because the source's start
+    // header is written once, when the study starts it.
+    if let Some(opened) = analog_samples {
+        match start_samples_reader(&capture, opened) {
+            Ok((id, reader)) => {
+                signal_taps.insert(id, reader);
+            }
+            Err(msg) => {
+                finish_streams(&capture, &mut writer, &results_dir);
+                fail_job(&jobs, &events_tx, &study_id, msg);
+                return;
+            }
+        }
+    }
 
     if let Err(msg) = sync_signal_taps(&capture, &mut signal_taps, 0) {
         stop_signal_taps(&mut signal_taps);
@@ -2969,6 +3013,48 @@ fn start_signal_tap(
     Ok(Some(SignalTapReader { stop, handle: Some(handle), port_name: port.port_name, _claim }))
 }
 
+/// Whether the study declares an analog source, which is read from the dev
+/// bench's samples port rather than relayed over its control link. At most one
+/// (`embarch-study-designer`'s `SecondAnalogInput`).
+fn study_has_analog_source(study: &Study) -> bool {
+    study.streams.iter().any(|t| matches!(t.source, StreamSource::AnalogInput { .. }))
+}
+
+/// Starts the thread that reads the opened samples port into the analog tap's
+/// write path, the same one a signal tap's bytes take, so the start header
+/// and the blocks reach the decoder as they arrive (EMB-475). Returns the
+/// tap's id with the reader; stopping it closes the port.
+fn start_samples_reader(
+    capture: &Arc<Capture>,
+    opened: crate::analog_source::OpenedSamples,
+) -> Result<(u8, SignalTapReader), String> {
+    let tap = capture
+        .study
+        .streams
+        .iter()
+        .find(|t| matches!(t.source, StreamSource::AnalogInput { .. }))
+        .ok_or_else(|| "a samples port was opened for a study with no analog source".to_string())?
+        .clone();
+    let id = tap.id;
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let capture = Arc::clone(capture);
+        let stop = Arc::clone(&stop);
+        let port = opened.port;
+        std::thread::Builder::new()
+            .name(format!("analog-tap-{id}"))
+            .spawn(move || read_signal_tap(capture, tap, port, stop))
+            .map_err(|e| format!("failed to start a reader thread for the dev bench's samples port: {e:?}"))?
+    };
+    tracing::info!(
+        study_id = capture.study_id,
+        id,
+        port = opened.port_name,
+        "opened the dev bench's samples port for an analog source"
+    );
+    Ok((id, SignalTapReader { stop, handle: Some(handle), port_name: opened.port_name, _claim: opened.claim }))
+}
+
 /// Reads a signal port until the tap's scope ends or the study does, and
 /// writes what arrives **verbatim** (decision 30(a)).
 ///
@@ -2981,10 +3067,9 @@ fn start_signal_tap(
 fn read_signal_tap(
     capture: Arc<Capture>,
     tap: StreamTap,
-    mut port: Box<dyn serialport::SerialPort>,
+    mut port: impl std::io::Read,
     stop: Arc<AtomicBool>,
 ) {
-    use std::io::Read as _;
     const CHUNK: usize = embarch_study_designer::limits::MAX_STREAM_CHUNK_BYTES;
 
     let mut buf = [0u8; CHUNK];
@@ -3018,6 +3103,12 @@ fn read_signal_tap(
                     name = tap.name.as_str(),
                     "signal tap read failed, stopping this tap: {e:?}"
                 );
+                // A samples port that goes away mid-study leaves a capture
+                // that ends short, and the result must say so rather than
+                // read as complete.
+                if matches!(tap.source, StreamSource::AnalogInput { .. }) {
+                    capture.store.lock().unwrap().mark_lost_at_source(tap.id);
+                }
                 return;
             }
         }
@@ -5164,6 +5255,134 @@ mod tests {
             std::fs::read_to_string(dir.path().join("streams").join("mic.events.csv")).unwrap();
         assert!(events.contains("refused_crc,,528,528,"), "{events}");
         assert!(events.contains("gap,256,256,1056,"), "{events}");
+    }
+
+    // ---- the dev bench's samples port (EMB-480) ----
+
+    /// A samples port that hands out `data` in reads of at most `chunk`, then
+    /// times out like an idle CDC port. `closed` is set when it is dropped:
+    /// the port closing.
+    struct FakeSamples {
+        data: Vec<u8>,
+        at: usize,
+        chunk: usize,
+        drained: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl std::io::Read for FakeSamples {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.data.len() {
+                self.drained.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1));
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            let n = self.chunk.min(buf.len()).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    impl Drop for FakeSamples {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn analog_header() -> Vec<u8> {
+        use embarch_study_designer::analog::{encode_start_header, AnalogReference, StartHeader, START_HEADER_BYTES};
+        let header = StartHeader {
+            sample_rate_hz: 32_000,
+            resolution_bits: 12,
+            gain_numerator: 1,
+            gain_denominator: 4,
+            reference: AnalogReference::VddDiv4,
+            channel_count: 1,
+            vdd_mv: 3300,
+            input_name: heapless::String::try_from("A0").unwrap(),
+            board: heapless::String::try_from("dk").unwrap(),
+            image_version: heapless::String::try_from("1").unwrap(),
+        };
+        let mut out = vec![0u8; START_HEADER_BYTES];
+        encode_start_header(&mut out, &header).unwrap();
+        out
+    }
+
+    /// Starts the real reader over `data` and returns its flags: the port
+    /// drained, and the port closed.
+    fn start_fake_samples(
+        capture: &Arc<Capture>,
+        data: Vec<u8>,
+        tap_ports: &TapPorts,
+    ) -> (SignalTapReader, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (drained, closed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let port = FakeSamples { data, at: 0, chunk: 512, drained: drained.clone(), closed: closed.clone() };
+        let opened = crate::analog_source::OpenedSamples {
+            port_name: "COM8".to_string(),
+            port: Box::new(port),
+            claim: tap_ports.claim("COM8"),
+        };
+        let (id, reader) = start_samples_reader(capture, opened).unwrap();
+        assert_eq!(id, 0);
+        (reader, drained, closed)
+    }
+
+    #[test]
+    fn a_study_with_an_analog_source_is_the_one_that_needs_the_samples_port() {
+        assert!(study_has_analog_source(&analog_study()));
+        assert!(!study_has_analog_source(&study_with_steps(&[1_000])));
+    }
+
+    #[test]
+    fn the_start_header_and_a_five_minute_stream_reach_the_decoder_with_no_lost_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = Arc::new(test_capture(dir.path(), analog_study()));
+        // 37 500 blocks of 256 frames is 300 s at 32 ksps, read 512 bytes at a
+        // time so no block arrives whole.
+        let blocks: u32 = 300 * 32_000 / 256;
+        let mut stream = analog_header();
+        for n in 0..blocks {
+            stream.extend(analog_block(n * 256, false));
+        }
+        let total = stream.len();
+
+        let tap_ports = TapPorts::default();
+        let (reader, drained, closed) = start_fake_samples(&capture, stream, &tap_ports);
+        assert!(tap_ports.holds("COM8"), "held while the study runs");
+        let end = Instant::now() + Duration::from_secs(120);
+        while !drained.load(Ordering::SeqCst) {
+            assert!(Instant::now() < end, "the fake port never drained");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reader.stop();
+        assert!(closed.load(Ordering::SeqCst) && !tap_ports.holds("COM8"));
+        {
+            let decoders = capture.analog.lock().unwrap();
+            assert_eq!(decoders[&0].header().map(|h| h.sample_rate_hz), Some(32_000), "the start header decoded");
+        }
+        finish_analog_taps(&capture);
+
+        let streams = dir.path().join("streams");
+        assert_eq!(std::fs::metadata(streams.join("mic.bin")).unwrap().len() as usize, total, "every byte kept");
+        let events = std::fs::read_to_string(streams.join("mic.events.csv")).unwrap();
+        let kinds: Vec<&str> = events.lines().skip(1).map(|l| l.split(',').next().unwrap()).collect();
+        assert_eq!(kinds, ["start"], "the start header and nothing else: no gap, no refusal: {}", &events[..events.len().min(300)]);
+        assert!(events.contains("start,,32000,0,"), "{events}");
+    }
+
+    #[test]
+    fn stopping_the_reader_closes_the_port_and_releases_it() {
+        // What a cancel, a failure and a timeout all call: `stop_signal_taps`.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = Arc::new(test_capture(dir.path(), analog_study()));
+        let tap_ports = TapPorts::default();
+        let (reader, _drained, closed) = start_fake_samples(&capture, analog_header(), &tap_ports);
+        let mut open = HashMap::from([(0u8, reader)]);
+        assert!(!closed.load(Ordering::SeqCst));
+        stop_signal_taps(&mut open);
+        assert!(closed.load(Ordering::SeqCst), "the port is closed");
+        assert!(!tap_ports.holds("COM8"), "and free for the next study");
     }
 
     // ---- write_struct_rows (`embarch-study-designer` decision 52) ----

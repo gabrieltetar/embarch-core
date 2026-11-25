@@ -1,4 +1,5 @@
 mod analog_tap;
+mod analog_source;
 mod api;
 mod bootload;
 mod call_log;
