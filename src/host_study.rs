@@ -27,6 +27,8 @@ use embarch_study_designer::{
     HostAction, HostList, HostStep, HostStepResult, HostStudy, IterationMarker, IterationRef, Outcome, VALUE_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
+use embarch_study_designer::host_study::{PromptAnswer as ObservationShape, PromptKind};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +113,22 @@ impl AnsweredBy {
     }
 }
 
+/// An observation's answer: its value (decision 138).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ObservedValue {
+    Choice(String),
+    Number(f64),
+}
+
+/// What an answer records beside `PromptAnswer` and `AnsweredBy` (decision 138): the scope of the
+/// token that relayed it, which is what decided who may answer, and an observation's value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnswerExtra {
+    pub scope: crate::token_store::Scope,
+    pub value: Option<ObservedValue>,
+}
+
 /// How a prompt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptEnd {
@@ -150,15 +168,40 @@ pub struct PromptRequest {
     /// The step's `bench_config`, as the study wrote it (decision 107).
     pub bench_config: Option<String>,
     pub timeout_ms: u32,
+    /// The study's own declaration of an observation's answer; the prompt's kind is not here but
+    /// the backend's, from `run.json` (decision 138).
+    pub observation: Option<ObservationShape>,
 }
 
 /// What the backend says about a prompt it ran: how it ended, and the id and deadline it was
-/// published under, which the step's record keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// published under, which the step's record keeps; with `answer`, the scope and value of the
+/// answer that ended it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PromptRun {
     pub end: PromptEnd,
     pub prompt_id: u32,
     pub deadline_utc_ms: u64,
+    pub answer: Option<AnswerExtra>,
+}
+
+/// One output Core last switched on, by the energising step it ran (decision 138).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SwitchedOn {
+    /// The signal or instrument the step addressed.
+    pub target: String,
+    /// The line it sent.
+    pub line: String,
+    pub step: String,
+}
+
+/// What a Test run tells the study it runs (decision 138); empty outside one.
+#[derive(Debug, Clone, Default)]
+pub struct RunContext {
+    /// Each prompt step's kind, from `run.json`'s `prompt_kinds` by step name. A study cannot
+    /// relabel its own prompt; one outside a Test run has no kinds.
+    pub kinds: BTreeMap<String, PromptKind>,
+    /// The steps the crate's `energises` marks, by name, computed at the prepare.
+    pub energising: BTreeSet<String>,
 }
 
 /// The prompt a host study is waiting on, as `PromptPending` and `GET /study/{id}` show it.
@@ -177,6 +220,16 @@ pub struct PendingPrompt {
     /// and a name that bench lacks is still shown. Absent when the step names none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bench_config: Option<String>,
+    /// The prompt's kind, from the Test run's `run.json` (decision 138); absent outside one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<PromptKind>,
+    /// An `observation`'s declared answer: the choices, or the number and its unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ObservationShape>,
+    /// The outputs Core last switched on, from the energising steps it ran, so the surface can
+    /// show them (decision 138). Absent when none, and always outside a Test run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub switched_on: Vec<SwitchedOn>,
     pub opened_utc_ms: u64,
     pub deadline_utc_ms: u64,
     /// Set only on a device study's session prompt (Start or Done, decision 127): which one, and
@@ -193,6 +246,8 @@ pub struct PromptSlot {
     pub study_id: String,
     pub pending: PendingPrompt,
     pub answer: Option<(PromptAnswer, AnsweredBy)>,
+    /// The scope and value of that answer (decision 138); set with it.
+    pub extra: Option<AnswerExtra>,
     /// A device study's session prompt only: the session it is for, and the run fields a Start
     /// answer carried once it was checked (decision 127).
     pub session: Option<crate::session_run::SessionSlot>,
@@ -205,13 +260,20 @@ pub type HostPrompt = Arc<StdMutex<Option<PromptSlot>>>;
 /// a cancel of the study is seen within it. The slot is cleared **under the same lock as the last
 /// look**, so an answer either lands before the clear and counts, or finds no prompt and is
 /// refused `409`: never accepted and then lost.
+#[cfg(test)]
 pub fn wait_for_answer(slot: &HostPrompt, prompt_id: u32, timeout: Duration, cancel: Option<&AtomicBool>) -> PromptEnd {
+    wait_for_answer_with(slot, prompt_id, timeout, cancel).0
+}
+
+/// [`wait_for_answer`], also returning the scope and value the answer carried.
+pub fn wait_for_answer_with(slot: &HostPrompt, prompt_id: u32, timeout: Duration, cancel: Option<&AtomicBool>) -> (PromptEnd, Option<AnswerExtra>) {
     let deadline = Instant::now() + timeout;
     loop {
         {
             let mut g = slot.lock().unwrap();
             let ours = g.as_ref().is_some_and(|s| s.pending.prompt_id == prompt_id);
             let answered = g.as_ref().filter(|_| ours).and_then(|s| s.answer);
+            let extra = g.as_ref().filter(|_| ours).and_then(|s| s.extra.clone());
             let end = match answered {
                 Some((answer, by)) => Some(PromptEnd::Answered(answer, by)),
                 None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => Some(PromptEnd::StudyCancelled),
@@ -222,7 +284,7 @@ pub fn wait_for_answer(slot: &HostPrompt, prompt_id: u32, timeout: Duration, can
                 if ours {
                     *g = None;
                 }
-                return end;
+                return (end, extra);
             }
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -237,6 +299,10 @@ pub struct PromptAnswerBody {
     pub prompt_id: u32,
     pub answer: PromptAnswer,
     pub answered_by: AnsweredBy,
+    /// An `observation` prompt's value (decision 138): one of its declared `answers`, or a number
+    /// in its declared unit, with `answer: confirmed`. Refused on every other prompt.
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
     /// The values for a session Start prompt's run fields (decision 127). Absent, or empty, for
     /// every other prompt; a host study's `Prompt` refuses a non-empty list.
     #[serde(default)]
@@ -276,6 +342,21 @@ pub fn record_answer_scoped(
     if let Some((answer, by)) = s.answer {
         return Err((StatusCode::CONFLICT, format!("prompt {} was already answered ({answer:?}, from {})", body.prompt_id, by.as_str())));
     }
+    // Decided by the token's scope and the prompt's kind, never by `answered_by` (decision 138).
+    if scope == crate::token_store::Scope::Agent {
+        if let Some(kind @ (PromptKind::Observation | PromptKind::Clearance)) = s.pending.kind {
+            let what = if kind == PromptKind::Observation { "an observation is a measurement" } else { "a clearance is a person's safety" };
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "prompt {} is {} prompt: {what}, so only the person's own hand answers it, from the UI, or from the CLI where there is no UI; the agent's token may not relay it",
+                    body.prompt_id,
+                    if kind == PromptKind::Observation { "an observation" } else { "a clearance" },
+                ),
+            ));
+        }
+    }
+    let value = check_value(s.pending.kind, s.pending.observation.as_ref(), body)?;
     match (s.session.as_mut(), s.pending.session.as_ref()) {
         (Some(session), Some(info)) => session.check_answer(info.phase, body, scope)?,
         _ if !body.run_fields.is_empty() => {
@@ -284,7 +365,51 @@ pub fn record_answer_scoped(
         _ => {}
     }
     s.answer = Some((body.answer, body.answered_by));
+    s.extra = Some(AnswerExtra { scope, value });
     Ok(true)
+}
+
+/// The value an answer carries, checked against the prompt (decision 138): an `observation`
+/// confirmed takes exactly one of its declared `answers`, or a number when it declares a unit;
+/// every other answer takes none. `400` otherwise, naming what the prompt declared.
+fn check_value(kind: Option<PromptKind>, shape: Option<&ObservationShape>, body: &PromptAnswerBody) -> Result<Option<ObservedValue>, (StatusCode, String)> {
+    let bad = |msg: String| Err((StatusCode::BAD_REQUEST, msg));
+    if kind != Some(PromptKind::Observation) {
+        return match body.value {
+            None => Ok(None),
+            Some(_) => bad("only an observation prompt takes a value; this answer must carry none".to_string()),
+        };
+    }
+    if body.answer == PromptAnswer::Cancelled {
+        return match body.value {
+            None => Ok(None),
+            Some(_) => bad("a cancelled observation carries no value".to_string()),
+        };
+    }
+    let Some(shape) = shape else {
+        return bad("this observation declares no answer, so Core has nothing to take as its value".to_string());
+    };
+    let Some(v) = &body.value else {
+        return bad(format!("an observation is answered with its value: {}", declared(shape)));
+    };
+    if let Some(n) = &shape.number {
+        return match v.as_f64().filter(|x| x.is_finite()) {
+            Some(x) => Ok(Some(ObservedValue::Number(x))),
+            None => bad(format!("the value must be a number in {}", n.unit)),
+        };
+    }
+    match v.as_str().filter(|c| shape.answers.iter().any(|a| a == c)) {
+        Some(c) => Ok(Some(ObservedValue::Choice(c.to_string()))),
+        None => bad(format!("the value must be {}", declared(shape))),
+    }
+}
+
+/// What an observation declares, in words, for a refusal.
+fn declared(shape: &ObservationShape) -> String {
+    match &shape.number {
+        Some(n) => format!("a number in {}", n.unit),
+        None => format!("one of {}", shape.answers.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(", ")),
+    }
 }
 
 /// Why a backend could not run an exchange at all (nothing, or not all of the line, was written).
@@ -304,6 +429,8 @@ pub trait HostBackend {
     /// One `Prompt`: publish it, then wait for a person's answer until its deadline or a cancel of
     /// the study (`cancel`, `None` in the teardown), and say how it ended (decision 105).
     fn prompt(&mut self, req: PromptRequest, cancel: Option<&AtomicBool>) -> PromptRun;
+    /// Called once a step has run, so a backend can note what it switched on (decision 138).
+    fn stepped(&mut self, _step: &HostStep, _rec: &StepRecord) {}
 }
 
 /// One step as the run recorded it: the study-designer result plus what Core saw.
@@ -344,6 +471,13 @@ pub struct StepRecord {
     /// the step declares none or no reply came back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsed: Option<crate::host_parse::Parsed>,
+    /// The scope of the token that relayed a `Prompt`'s answer (decision 138): `person` or
+    /// `agent`. `answered_by` stays the surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_scope: Option<&'static str>,
+    /// An `observation`'s answer, the value it is recorded as (decision 138).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<crate::host_parse::Observed>,
 }
 
 /// How a run ended. `completed` is whether every step ran and none stopped the study.
@@ -529,6 +663,8 @@ fn run_step<B: HostBackend>(
         prompt_deadline_utc_ms: None,
         bench_config: None,
         parsed: None,
+        answered_scope: None,
+        observed: None,
     };
     if !delayed {
         rec.result.outcome = fail("cancelled before the step ran");
@@ -608,7 +744,7 @@ fn run_step<B: HostBackend>(
                     }
                 }
             }
-            HostAction::Prompt { text, bench_config, .. } => {
+            HostAction::Prompt { text, bench_config, answer, .. } => {
                 let req = PromptRequest {
                     list,
                     step_index: index,
@@ -616,14 +752,23 @@ fn run_step<B: HostBackend>(
                     text: text.clone(),
                     bench_config: bench_config.clone(),
                     timeout_ms: step.timeout_ms,
+                    observation: answer.clone(),
                 };
                 let run = backend.prompt(req, cancel);
                 rec.prompt_id = Some(run.prompt_id);
                 rec.prompt_deadline_utc_ms = Some(run.deadline_utc_ms);
                 rec.bench_config = bench_config.clone();
                 rec.result.answered_by = run.end.answered_by().map(|by| by.as_str().to_string());
+                rec.answered_scope = run.answer.as_ref().map(|a| a.scope.as_str());
                 match run.end {
-                    PromptEnd::Answered(PromptAnswer::Confirmed, _) => rec.detail = detail::CONFIRMED,
+                    PromptEnd::Answered(PromptAnswer::Confirmed, _) => {
+                        rec.detail = detail::CONFIRMED;
+                        rec.observed = run.answer.as_ref().and_then(|a| a.value.clone()).zip(answer.as_ref()).map(|(value, shape)| crate::host_parse::Observed {
+                            name: shape.name.clone(),
+                            value,
+                            unit: shape.number.as_ref().map(|n| n.unit.clone()),
+                        });
+                    }
                     PromptEnd::Answered(PromptAnswer::Cancelled, _) => {
                         rec.result.outcome = fail("the operator cancelled the prompt");
                         rec.detail = detail::PROMPT_CANCELLED;
@@ -649,6 +794,7 @@ fn run_step<B: HostBackend>(
     }
     rec.result.elapsed_ms = t0.elapsed().as_millis() as u64;
     rec.ended_utc_ms = clock.now();
+    backend.stepped(step, &rec);
     rec
 }
 
@@ -1181,7 +1327,16 @@ fn run_job_with_origin<B: HostBackend>(
     let clock = taps.as_ref().map(|t| t.clock).unwrap_or_else(StudyClock::new);
     let mut write_err: Option<String> = None;
     let mut parses: Vec<crate::host_parse::Collected> = Vec::new();
+    let mut observed: Vec<crate::host_parse::CollectedObservation> = Vec::new();
     let end = execute(study, backend, cancel, clock, |rec| {
+        if let Some(o) = &rec.observed {
+            observed.push(crate::host_parse::CollectedObservation {
+                step: rec.result.step_name.clone(),
+                iteration: rec.result.iteration.clone(),
+                at_utc_ms: rec.ended_utc_ms,
+                observed: o.clone(),
+            });
+        }
         if let Some(parsed) = &rec.parsed {
             parses.push(crate::host_parse::Collected {
                 step: rec.result.step_name.clone(),
@@ -1222,7 +1377,7 @@ fn run_job_with_origin<B: HostBackend>(
     // Before the record is signed, so it is a subject of it (decision 131).
     let fallback = crate::signing::Declarations::new();
     let declarations = seal.map_or(&fallback, |s| s.sealer.declarations());
-    if let Err(e) = crate::host_parse::write(dir, study_id, &parses, signal_origin, declarations) {
+    if let Err(e) = crate::host_parse::write(dir, study_id, &parses, &observed, signal_origin, declarations) {
         crate::study::fail_job(jobs, events_tx, study_id, format!("failed to write measurements.json: {e:#}"));
         return;
     }
@@ -1257,6 +1412,11 @@ struct CoreBackend {
     study_id: String,
     /// Prompts published so far; the next one's id is this plus one.
     prompts: u32,
+    /// What the Test run says about this study's steps; empty for a study run on its own.
+    ctx: RunContext,
+    /// The outputs the energising steps run so far switched on, by target: the last line each
+    /// was sent (decision 138).
+    switched_on: BTreeMap<String, SwitchedOn>,
 }
 
 impl HostBackend for CoreBackend {
@@ -1291,16 +1451,19 @@ impl HostBackend for CoreBackend {
             prompt_id: self.prompts,
             list: req.list,
             step_index: req.step_index,
+            kind: self.ctx.kinds.get(&req.step_name).copied(),
             step_name: req.step_name,
             text: req.text,
             bench_config: req.bench_config,
+            observation: req.observation,
+            switched_on: self.switched_on.values().cloned().collect(),
             opened_utc_ms: opened,
             deadline_utc_ms: opened + req.timeout_ms as u64,
             session: None,
         };
-        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.study_id.clone(), pending: pending.clone(), answer: None, session: None });
+        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.study_id.clone(), pending: pending.clone(), answer: None, extra: None, session: None });
         let _ = self.state.study_events.send(StudyEvent::PromptPending { study_id: self.study_id.clone(), prompt: pending.clone() });
-        let end = wait_for_answer(&self.state.host_prompt, pending.prompt_id, Duration::from_millis(req.timeout_ms as u64), cancel);
+        let (end, answer) = wait_for_answer_with(&self.state.host_prompt, pending.prompt_id, Duration::from_millis(req.timeout_ms as u64), cancel);
         let _ = self.state.study_events.send(StudyEvent::PromptResolved {
             study_id: self.study_id.clone(),
             prompt_id: pending.prompt_id,
@@ -1308,7 +1471,18 @@ impl HostBackend for CoreBackend {
             answered_by: end.answered_by(),
             resolved_utc_ms: now_ms(),
         });
-        PromptRun { end, prompt_id: pending.prompt_id, deadline_utc_ms: pending.deadline_utc_ms }
+        PromptRun { end, prompt_id: pending.prompt_id, deadline_utc_ms: pending.deadline_utc_ms, answer }
+    }
+
+    fn stepped(&mut self, step: &HostStep, rec: &StepRecord) {
+        // A step that wrote nothing switched nothing on.
+        let wrote = !matches!(rec.detail, detail::CANCELLED | detail::PORT_UNAVAILABLE | detail::EXCHANGE_FAILED);
+        if !wrote || !self.ctx.energising.contains(&step.name) {
+            return;
+        }
+        if let HostAction::Exchange { signal: target, line, .. } | HostAction::Instrument { instrument: target, line, .. } = &step.action {
+            self.switched_on.insert(target.clone(), SwitchedOn { target: target.clone(), line: line.clone(), step: step.name.clone() });
+        }
     }
 }
 
@@ -1382,7 +1556,7 @@ pub async fn post_host_study_handler(
         let id_for_panic = id.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let _hold = hold;
-            let mut backend = CoreBackend { state, handle, study_id: id.clone(), prompts: 0 };
+            let mut backend = CoreBackend { state, handle, study_id: id.clone(), prompts: 0, ctx: RunContext::default(), switched_on: BTreeMap::new() };
             run_job(&study, &id, &dir, &mut backend, &cancel, &jobs, &events_tx, taps, Some(&seal));
         })
         .await;
@@ -1406,7 +1580,7 @@ pub(crate) struct RanStudy {
 /// the route: `study_lock`, the signal check, the taps, the cancel slot, `run_job` with its
 /// teardown and seal. `Err` names why nothing ran. The caller holds the run lock; the lease is not
 /// asked, since the run is the lease's holder.
-pub(crate) fn run_study_blocking(state: &AppState, handle: &tokio::runtime::Handle, study: &HostStudy, go_by: crate::token_store::Scope) -> Result<RanStudy, String> {
+pub(crate) fn run_study_blocking(state: &AppState, handle: &tokio::runtime::Handle, study: &HostStudy, go_by: crate::token_store::Scope, ctx: RunContext) -> Result<RanStudy, String> {
     check_study(study)?;
     check_signals(study)?;
     let study_id = crate::study::generate_study_id();
@@ -1424,7 +1598,7 @@ pub(crate) fn run_study_blocking(state: &AppState, handle: &tokio::runtime::Hand
         StudyJob { status: "running".to_string(), current_step: None, total_steps: Some(study.steps.len() as u32), reason: None },
     );
     let seal = crate::signing::SealJob { sealer: state.sealer.clone(), kind: "host", build: None, submitted_by: None, calls: crate::call_log::RunCalls::begin(&state.call_log) };
-    let mut backend = CoreBackend { state: state.clone(), handle: handle.clone(), study_id: study_id.clone(), prompts: 0 };
+    let mut backend = CoreBackend { state: state.clone(), handle: handle.clone(), study_id: study_id.clone(), prompts: 0, ctx, switched_on: BTreeMap::new() };
     run_job(study, &study_id, &dir, &mut backend, &cancel, &state.study_jobs, &state.study_events, taps, Some(&seal));
     let status = state.study_jobs.lock().unwrap().get(&study_id).map(|j| (j.status.clone(), j.reason.clone()));
     match status {
@@ -1639,6 +1813,8 @@ mod tests {
         instrument_replies: VecDeque<InstrumentScript>,
         /// How each `Prompt` ends, in order; an unscripted one times out.
         prompt_ends: VecDeque<PromptEnd>,
+        /// The scope and value each answered `Prompt` carried, in order.
+        prompt_answers: VecDeque<AnswerExtra>,
         /// What each `Prompt` asked.
         prompts: Vec<PromptRequest>,
     }
@@ -1679,6 +1855,7 @@ mod tests {
                 calls: 0,
                 instrument_replies: VecDeque::new(),
                 prompt_ends: VecDeque::new(),
+                prompt_answers: VecDeque::new(),
                 prompts: vec![],
             }
         }
@@ -1733,7 +1910,8 @@ mod tests {
                 None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => PromptEnd::StudyCancelled,
                 None => PromptEnd::TimedOut,
             };
-            PromptRun { end, prompt_id: self.prompts.len() as u32, deadline_utc_ms: 1_000 * self.prompts.len() as u64 }
+            let answer = if matches!(end, PromptEnd::Answered(..)) { self.prompt_answers.pop_front() } else { None };
+            PromptRun { end, prompt_id: self.prompts.len() as u32, deadline_utc_ms: 1_000 * self.prompts.len() as u64, answer }
         }
     }
 
@@ -1908,15 +2086,18 @@ mod tests {
             step_name: "plug".into(),
             text: "plug in".into(),
             bench_config: None,
+            kind: None,
+            observation: None,
+            switched_on: vec![],
             opened_utc_ms: 1,
             deadline_utc_ms: 2,
             session: None,
         };
-        Arc::new(StdMutex::new(Some(PromptSlot { study_id: study_id.into(), pending, answer: None, session: None })))
+        Arc::new(StdMutex::new(Some(PromptSlot { study_id: study_id.into(), pending, answer: None, extra: None, session: None })))
     }
 
     fn body(prompt_id: u32, answer: PromptAnswer) -> PromptAnswerBody {
-        PromptAnswerBody { prompt_id, answer, answered_by: AnsweredBy::Ui, run_fields: vec![] }
+        PromptAnswerBody { prompt_id, answer, answered_by: AnsweredBy::Ui, value: None, run_fields: vec![] }
     }
 
     #[test]
@@ -2026,7 +2207,7 @@ mod tests {
     async fn the_real_backend_publishes_bench_config_on_the_slot_and_the_event() {
         let state = AppState::new("t".into());
         let mut events = state.study_events.subscribe();
-        let mut backend = CoreBackend { state: state.clone(), handle: tokio::runtime::Handle::current(), study_id: "h1".into(), prompts: 0 };
+        let mut backend = CoreBackend { state: state.clone(), handle: tokio::runtime::Handle::current(), study_id: "h1".into(), prompts: 0, ctx: RunContext::default(), switched_on: BTreeMap::new() };
         let req = PromptRequest {
             list: HostList::Steps,
             step_index: 3,
@@ -2034,6 +2215,7 @@ mod tests {
             text: "move the analyzer in line".into(),
             bench_config: Some("analyzer in line".into()),
             timeout_ms: 10_000,
+            observation: None,
         };
         let asker = std::thread::spawn(move || backend.prompt(req, None));
         let pending = loop {
@@ -2529,7 +2711,7 @@ mod tests {
         }
 
         fn prompt(&mut self, _req: PromptRequest, _cancel: Option<&AtomicBool>) -> PromptRun {
-            PromptRun { end: PromptEnd::TimedOut, prompt_id: 1, deadline_utc_ms: 0 }
+            PromptRun { end: PromptEnd::TimedOut, prompt_id: 1, deadline_utc_ms: 0, answer: None }
         }
     }
 
@@ -2793,6 +2975,186 @@ mod tests {
         // A tap the study never declared is a 400.
         let bad = vec![embarch_study_designer::LineCount { name: "n".into(), tap: "nope".into(), pattern: "x".into(), kind: Default::default() }];
         assert_eq!(render_counts_for(dir.path(), "s1", Some(bad)).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- a prompt's kind and who may answer it (decision 138) ----
+
+    use crate::token_store::Scope;
+
+    fn shape(answers: &[&str]) -> ObservationShape {
+        ObservationShape { name: "led".into(), answers: answers.iter().map(|a| a.to_string()).collect(), number: None }
+    }
+
+    fn number_shape() -> ObservationShape {
+        ObservationShape {
+            name: "vbus".into(),
+            answers: vec![],
+            number: Some(embarch_study_designer::host_study::ObservedNumber { unit: "mV".into(), resolution: 1.0, u_expanded: 10.0, k: None }),
+        }
+    }
+
+    fn kinded_slot(kind: Option<PromptKind>, observation: Option<ObservationShape>) -> HostPrompt {
+        let slot = slot_with("h1", 1);
+        {
+            let mut g = slot.lock().unwrap();
+            let p = &mut g.as_mut().unwrap().pending;
+            p.kind = kind;
+            p.observation = observation;
+        }
+        slot
+    }
+
+    fn valued(answer: PromptAnswer, value: serde_json::Value) -> PromptAnswerBody {
+        PromptAnswerBody { value: Some(value), ..body(1, answer) }
+    }
+
+    #[test]
+    fn the_agents_token_is_refused_an_observation_and_a_clearance_whatever_answered_by_says() {
+        for kind in [PromptKind::Observation, PromptKind::Clearance] {
+            let slot = kinded_slot(Some(kind), Some(shape(&["green", "red"])));
+            for answered_by in [AnsweredBy::Ui, AnsweredBy::Mcp, AnsweredBy::Cli] {
+                let b = PromptAnswerBody { answered_by, ..valued(PromptAnswer::Confirmed, serde_json::json!("green")) };
+                let (status, msg) = record_answer_scoped(&slot, "h1", &b, Scope::Agent).unwrap_err();
+                assert_eq!(status, StatusCode::FORBIDDEN, "{kind:?} {answered_by:?}");
+                assert!(msg.contains("the UI") && msg.contains("CLI") && msg.contains("only the person's own hand"), "{msg}");
+            }
+            assert!(pending_prompt(&slot, "h1").is_some(), "a refused answer leaves the prompt pending");
+        }
+        let obs = kinded_slot(Some(PromptKind::Observation), Some(shape(&["green"])));
+        assert!(record_answer_scoped(&obs, "h1", &body(1, PromptAnswer::Cancelled), Scope::Agent).unwrap_err().1.contains("an observation"));
+        let clr = kinded_slot(Some(PromptKind::Clearance), None);
+        assert!(record_answer_scoped(&clr, "h1", &body(1, PromptAnswer::Confirmed), Scope::Agent).unwrap_err().1.contains("a clearance"));
+        // The person's token takes a clearance.
+        assert_eq!(record_answer_scoped(&clr, "h1", &body(1, PromptAnswer::Confirmed), Scope::Person), Ok(true));
+    }
+
+    #[test]
+    fn the_agent_may_still_relay_a_setup_an_action_and_a_prompt_with_no_kind() {
+        for kind in [Some(PromptKind::Setup), Some(PromptKind::Action), None] {
+            let slot = kinded_slot(kind, None);
+            assert_eq!(record_answer_scoped(&slot, "h1", &body(1, PromptAnswer::Confirmed), Scope::Agent), Ok(true), "{kind:?}");
+            let g = slot.lock().unwrap();
+            assert_eq!(g.as_ref().unwrap().extra, Some(AnswerExtra { scope: Scope::Agent, value: None }));
+        }
+    }
+
+    #[test]
+    fn an_observation_takes_a_declared_choice_or_a_number_with_the_persons_token_and_records_the_scope() {
+        let slot = kinded_slot(Some(PromptKind::Observation), Some(shape(&["green", "red"])));
+        let (status, msg) = record_answer_scoped(&slot, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!("blue")), Scope::Person).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("'green', 'red'"), "{msg}");
+        assert_eq!(record_answer_scoped(&slot, "h1", &body(1, PromptAnswer::Confirmed), Scope::Person).unwrap_err().0, StatusCode::BAD_REQUEST, "an observation needs its value");
+        assert_eq!(record_answer_scoped(&slot, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!(5)), Scope::Person).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(pending_prompt(&slot, "h1").is_some());
+        assert_eq!(record_answer_scoped(&slot, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!("red")), Scope::Person), Ok(true));
+        let (end, extra) = wait_for_answer_with(&slot, 1, Duration::from_secs(1), None);
+        assert_eq!(end, PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
+        assert_eq!(extra, Some(AnswerExtra { scope: Scope::Person, value: Some(ObservedValue::Choice("red".into())) }));
+
+        let num = kinded_slot(Some(PromptKind::Observation), Some(number_shape()));
+        let (status, msg) = record_answer_scoped(&num, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!("five")), Scope::Person).unwrap_err();
+        assert!((status, msg.contains("mV")) == (StatusCode::BAD_REQUEST, true), "{msg}");
+        assert_eq!(record_answer_scoped(&num, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!(5012.5)), Scope::Person), Ok(true));
+        assert_eq!(num.lock().unwrap().as_ref().unwrap().extra.as_ref().unwrap().value, Some(ObservedValue::Number(5012.5)));
+
+        // A cancel takes no value; every other kind takes none either.
+        let cancel = kinded_slot(Some(PromptKind::Observation), Some(shape(&["green"])));
+        assert_eq!(record_answer_scoped(&cancel, "h1", &valued(PromptAnswer::Cancelled, serde_json::json!("green")), Scope::Person).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(record_answer_scoped(&cancel, "h1", &body(1, PromptAnswer::Cancelled), Scope::Person), Ok(true));
+        let action = kinded_slot(Some(PromptKind::Action), None);
+        assert_eq!(record_answer_scoped(&action, "h1", &valued(PromptAnswer::Confirmed, serde_json::json!("x")), Scope::Person).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_study_with_no_kind_answers_as_it_did_before() {
+        // No `run.json`, so no kind: the agent's token relays, `confirmed` and `cancelled` as ever.
+        let slot = kinded_slot(None, None);
+        assert_eq!(record_answer_scoped(&slot, "h1", &body(1, PromptAnswer::Cancelled), Scope::Agent), Ok(true));
+        let serialised = serde_json::to_value(&slot.lock().unwrap().as_ref().unwrap().pending).unwrap();
+        for key in ["kind", "observation", "switched_on"] {
+            assert!(serialised.get(key).is_none(), "{key} is absent when unset: {serialised}");
+        }
+    }
+
+    fn observing(name: &str, shape: ObservationShape) -> HostStep {
+        HostStep {
+            name: name.into(),
+            action: HostAction::Prompt { text: "what colour is the LED".into(), bench_config: None, kind: Some(PromptKind::Observation), confirmed_by: None, answer: Some(shape) },
+            timeout_ms: 1_000,
+            continue_on_fail: true,
+            delay_before_ms: 0,
+        }
+    }
+
+    #[test]
+    fn an_observations_answer_is_recorded_with_its_scope_and_written_as_a_person_measurement() {
+        let s = study(vec![observing("look", shape(&["green", "red"]))], vec![]);
+        let mut b = Script::new(vec![]);
+        b.prompt_ends.push_back(PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Cli));
+        b.prompt_answers.push_back(AnswerExtra { scope: Scope::Person, value: Some(ObservedValue::Choice("red".into())) });
+        let (events, m, subjects) = run_to_disk(&s, &mut b, &|_| None);
+        let step = &events["steps"][0];
+        assert_eq!((step["answered_by"].as_str(), step["answered_scope"].as_str()), (Some("cli"), Some("person")));
+        assert_eq!(step["observed"], serde_json::json!({"name": "led", "value": "red"}));
+        let m = m.unwrap();
+        let one = &m["measurements"][0];
+        assert_eq!((one["name"].as_str(), one["value"].as_str(), one["by"].as_str()), (Some("led"), Some("red"), Some("person")));
+        assert_eq!(one["method"], serde_json::json!({"kind": "prompt", "prompt_kind": "observation"}));
+        assert_eq!(one["declared_by"][0]["scope"], "person");
+        assert!(subjects.contains(&"measurements.json".to_string()), "{subjects:?}");
+
+        let n = study(vec![observing("read", number_shape())], vec![]);
+        let mut b = Script::new(vec![]);
+        b.prompt_ends.push_back(PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Ui));
+        b.prompt_answers.push_back(AnswerExtra { scope: Scope::Person, value: Some(ObservedValue::Number(4981.0)) });
+        let (_, m, _) = run_to_disk(&n, &mut b, &|_| None);
+        let one = &m.unwrap()["measurements"][0];
+        assert_eq!((one["value"].as_f64(), one["unit"].as_str()), (Some(4981.0), Some("mV")));
+    }
+
+    #[test]
+    fn an_unanswered_observation_writes_no_measurement() {
+        let s = study(vec![observing("look", shape(&["green"]))], vec![]);
+        let mut b = Script::new(vec![]);
+        let (events, m, _) = run_to_disk(&s, &mut b, &|_| None);
+        assert_eq!(events["steps"][0]["detail"], "prompt_timed_out");
+        assert!(events["steps"][0].get("observed").is_none() && m.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_after_an_energising_step_lists_the_output_it_switched_on_and_takes_its_kind_from_the_run() {
+        let state = AppState::new("t".into());
+        let ctx = RunContext {
+            kinds: BTreeMap::from([("ask".to_string(), PromptKind::Clearance)]),
+            energising: BTreeSet::from(["on".to_string()]),
+        };
+        let mut backend = CoreBackend { state: state.clone(), handle: tokio::runtime::Handle::current(), study_id: "h1".into(), prompts: 0, ctx, switched_on: BTreeMap::new() };
+        let on = inst("on", "OUTP ON", false);
+        let query = inst("meas", "MEAS?", true);
+        let mut script = Script::new(vec![]);
+        script.instrument_replies.push_back(Ok(("", false, None)));
+        script.instrument_replies.push_back(Ok(("5.0\n", true, None)));
+        for step in [&on, &query] {
+            let rec = run_step(step, HostList::Steps, 0, &mut script, None, StudyClock::new());
+            backend.stepped(step, &rec);
+        }
+        let req = PromptRequest { list: HostList::Steps, step_index: 2, step_name: "ask".into(), text: "clear?".into(), bench_config: None, timeout_ms: 10_000, observation: None };
+        let asker = std::thread::spawn(move || backend.prompt(req, None));
+        let pending = loop {
+            if let Some(p) = pending_prompt(&state.host_prompt, "h1") {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(pending.kind, Some(PromptKind::Clearance), "the kind is the run's, by step name");
+        assert_eq!(pending.switched_on, vec![SwitchedOn { target: "eload".into(), line: "OUTP ON".into(), step: "on".into() }], "a query switches nothing on");
+        let shown = serde_json::to_value(&pending).unwrap();
+        assert_eq!((shown["kind"].as_str(), shown["switched_on"][0]["line"].as_str()), (Some("clearance"), Some("OUTP ON")));
+        assert_eq!(record_answer_scoped(&state.host_prompt, "h1", &body(pending.prompt_id, PromptAnswer::Confirmed), Scope::Agent).unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(record_answer_scoped(&state.host_prompt, "h1", &body(pending.prompt_id, PromptAnswer::Confirmed), Scope::Person), Ok(true));
+        let run = tokio::task::spawn_blocking(move || asker.join().unwrap()).await.unwrap();
+        assert_eq!(run.answer, Some(AnswerExtra { scope: Scope::Person, value: None }));
     }
 
     // ---- a step's declared number (decision 131) ----

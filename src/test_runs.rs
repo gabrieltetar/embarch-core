@@ -23,7 +23,7 @@ use embarch_study_designer::hil_test::{definition_hash, derived_diff, Capability
 use embarch_study_designer::host_study::{HostAction, HostStep, HostStudy};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use crate::api::AppState;
@@ -237,6 +237,34 @@ fn prompts(steps: &[HostStep], list: &str, out: &mut Vec<Value>) {
     }
 }
 
+/// The names of the steps that energise, by the crate's `energises`: what the executor tells a
+/// prompt's card Core last switched on (decision 138).
+fn energising_names(steps: &[HostStep], bench: &SuiteBench, out: &mut Vec<String>) {
+    for s in steps {
+        match &s.action {
+            HostAction::Repeat { steps, .. } => energising_names(steps, bench, out),
+            _ if energises(s, bench) => out.push(s.name.clone()),
+            _ => {}
+        }
+    }
+}
+
+/// [`energising_names`] for each test's study, by test id.
+fn energising_by_test(defs_exp: &Expansion, res: &Resolved, studies: &BTreeMap<String, HostStudy>) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for rt in &defs_exp.run.tests {
+        let study = defs_exp.studies.iter().find(|s| s.test_id == rt.test_id).map(|s| &s.study).or_else(|| studies.get(&rt.study.file));
+        let bench = res.manifest.benches.iter().find(|b| b.name == rt.bench.name);
+        if let (Some(study), Some(bench)) = (study, bench) {
+            let mut names = Vec::new();
+            energising_names(&study.steps, bench, &mut names);
+            energising_names(&study.teardown, bench, &mut names);
+            out.insert(rt.test_id.clone(), names);
+        }
+    }
+    out
+}
+
 /// Every step that energises, by the crate's `energises`, with the line it sends.
 fn energising(steps: &[HostStep], bench: &SuiteBench, list: &str, out: &mut Vec<Value>) {
     for s in steps {
@@ -406,6 +434,7 @@ pub async fn prepare_handler(State(state): State<AppState>, Json(req): Json<Prep
             "lease_holder": holder, "prepared_utc_ms": crate::study::current_utc_ms(),
             "card": static_card(&defs, &res, &exp, &req.studies), "inputs": inputs(&res),
             "studies": kept_studies(&exp, &req.studies),
+            "energising_steps": energising_by_test(&exp, &res, &req.studies),
         });
         write_new(&path, &record).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => (StatusCode::CONFLICT, format!("run {} is already prepared: a run id is used once", req.run.run_id)),
@@ -587,7 +616,9 @@ pub async fn go_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<
 fn start_executor(state: &AppState, run_id: &str, rec: &Value) -> Result<(), String> {
     let run: RunJson = serde_json::from_value(rec["run"].clone()).map_err(|e| format!("the kept run.json no longer parses: {e}"))?;
     let studies: BTreeMap<String, HostStudy> = serde_json::from_value(rec["studies"].clone()).unwrap_or_default();
-    crate::test_executor::spawn(state.clone(), run_id.to_string(), run, studies);
+    // A record kept before decision 138 has none: its prompts list no outputs.
+    let energising: BTreeMap<String, BTreeSet<String>> = serde_json::from_value(rec["energising_steps"].clone()).unwrap_or_default();
+    crate::test_executor::spawn(state.clone(), run_id.to_string(), run, studies, energising);
     Ok(())
 }
 
@@ -1047,6 +1078,7 @@ mod tests {
         assert_eq!(started["state"], "started", "a started run with no executor yet");
 
         let rec = read_record(s.run_log.data_dir(), "run-s1").unwrap();
+        assert!(rec["energising_steps"]["vbus-5v-source-voltage"].is_array(), "the prepare keeps each test's energising steps: {}", rec["energising_steps"]);
         let run: RunJson = serde_json::from_value(rec["run"].clone()).unwrap();
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test_executor::Progress { state: "running", ..Default::default() }));
         s.test_progress.lock().unwrap().insert("run-s1".into(), progress.clone());
@@ -1063,9 +1095,10 @@ mod tests {
             study_id: "st".into(),
             pending: crate::host_study::PendingPrompt {
                 prompt_id: 1, list: HostList::Steps, step_index: 0, step_name: "set up".into(), text: "Wire it".into(), bench_config: None,
-                opened_utc_ms: 0, deadline_utc_ms: 9, session: None,
+                kind: None, observation: None, switched_on: vec![], opened_utc_ms: 0, deadline_utc_ms: 9, session: None,
             },
             answer: None,
+            extra: None,
             session: None,
         });
         let (st, mid) = call(&s, AGENT, "GET", "/test-runs/run-s1", None).await;

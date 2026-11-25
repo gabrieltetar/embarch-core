@@ -8654,6 +8654,7 @@ mod tests {
                         prompt_id: p.prompt_id,
                         answer: crate::host_study::PromptAnswer::Confirmed,
                         answered_by: crate::host_study::AnsweredBy::Ui,
+                        value: None,
                         run_fields: Vec::new(),
                     };
                     assert_eq!(crate::host_study::record_answer_scoped(&self.prompts, "s1", &body, crate::token_store::Scope::Person), Ok(true));

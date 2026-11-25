@@ -69,15 +69,62 @@ pub struct Collected {
     pub parsed: Parsed,
 }
 
-/// Writes `measurements.json` from a host run's parses; `Ok(None)` when it had none.
+/// An observation prompt's answer (core decision 138), as the step's record carries it
+/// (`observed`) and as `measurements.json` writes it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Observed {
+    pub name: String,
+    pub value: crate::host_study::ObservedValue,
+    /// The declared unit of a number; `None` for a choice.
+    #[serde(skip)]
+    pub unit: Option<String>,
+}
+
+/// An observation as the run collected it.
+pub struct CollectedObservation {
+    pub step: String,
+    pub iteration: Option<IterationRef>,
+    pub at_utc_ms: u64,
+    pub observed: Observed,
+}
+
+/// A person's answer as a measurement: `by: person`, `method {kind: "prompt", prompt_kind:
+/// "observation"}`, declared by the person's own token (only that token can answer one).
+fn observation(c: &CollectedObservation) -> Value {
+    let o = &c.observed;
+    let mut source = json!({"file": "events.json", "step": c.step});
+    if let Some(it) = &c.iteration {
+        source["iteration"] = json!(it);
+    }
+    json!({
+        "name": o.name,
+        "value": serde_json::to_value(&o.value).unwrap_or(Value::Null),
+        "unit": o.unit,
+        "at_utc_ms": c.at_utc_ms,
+        "source": source,
+        "by": "person",
+        "instrument": Value::Null,
+        "bench_image": Value::Null,
+        "method": {"kind": "prompt", "prompt_kind": "observation"},
+        "resolution": Value::Null,
+        "uncertainty": Value::Null,
+        "u_source": "undeclared",
+        "declared_by": [{"what": "prompt", "name": c.step, "scope": Scope::Person.as_str()}],
+        "incomplete": Vec::<&str>::new(),
+    })
+}
+
+/// Writes `measurements.json` from a host run's parses and observations, in the order they ran
+/// (parses first); `Ok(None)` when it had none.
 pub fn write(
     dir: &Path,
     run_id: &str,
     collected: &[Collected],
+    observed: &[CollectedObservation],
     signal_origin: &dyn Fn(&str) -> Option<SignalOrigin>,
     declarations: &Declarations,
 ) -> Result<Option<PathBuf>> {
-    if collected.is_empty() {
+    if collected.is_empty() && observed.is_empty() {
         return Ok(None);
     }
     let doc = json!({
@@ -85,7 +132,7 @@ pub fn write(
         "run_id": run_id,
         // A parse is no reducer: it carries no behaviour version.
         "behaviours": {},
-        "measurements": collected.iter().map(|c| measurement(c, signal_origin, declarations)).collect::<Vec<_>>(),
+        "measurements": collected.iter().map(|c| measurement(c, signal_origin, declarations)).chain(observed.iter().map(observation)).collect::<Vec<_>>(),
     });
     crate::measurements::write_file(dir, &doc).map(Some)
 }

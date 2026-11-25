@@ -207,6 +207,7 @@ fn publish(p: &SessionPrompter, pending: PendingPrompt, spec: &SessionSpec) {
         study_id: p.study_id.clone(),
         pending: pending.clone(),
         answer: None,
+        extra: None,
         session: Some(SessionSlot::new(spec.clone())),
     });
     let _ = p.events.send(StudyEvent::PromptPending { study_id: p.study_id.clone(), prompt: pending });
@@ -246,6 +247,9 @@ impl SessionPrompter {
             step_name: START_STEP_NAME.to_string(),
             text: spec.start_text.as_str().to_string(),
             bench_config: None,
+            kind: None,
+            observation: None,
+            switched_on: Vec::new(),
             opened_utc_ms: opened,
             deadline_utc_ms: opened + timeout.as_millis() as u64,
             session: Some(SessionPromptInfo {
@@ -298,6 +302,9 @@ impl SessionPrompter {
             step_name: DONE_STEP_NAME.to_string(),
             text: spec.done_text.as_str().to_string(),
             bench_config: None,
+            kind: None,
+            observation: None,
+            switched_on: Vec::new(),
             opened_utc_ms: opened,
             deadline_utc_ms: opened + cap.as_millis() as u64,
             session: Some(SessionPromptInfo { phase: SessionPhase::Done, run_fields: Vec::new() }),
@@ -453,6 +460,7 @@ mod tests {
             prompt_id,
             answer,
             answered_by: AnsweredBy::Ui,
+            value: None,
             run_fields: fields.iter().map(|(n, v)| RunFieldAnswer { name: n.to_string(), value: v.to_string() }).collect(),
         }
     }

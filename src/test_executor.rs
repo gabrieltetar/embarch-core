@@ -18,12 +18,12 @@ use embarch_study_designer::hil_test::Precondition;
 use embarch_study_designer::host_study::{HostAction, HostStep, HostStudy, PromptKind};
 use embarch_study_designer::verdicts::{Counts, Evidence, Judged, Reason, Rules, StepOutcome, Target, Verdict};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::AppState;
-use crate::host_study::detail;
+use crate::host_study::{detail, RunContext};
 use crate::measurements::SignalOrigin;
 use crate::token_store::Scope;
 
@@ -295,8 +295,10 @@ fn outcome_of(detail: &str, observation: bool) -> Option<StepOutcome> {
     })
 }
 
-/// The steps of an `events.json`, as the verdict rules read them.
-pub fn judge_steps(study: &HostStudy, events: &Value, origin: &dyn Fn(&str) -> Option<SignalOrigin>) -> Vec<JudgeStep> {
+/// The steps of an `events.json`, as the verdict rules read them. Whether a prompt asked a person
+/// what they saw is `run.json`'s `prompt_kinds` (`kinds`), never the study's own `kind` field: a
+/// study cannot relabel its prompt (decision 138).
+pub fn judge_steps(study: &HostStudy, kinds: &BTreeMap<String, PromptKind>, events: &Value, origin: &dyn Fn(&str) -> Option<SignalOrigin>) -> Vec<JudgeStep> {
     let mut actions = BTreeMap::new();
     walk_steps(&study.steps, &mut actions);
     walk_steps(&study.teardown, &mut actions);
@@ -308,7 +310,7 @@ pub fn judge_steps(study: &HostStudy, events: &Value, origin: &dyn Fn(&str) -> O
             let name = s["step_name"].as_str()?;
             let detail = s["detail"].as_str().unwrap_or("");
             let action = actions.get(name).copied();
-            let observation = matches!(action, Some(HostAction::Prompt { kind: Some(PromptKind::Observation), .. }));
+            let observation = kinds.get(name) == Some(&PromptKind::Observation);
             let outcome = outcome_of(detail, observation)?;
             let target = match action {
                 Some(HostAction::Exchange { signal, .. }) => target_of(origin(signal)),
@@ -331,6 +333,7 @@ pub fn judge_measurements(test: &RunTest, doc: &Value) -> Vec<MeasurementRecord>
             let name = m["name"].as_str()?;
             let source = test.sources.iter().find(|s| s.measurement == name);
             let origin = match (m["by"].as_str(), m["instrument"]["kind"].as_str()) {
+                (Some("person"), _) => Origin::PersonObservation,
                 (Some("dut"), _) => Origin::DutReport,
                 (_, Some("instrument")) => Origin::Instrument,
                 // `bench_image` is `unverified` for every board until Core can read an image back.
@@ -340,7 +343,10 @@ pub fn judge_measurements(test: &RunTest, doc: &Value) -> Vec<MeasurementRecord>
             let by_person = m["declared_by"].as_array().is_some_and(|d| !d.is_empty() && d.iter().all(|x| x["scope"] == "person"));
             Some(MeasurementRecord {
                 measurement: name.to_string(),
-                value: MeasuredValue::Number(m["value"].as_f64().unwrap_or(0.0)),
+                value: match m["value"].as_str() {
+                    Some(choice) => MeasuredValue::Choice(choice.to_string()),
+                    None => MeasuredValue::Number(m["value"].as_f64().unwrap_or(0.0)),
+                },
                 u: source.map_or(0.0, |s| s.u),
                 evidence: Evidence { incomplete, calibration_expired: false },
                 origin,
@@ -360,13 +366,22 @@ pub struct CoreEnv {
     run_id: String,
     /// The study each test runs, kept at the prepare (decision 136).
     studies: BTreeMap<String, HostStudy>,
+    /// The steps of each test's study that energise, by the crate's `energises`, worked out at the
+    /// prepare (decision 138). A record kept before that has none.
+    energising: BTreeMap<String, BTreeSet<String>>,
     /// The run was cancelled under a study: set from the study's own cancel flag.
     study_cancelled: bool,
 }
 
 impl CoreEnv {
-    pub fn new(state: AppState, handle: tokio::runtime::Handle, run_id: String, studies: BTreeMap<String, HostStudy>) -> Self {
-        CoreEnv { state, handle, run_id, studies, study_cancelled: false }
+    pub fn new(
+        state: AppState,
+        handle: tokio::runtime::Handle,
+        run_id: String,
+        studies: BTreeMap<String, HostStudy>,
+        energising: BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
+        CoreEnv { state, handle, run_id, studies, energising, study_cancelled: false }
     }
 
     fn reset_dut(&self) -> Result<(), String> {
@@ -415,13 +430,18 @@ impl Env for CoreEnv {
         let Some(study) = self.studies.get(&test.test_id).cloned() else {
             return abort(format!("Core kept no study for {} at the prepare", test.test_id));
         };
-        let ran = match crate::host_study::run_study_blocking(&self.state, &self.handle, &study, Scope::Person) {
+        let ctx_kinds: BTreeMap<String, PromptKind> = test.prompt_kinds.iter().map(|k| (k.step.clone(), k.kind)).collect();
+        let ctx = RunContext {
+            kinds: ctx_kinds.clone(),
+            energising: self.energising.get(&test.test_id).cloned().unwrap_or_default(),
+        };
+        let ran = match crate::host_study::run_study_blocking(&self.state, &self.handle, &study, Scope::Person, ctx) {
             Ok(r) => r,
             Err(why) => return abort(why),
         };
         let read = |f: &str| std::fs::read(ran.dir.join(f)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
         let origin = &crate::measurements::topology_signal_origin;
-        let steps = read("events.json").map(|e| judge_steps(&study, &e, origin)).unwrap_or_default();
+        let steps = read("events.json").map(|e| judge_steps(&study, &ctx_kinds, &e, origin)).unwrap_or_default();
         let measurements = read("measurements.json").map(|m| judge_measurements(test, &m)).unwrap_or_default();
         self.study_cancelled = ran.cancelled;
         StudyRun { steps, measurements, cancelled: ran.cancelled, aborted: None, study_id: Some(ran.study_id) }
@@ -430,12 +450,12 @@ impl Env for CoreEnv {
 
 /// Starts the executor for a run the go just started, on its own blocking thread, and ends the
 /// run through [`crate::test_runs::end_run`] when it is done (`None` scope: Core ended it).
-pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<String, HostStudy>) {
+pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<String, HostStudy>, energising: BTreeMap<String, BTreeSet<String>>) {
     let handle = tokio::runtime::Handle::current();
     let progress = Arc::new(Mutex::new(Progress { state: "running", ..Default::default() }));
     state.test_progress.lock().unwrap().insert(run_id.clone(), progress.clone());
     tokio::task::spawn_blocking(move || {
-        let mut env = CoreEnv::new(state.clone(), handle, run_id.clone(), studies);
+        let mut env = CoreEnv::new(state.clone(), handle, run_id.clone(), studies, energising);
         let outcome = drive(&run, &mut env, &progress, &Rules::latest(), deadline(&run));
         let body = json!({
             "run_id": run_id, "status": outcome.status, "ended_utc_ms": crate::study::current_utc_ms(),
@@ -731,7 +751,7 @@ mod tests {
             "partner" => Some(SignalOrigin::Board("sn1".into())),
             _ => None,
         };
-        let got = judge_steps(&study, &events, &origin);
+        let got = judge_steps(&study, &BTreeMap::new(), &events, &origin);
         let shown: Vec<(&str, Target, StepOutcome)> = got.iter().map(|s| (s.step.as_str(), s.target, s.outcome)).collect();
         assert_eq!(
             shown,
@@ -742,6 +762,48 @@ mod tests {
             ],
             "a step a cancel cut short says nothing"
         );
+    }
+
+    #[test]
+    fn an_unanswered_prompt_is_judged_by_the_kind_run_json_gives_it_never_the_studys_own() {
+        // The study calls both prompts what it likes; `run.json` says which is the observation.
+        let study: HostStudy = serde_json::from_value(json!({
+            "name": "s", "steps": [
+                { "name": "look", "timeout_ms": 100, "action": { "Prompt": { "text": "?", "kind": "setup" } } },
+                { "name": "plug", "timeout_ms": 100, "action": { "Prompt": { "text": "?", "kind": "observation", "answer": { "name": "x", "answers": ["a"] } } } }
+            ], "teardown": []
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let kinds = BTreeMap::from([("look".to_string(), PromptKind::Observation), ("plug".to_string(), PromptKind::Action)]);
+        let events = json!({ "steps": [
+            { "step_name": "look", "detail": "prompt_timed_out" },
+            { "step_name": "plug", "detail": "prompt_timed_out" },
+            { "step_name": "look", "detail": "prompt_cancelled" },
+        ]});
+        let steps = judge_steps(&study, &kinds, &events, &|_| None);
+        let rules = Rules::latest();
+        let judged: Vec<(Verdict, Option<Reason>)> =
+            steps.iter().map(|s| rules.step_verdict(s.target, s.outcome).map(|j| (j.verdict, j.reason)).unwrap()).collect();
+        assert_eq!(
+            judged,
+            [
+                (Verdict::Inconclusive, Some(Reason::ObservationUnanswered)),
+                (Verdict::Error, Some(Reason::PromptNotConfirmed)),
+                (Verdict::Inconclusive, Some(Reason::ObservationUnanswered)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_persons_choice_reads_as_a_person_observation_judged_by_the_person() {
+        let t = test("t1", "A", 1, &[]);
+        let doc = json!({ "measurements": [
+            { "name": "led", "value": "green", "by": "person", "instrument": null, "incomplete": [], "declared_by": [ { "scope": "person" } ] },
+            { "name": "vbus", "value": 4981.0, "by": "person", "instrument": null, "incomplete": [], "declared_by": [ { "scope": "person" } ] },
+        ]});
+        let got = judge_measurements(&t, &doc);
+        assert_eq!((got[0].origin, got[0].value.clone(), got[0].declared_by), (Origin::PersonObservation, MeasuredValue::Choice("green".into()), DeclaredBy::Person));
+        assert_eq!((got[1].origin, got[1].value.clone(), got[1].u), (Origin::PersonObservation, MeasuredValue::Number(4981.0), 10.0));
     }
 
     #[test]
