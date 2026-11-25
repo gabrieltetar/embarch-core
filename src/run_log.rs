@@ -307,6 +307,24 @@ impl RunLog {
         }))
     }
 
+    /// A setup call admitted between two benches of a Test run (decision 139): `scope` is the
+    /// token it came with, so an agent's is labelled the agent's.
+    pub fn test_run_setup_call(&self, run_id: &str, method: &str, route: &str, scope: Scope) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test_run_setup_call", "run_id": run_id, "method": method, "route": route,
+            "scope": scope.as_str(), "at_utc_ms": now_ms(),
+        }))
+    }
+
+    /// How a setup prompt between two benches ended (decision 139): `scope` is the answering
+    /// token's, `None` for a timeout or a cancel; `relayed` is true when it was the agent's.
+    pub fn test_run_setup_ended(&self, run_id: &str, bench: &str, answer: &str, scope: Option<Scope>) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test_run_setup_ended", "run_id": run_id, "bench": bench, "answer": answer,
+            "scope": scope.map(|s| s.as_str()), "relayed": scope == Some(Scope::Agent), "at_utc_ms": now_ms(),
+        }))
+    }
+
     /// Every hash a `confirmed` entry binds. A log that does not verify is an error.
     pub fn confirmed_hashes(&self) -> Result<HashSet<String>> {
         self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;

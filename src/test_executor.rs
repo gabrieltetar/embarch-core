@@ -15,7 +15,7 @@
 use embarch_study_designer::hil_expand::{RunBench, RunBoard, RunJson, RunTest};
 use embarch_study_designer::hil_judge::{self, DeclaredBy, FirmwareState, MeasuredValue, MeasurementRecord, Origin, StepRecord as JudgeStep};
 use embarch_study_designer::hil_test::Precondition;
-use embarch_study_designer::host_study::{HostAction, HostStep, HostStudy, PromptKind};
+use embarch_study_designer::host_study::{HostList, HostAction, HostStep, HostStudy, PromptKind};
 use embarch_study_designer::verdicts::{Counts, Evidence, Judged, Reason, Rules, StepOutcome, Target, Verdict};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +38,10 @@ const DEADLINE_FACTOR: u64 = 2;
 const IDLE_WAIT_MS: u64 = 500;
 /// How long a precondition waits for a port that a reset has taken away to come back.
 const PORT_WAIT_MS: u64 = 5_000;
+/// How long the setup prompt between two benches waits for the person (decision 139), and what each
+/// bench after the first adds to the run's deadline. **Chosen, not measured**: a person moving a
+/// cable and enrolling a board.
+const SETUP_WAIT_MS: u64 = 900_000;
 
 /// What one run of a test's study left, ready for [`hil_judge::judge_run`].
 pub struct StudyRun {
@@ -52,8 +56,27 @@ pub struct StudyRun {
     pub study_id: Option<String>,
 }
 
+/// How the setup prompt before a bench ended (decision 139).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupEnd {
+    /// Someone confirmed the bench is set up.
+    Confirmed,
+    /// Someone declined it.
+    Declined,
+    /// Nobody answered by the deadline.
+    TimedOut,
+    /// The run was cancelled while it waited.
+    Cancelled,
+}
+
 /// What the policy needs from a bench.
 pub trait Env {
+    /// The setup window before `bench`, the next saved bench (decision 139): raises a `setup`
+    /// prompt naming it and what is `missing`, admits the setup calls while it waits, and says how
+    /// it ended. The default has no window.
+    fn setup(&mut self, _bench: &RunBench, _config: &str, _missing: &[String]) -> SetupEnd {
+        SetupEnd::Confirmed
+    }
     /// The run was cancelled (the route, or a study's own cancel).
     fn cancelled(&self) -> bool;
     /// Brings the DUT and the bench boards to the test's starting state; `Err` names what failed.
@@ -142,7 +165,10 @@ fn errored(test: &RunTest, why: Reason, note: String, study_ids: Vec<String>) ->
 /// run to ([`DEADLINE_FACTOR`]).
 pub fn deadline(run: &RunJson) -> Duration {
     let bound = embarch_study_designer::hil_expand::duration_bound(run);
-    Duration::from_millis(bound.saturating_mul(DEADLINE_FACTOR).saturating_add(TEST_ALLOWANCE_MS.saturating_mul(run.tests.len() as u64)))
+    let setups = (run.benches.len() as u64).saturating_sub(1);
+    Duration::from_millis(
+        bound.saturating_mul(DEADLINE_FACTOR).saturating_add(TEST_ALLOWANCE_MS.saturating_mul(run.tests.len() as u64)).saturating_add(SETUP_WAIT_MS.saturating_mul(setups)),
+    )
 }
 
 /// Walks `run` against `env` under the failure policy (`notes/hil/03-test.md`, "A run", item 5):
@@ -162,8 +188,21 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
         p.test = test.map(str::to_string);
         p.results = results.to_vec();
     };
-    for bench in &run.benches {
+    for (n, bench) in run.benches.iter().enumerate() {
         let mut bench_error = false;
+        // The setup window before every bench after the first. The smoke check is EMB-368, so
+        // nothing is found missing yet (decision 139).
+        let mut setup_failed: Option<&str> = None;
+        if n > 0 && ended.is_none() && !env.cancelled() {
+            publish(&results, Some(&bench.name), None);
+            let config = bench.tests.iter().find_map(|id| run.tests.iter().find(|t| &t.test_id == id)).map_or("", |t| t.bench.config.as_str());
+            match env.setup(bench, config, &[]) {
+                SetupEnd::Confirmed => {}
+                SetupEnd::Declined => setup_failed = Some("the setup prompt for this bench was declined"),
+                SetupEnd::TimedOut => setup_failed = Some("the setup prompt for this bench timed out"),
+                SetupEnd::Cancelled => ended = Some("cancelled"),
+            }
+        }
         for id in &bench.tests {
             let Some(test) = run.tests.iter().find(|t| &t.test_id == id) else { continue };
             if ended.is_none() && env.cancelled() {
@@ -174,6 +213,9 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
             }
             let result = if let Some(e) = ended {
                 cancelled(test, if e == "deadline" { "the run passed its deadline" } else { "the run was cancelled" })
+            } else if let Some(why) = setup_failed.take() {
+                bench_error = true;
+                errored(test, Reason::BenchStepFailed, why.to_string(), vec![])
             } else if after_fail {
                 skipped(test, Reason::StoppedAfterFail, "stop_on_fail: an earlier test failed")
             } else if bench_error {
@@ -371,6 +413,8 @@ pub struct CoreEnv {
     energising: BTreeMap<String, BTreeSet<String>>,
     /// The run was cancelled under a study: set from the study's own cancel flag.
     study_cancelled: bool,
+    /// Setup prompts raised so far; the next one's id is this plus one (decision 139).
+    setups: u32,
 }
 
 impl CoreEnv {
@@ -381,7 +425,7 @@ impl CoreEnv {
         studies: BTreeMap<String, HostStudy>,
         energising: BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
-        CoreEnv { state, handle, run_id, studies, energising, study_cancelled: false }
+        CoreEnv { state, handle, run_id, studies, energising, study_cancelled: false, setups: 0 }
     }
 
     fn reset_dut(&self) -> Result<(), String> {
@@ -408,6 +452,53 @@ impl CoreEnv {
 }
 
 impl Env for CoreEnv {
+    fn setup(&mut self, bench: &RunBench, config: &str, missing: &[String]) -> SetupEnd {
+        use crate::host_study::{PendingPrompt, PromptSlot, PromptEnd, PromptAnswer};
+        self.setups += 1;
+        let opened = crate::study::current_utc_ms();
+        let missing_text = if missing.is_empty() { "nothing is checked yet, so nothing is listed as missing".to_string() } else { missing.join(", ") };
+        let pending = PendingPrompt {
+            prompt_id: self.setups,
+            list: HostList::Steps,
+            step_index: 0,
+            step_name: format!("setup:{}", bench.name),
+            text: format!("Set up the bench '{}' (configuration '{}') for the next tests. Missing: {missing_text}.", bench.name, config),
+            bench_config: Some(config.to_string()),
+            kind: Some(PromptKind::Setup),
+            observation: None,
+            switched_on: vec![],
+            opened_utc_ms: opened,
+            deadline_utc_ms: opened + SETUP_WAIT_MS,
+            session: None,
+        };
+        // The window opens with the prompt and closes when it ends, whichever way it ends.
+        *self.state.setup_window.lock().unwrap() = Some(self.run_id.clone());
+        *self.state.host_prompt.lock().unwrap() = Some(PromptSlot { study_id: self.run_id.clone(), pending: pending.clone(), answer: None, extra: None, session: None });
+        let _ = self.state.study_events.send(crate::study::StudyEvent::PromptPending { study_id: self.run_id.clone(), prompt: pending.clone() });
+        let (end, extra) = crate::host_study::wait_for_answer_until(&self.state.host_prompt, pending.prompt_id, Duration::from_millis(SETUP_WAIT_MS), &|| self.cancelled());
+        *self.state.setup_window.lock().unwrap() = None;
+        let _ = self.state.study_events.send(crate::study::StudyEvent::PromptResolved {
+            study_id: self.run_id.clone(),
+            prompt_id: pending.prompt_id,
+            answer: end.answer_str(),
+            answered_by: match end {
+                PromptEnd::Answered(_, by) => Some(by),
+                _ => None,
+            },
+            resolved_utc_ms: crate::study::current_utc_ms(),
+        });
+        let scope = extra.as_ref().map(|e| e.scope);
+        if let Err(e) = self.state.run_log.test_run_setup_ended(&self.run_id, &bench.name, end.answer_str(), scope) {
+            tracing::error!(run_id = self.run_id, "could not enter the setup prompt's end in the run log: {e:#}");
+        }
+        match end {
+            PromptEnd::Answered(PromptAnswer::Confirmed, _) => SetupEnd::Confirmed,
+            PromptEnd::Answered(PromptAnswer::Cancelled, _) => SetupEnd::Declined,
+            PromptEnd::TimedOut => SetupEnd::TimedOut,
+            PromptEnd::StudyCancelled => SetupEnd::Cancelled,
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.study_cancelled || self.state.lease.run_in_flight().as_deref() != Some(self.run_id.as_str())
     }
@@ -508,10 +599,13 @@ mod tests {
         cancel_after_runs: Option<usize>,
         ran: Vec<String>,
         prepared: Vec<String>,
+        /// The benches a setup prompt was raised for, with the configuration, and how each ends.
+        setups: Vec<(String, String)>,
+        setup_ends: VecDeque<SetupEnd>,
     }
 
     fn fake(runs: Vec<StudyRun>) -> Fake {
-        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![] }
+        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![], setups: vec![], setup_ends: VecDeque::new() }
     }
 
     fn steps(outcome: StepOutcome, target: Target) -> Vec<JudgeStep> {
@@ -541,6 +635,11 @@ mod tests {
     }
 
     impl Env for Fake {
+        fn setup(&mut self, bench: &RunBench, config: &str, missing: &[String]) -> SetupEnd {
+            assert!(missing.is_empty(), "no smoke check exists yet");
+            self.setups.push((bench.name.clone(), config.to_string()));
+            self.setup_ends.pop_front().unwrap_or(SetupEnd::Confirmed)
+        }
         fn cancelled(&self) -> bool {
             self.cancel_after_runs.is_some_and(|n| self.ran.len() >= n)
         }
@@ -563,6 +662,85 @@ mod tests {
 
     fn verdicts(o: &RunOutcome) -> Vec<(String, Verdict, Option<Reason>)> {
         o.results.iter().map(|r| (r.test_id.clone(), r.judged.verdict, r.judged.reason)).collect()
+    }
+
+    #[test]
+    fn a_setup_prompt_is_raised_before_every_bench_after_the_first_and_names_it() {
+        let run = run_of(&[("a", &["t1"]), ("b", &["t2"])], vec![test("t1", "a", 1, &[]), test("t2", "b", 1, &[])], false);
+        let mut env = fake(vec![pass(), pass()]);
+        let out = go(&run, &mut env);
+        assert_eq!(env.setups, vec![("b".to_string(), "default".to_string())]);
+        assert_eq!(out.status, "completed");
+        assert!(out.results.iter().all(|r| r.judged.verdict == Verdict::Pass));
+    }
+
+    #[test]
+    fn a_declined_or_timed_out_setup_is_an_error_on_that_bench_and_the_run_goes_on() {
+        for end in [SetupEnd::Declined, SetupEnd::TimedOut] {
+            let run = run_of(&[("a", &["t1"]), ("b", &["t2", "t3"]), ("c", &["t4"])], vec![test("t1", "a", 1, &[]), test("t2", "b", 1, &[]), test("t3", "b", 1, &[]), test("t4", "c", 1, &[])], false);
+            let mut env = fake(vec![pass(), pass()]);
+            env.setup_ends = VecDeque::from([end]);
+            let out = go(&run, &mut env);
+            let v = verdicts(&out);
+            assert_eq!(v[1], ("t2".to_string(), Verdict::Error, Some(Reason::BenchStepFailed)), "{end:?}");
+            assert_eq!(v[2].2, Some(Reason::StoppedByError));
+            assert_eq!(v[3].1, Verdict::Pass, "bench c still runs");
+            assert_eq!(env.ran, vec!["t1", "t4"]);
+            assert_eq!(env.setups.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_setup_prompt_ends_the_run() {
+        let run = run_of(&[("a", &["t1"]), ("b", &["t2"])], vec![test("t1", "a", 1, &[]), test("t2", "b", 1, &[])], false);
+        let mut env = fake(vec![pass()]);
+        env.setup_ends = VecDeque::from([SetupEnd::Cancelled]);
+        let out = go(&run, &mut env);
+        assert_eq!(out.status, "cancelled");
+        assert_eq!(out.results[1].judged.verdict, Verdict::Cancelled);
+        assert_eq!(env.ran, vec!["t1"]);
+    }
+
+    #[test]
+    fn the_deadline_allows_each_setup_prompt_after_the_first_bench() {
+        let one = run_of(&[("a", &["t1"])], vec![test("t1", "a", 1, &[])], false);
+        let two = run_of(&[("a", &["t1"]), ("b", &["t2"])], vec![test("t1", "a", 1, &[]), test("t2", "b", 1, &[])], false);
+        assert!(deadline(&two) >= deadline(&one) + Duration::from_millis(SETUP_WAIT_MS));
+    }
+
+    /// The real setup prompt: raised under the run's id with kind `setup`, the window open while it
+    /// waits and shut after, and the agent's answer recorded as relayed (decision 139).
+    #[test]
+    fn the_real_setup_prompt_opens_the_window_and_records_an_agents_answer_as_relayed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state = AppState::new("tok".to_string());
+        *state.run_lock.lock().unwrap() = Some("r1".to_string());
+        let mut env = CoreEnv::new(state.clone(), rt.handle().clone(), "r1".to_string(), BTreeMap::new(), BTreeMap::new());
+        let bench: RunBench = serde_json::from_value(json!({ "name": "b", "tests": [], "boards": [] })).unwrap();
+        let answerer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                loop {
+                    if let Some(p) = crate::host_study::pending_prompt(&state.host_prompt, "r1") {
+                        assert_eq!(p.kind, Some(PromptKind::Setup));
+                        assert!(p.text.contains("'b'") && p.text.contains("'default'"), "{}", p.text);
+                        assert_eq!(state.setup_window.lock().unwrap().as_deref(), Some("r1"));
+                        let body: crate::host_study::PromptAnswerBody =
+                            serde_json::from_value(json!({ "prompt_id": p.prompt_id, "answer": "confirmed", "answered_by": "cli" })).unwrap();
+                        crate::host_study::record_answer_scoped(&state.host_prompt, "r1", &body, Scope::Agent).unwrap();
+                        return;
+                    }
+                    assert!(start.elapsed() < Duration::from_secs(10), "no setup prompt appeared");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        assert_eq!(env.setup(&bench, "default", &[]), SetupEnd::Confirmed);
+        answerer.join().unwrap();
+        assert_eq!(*state.setup_window.lock().unwrap(), None);
+        let entry = state.run_log.lines().unwrap().into_iter().map(|l| l["entry"].clone()).find(|e| e["type"] == "test_run_setup_ended").expect("an entry");
+        assert_eq!((entry["scope"].as_str(), entry["relayed"].as_bool(), entry["bench"].as_str()), (Some("agent"), Some(true), Some("b")));
     }
 
     #[test]

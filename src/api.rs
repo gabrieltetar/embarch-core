@@ -44,6 +44,10 @@ pub struct AppState {
     pub study_lock: study::StudyLock,
     /// The Test run holding the bench from its go to its end (`test_runs.rs`, decision 135).
     pub run_lock: lease::RunLock,
+    /// The Test run whose setup prompt waits between two benches (decision 139): while it is set to
+    /// the run in flight, `lease_middleware` admits [`SETUP_ADMITTED`] too. Opened and closed by the
+    /// executor only.
+    pub setup_window: Arc<StdMutex<Option<String>>>,
     pub study_jobs: study::JobRegistry,
     /// Live push for `GET /study/{study_id}/events` (SSE) — every
     /// `StudyEvent` `study.rs` produces goes through this one process-wide
@@ -122,6 +126,7 @@ impl AppState {
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock,
             run_lock,
+            setup_window: Arc::new(StdMutex::new(None)),
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
             study_events,
             test_progress: Arc::new(StdMutex::new(Default::default())),
@@ -348,10 +353,20 @@ async fn lease_middleware(
         let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
         let running = state.run_lock.lock().unwrap().clone();
         if let Some(id) = running {
-            if !matched.is_some_and(|m| RUN_ADMITTED.contains(&m)) {
-                return (StatusCode::CONFLICT, lease::run_refusal(&id)).into_response();
+            if matched.is_some_and(|m| RUN_ADMITTED.contains(&m)) {
+                return next.run(req).await;
             }
-            return next.run(req).await;
+            // Between two benches, while the setup prompt waits (decision 139): the setup calls,
+            // with either token, each entered in the run log under the scope it came with.
+            let open = state.setup_window.lock().unwrap().as_deref() == Some(id.as_str());
+            if open && matched.is_some_and(|m| SETUP_ADMITTED.contains(&(req.method().as_str(), m))) {
+                let scope = req.extensions().get::<crate::token_store::Scope>().copied().unwrap_or(crate::token_store::Scope::Agent);
+                if let Err(e) = state.run_log.test_run_setup_call(&id, req.method().as_str(), matched.unwrap_or(""), scope) {
+                    tracing::error!(run_id = id, "could not enter the setup call in the run log: {e:#}");
+                }
+                return next.run(req).await;
+            }
+            return (StatusCode::CONFLICT, lease::run_refusal(&id)).into_response();
         }
         if let Err(view) = state.lease.admit(lease_token(req.headers())) {
             return (StatusCode::CONFLICT, view.refusal()).into_response();
@@ -370,9 +385,24 @@ async fn lease_middleware(
 
 /// The lease-gated routes a running Test run still admits (decisions 135, 136): the cancel of a
 /// study, which stops the run's study and so the run. The setup calls between benches (Make
-/// live's declarations, an enrolment) are not named: the executor does not stop between benches
-/// to wait for them in this phase (decision 136, open).
+/// live's declarations, an enrolment) are [`SETUP_ADMITTED`], and only while the setup prompt waits.
 const RUN_ADMITTED: &[&str] = &[STUDY_CANCEL_ROUTE];
+
+/// The lease-gated calls a Test run admits only while its setup prompt waits between two benches
+/// (decision 139): enrolment, roles, signals, instruments, bootload ports and the dev-bench link.
+const SETUP_ADMITTED: &[(&str, &str)] = &[
+    ("POST", "/probes/enroll"),
+    ("DELETE", "/probes/enrolled/{role}"),
+    ("PUT", "/probes/enrolled/{role}/board"),
+    ("DELETE", "/probes/by-serial/{serial}"),
+    ("PUT", "/bootload/ports"),
+    ("DELETE", "/bootload/ports"),
+    ("POST", "/dev-bench/link"),
+    ("POST", "/signals"),
+    ("DELETE", "/signals/{name}"),
+    ("PUT", "/instruments"),
+    ("DELETE", "/instruments/{name}"),
+];
 
 /// The one lease-gated route a running study still admits (decision 95).
 const STUDY_CANCEL_ROUTE: &str = "/study/{study_id}/cancel";
@@ -3410,6 +3440,38 @@ mod tests {
         let status = r.status();
         let body = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    // ---- the setup window between two benches of a Test run (decision 139) ----
+
+    async fn call(state: &AppState, method: &str, uri: &str, tok: &str) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(Request::builder().method(method).uri(uri).header("authorization", format!("Bearer {tok}")).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_setup_calls_are_admitted_with_either_token_only_while_the_window_is_open() {
+        let state = AppState::new("test-token".to_string());
+        *state.run_lock.lock().unwrap() = Some("r1".to_string());
+        for tok in ["test-token", "person-test-token"] {
+            assert_eq!(call(&state, "DELETE", "/signals/nosuch", tok).await, StatusCode::CONFLICT, "{tok} outside the window");
+            assert_eq!(call(&state, "POST", "/flash", tok).await, StatusCode::CONFLICT);
+        }
+        *state.setup_window.lock().unwrap() = Some("r1".to_string());
+        for tok in ["test-token", "person-test-token"] {
+            assert_ne!(call(&state, "DELETE", "/signals/nosuch", tok).await, StatusCode::CONFLICT, "{tok} in the window");
+            // Every other gated call stays refused.
+            assert_eq!(call(&state, "POST", "/flash", tok).await, StatusCode::CONFLICT);
+            assert_eq!(call(&state, "POST", "/reset", tok).await, StatusCode::CONFLICT);
+        }
+        let scopes: Vec<_> = state.run_log.lines().unwrap().into_iter().map(|l| l["entry"].clone()).filter(|e| e["type"] == "test_run_setup_call").map(|e| e["scope"].as_str().unwrap().to_string()).collect();
+        assert_eq!(scopes, vec!["agent", "person"], "the agent's call is labelled the agent's");
+        // A window left open for another run admits nothing.
+        *state.setup_window.lock().unwrap() = Some("r2".to_string());
+        assert_eq!(call(&state, "DELETE", "/signals/nosuch", "test-token").await, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

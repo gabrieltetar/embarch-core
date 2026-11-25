@@ -267,6 +267,12 @@ pub fn wait_for_answer(slot: &HostPrompt, prompt_id: u32, timeout: Duration, can
 
 /// [`wait_for_answer`], also returning the scope and value the answer carried.
 pub fn wait_for_answer_with(slot: &HostPrompt, prompt_id: u32, timeout: Duration, cancel: Option<&AtomicBool>) -> (PromptEnd, Option<AnswerExtra>) {
+    wait_for_answer_until(slot, prompt_id, timeout, &|| cancel.is_some_and(|c| c.load(Ordering::SeqCst)))
+}
+
+/// [`wait_for_answer_with`] with the cancel as a question, which a Test run's setup prompt needs:
+/// its cancel is the run's, not a study's flag (decision 139).
+pub fn wait_for_answer_until(slot: &HostPrompt, prompt_id: u32, timeout: Duration, cancelled: &dyn Fn() -> bool) -> (PromptEnd, Option<AnswerExtra>) {
     let deadline = Instant::now() + timeout;
     loop {
         {
@@ -276,7 +282,7 @@ pub fn wait_for_answer_with(slot: &HostPrompt, prompt_id: u32, timeout: Duration
             let extra = g.as_ref().filter(|_| ours).and_then(|s| s.extra.clone());
             let end = match answered {
                 Some((answer, by)) => Some(PromptEnd::Answered(answer, by)),
-                None if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => Some(PromptEnd::StudyCancelled),
+                None if cancelled() => Some(PromptEnd::StudyCancelled),
                 None if Instant::now() >= deadline => Some(PromptEnd::TimedOut),
                 None => None,
             };
