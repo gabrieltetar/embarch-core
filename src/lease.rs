@@ -15,6 +15,11 @@
 //!
 //! A lease also ends after [`IDLE_RELEASE`] with no hardware call (decision
 //! 123), whatever client renews it.
+//!
+//! A Test run's go moves the lease to the run (decision 135): the session's
+//! lease stays in the slot, but while the run lock is held every token is
+//! refused naming the run, the lease neither expires nor idles, and the end
+//! of the run gives it back under its old token with its TTL restarted.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -23,6 +28,10 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use crate::study::StudyLock;
+
+/// The id of the Test run holding the bench, or `None` (decision 135). Held from the go to the
+/// run's end; `lease_middleware` checks it as it does `study_lock`.
+pub type RunLock = Arc<StdMutex<Option<String>>>;
 
 /// The request header that carries the lease token.
 pub const LEASE_HEADER: &str = "x-embarch-lease";
@@ -66,17 +75,31 @@ pub struct LeaseView {
     pub ttl_s: u64,
     /// The last hardware call admitted with the token, or `None` before one.
     pub last_hardware_call_at: Option<String>,
+    /// The Test run holding the bench for the session (`holder` is then `test run <id>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl LeaseView {
     /// The `409` body for a caller that does not hold the lease.
     pub fn refusal(&self) -> String {
+        if let Some(id) = &self.run_id {
+            return run_refusal(id);
+        }
         format!(
             "bench leased by '{}' for '{}' (started {}, expires {}); send that lease's token in the \
              {LEASE_HEADER} header, or wait for it to expire",
             self.holder, self.purpose, self.started_at, self.expires_at
         )
     }
+}
+
+/// The `409` body while a Test run holds the bench: the session's own token included.
+pub fn run_refusal(run_id: &str) -> String {
+    format!(
+        "test run {run_id} holds the bench: every lease-gated call is refused, the session's lease token \
+         included, until the run ends; POST /test-runs/{run_id}/cancel ends it"
+    )
 }
 
 fn rfc3339(t: OffsetDateTime) -> String {
@@ -92,6 +115,31 @@ impl Lease {
             expires_at: rfc3339(self.expires_at),
             ttl_s: self.ttl_s,
             last_hardware_call_at: self.last_call_at.map(rfc3339),
+            run_id: None,
+        }
+    }
+}
+
+/// Why a go could not take the lease for a run (decision 135).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunStartError {
+    /// The run was prepared without a lease: no session holds the bench for it.
+    PreparedWithoutLease,
+    /// No lease is live: the session that prepared the run released it or lost it.
+    NoLease(String),
+    /// A live lease belongs to another holder than the one that prepared the run.
+    OtherHolder { prepared_by: String, held_by: String },
+    /// Another run already holds the bench.
+    RunInFlight(String),
+}
+
+impl RunStartError {
+    pub fn why(&self) -> String {
+        match self {
+            Self::PreparedWithoutLease => "the run was prepared with no lease live, so no session holds the bench for it: take a lease and prepare it again".into(),
+            Self::NoLease(h) => format!("the session that prepared the run ('{h}') no longer holds the lease: take it again and prepare the run again"),
+            Self::OtherHolder { prepared_by, held_by } => format!("the lease is held by '{held_by}', not by the session that prepared the run ('{prepared_by}')"),
+            Self::RunInFlight(id) => run_refusal(id),
         }
     }
 }
@@ -129,12 +177,79 @@ pub struct LeaseSlot {
     inner: Arc<StdMutex<Inner>>,
     /// `AppState::study_lock`: a lease is not idle while it is held.
     study_lock: Option<StudyLock>,
+    /// `AppState::run_lock`: while a run holds the bench the lease neither expires nor idles.
+    run_lock: RunLock,
 }
 
 impl LeaseSlot {
-    /// A slot that treats a held `study_lock` as activity (decision 123).
-    pub fn watching(study_lock: StudyLock) -> Self {
-        Self { inner: Arc::default(), study_lock: Some(study_lock) }
+    /// A slot that treats a held `study_lock` as activity (decision 123) and whose lease a held
+    /// `run_lock` takes (decision 135).
+    pub fn watching(study_lock: StudyLock, run_lock: RunLock) -> Self {
+        Self { inner: Arc::default(), study_lock: Some(study_lock), run_lock }
+    }
+
+    /// The Test run holding the bench, if any.
+    pub fn run_in_flight(&self) -> Option<String> {
+        self.run_lock.lock().unwrap().clone()
+    }
+
+    /// Whether a go could take the lease now for a run `prepared_by` prepared; sets nothing.
+    pub fn can_start_run(&self, prepared_by: Option<&str>) -> Result<(), RunStartError> {
+        let mut inner = self.inner.lock().unwrap();
+        let live = self.live(&mut inner).map(|l| l.holder.clone());
+        let run = self.run_lock.lock().unwrap();
+        Self::check_start(run.as_deref(), live, prepared_by)
+    }
+
+    fn check_start(run: Option<&str>, live: Option<String>, prepared_by: Option<&str>) -> Result<(), RunStartError> {
+        if let Some(id) = run {
+            return Err(RunStartError::RunInFlight(id.to_string()));
+        }
+        let Some(prepared_by) = prepared_by else { return Err(RunStartError::PreparedWithoutLease) };
+        match live {
+            None => Err(RunStartError::NoLease(prepared_by.to_string())),
+            Some(h) if h != prepared_by => Err(RunStartError::OtherHolder { prepared_by: prepared_by.to_string(), held_by: h }),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The go moved the lease to `run_id`, which `prepared_by` prepared (decision 135). The lease
+    /// must be live and that holder's; the run lock is set under the same lock as the check.
+    pub fn start_run(&self, run_id: &str, prepared_by: Option<&str>) -> Result<(), RunStartError> {
+        let mut inner = self.inner.lock().unwrap();
+        let live = self.live(&mut inner).map(|l| l.holder.clone());
+        let mut run = self.run_lock.lock().unwrap();
+        Self::check_start(run.as_deref(), live, prepared_by)?;
+        *run = Some(run_id.to_string());
+        Ok(())
+    }
+
+    /// The run ended or was cancelled: the lease goes back to the session under its old token with
+    /// its TTL and idle clock restarted. `false` when `run_id` is not the run in flight.
+    pub fn end_run(&self, run_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let mut run = self.run_lock.lock().unwrap();
+        if run.as_deref() != Some(run_id) {
+            return false;
+        }
+        *run = None;
+        if let Some(l) = inner.lease.as_mut() {
+            let (now, d) = (Instant::now(), Duration::from_secs(l.ttl_s));
+            l.expires = now + d;
+            l.expires_at = OffsetDateTime::now_utc() + d;
+            l.idle_since = now;
+        }
+        true
+    }
+
+    /// `lease`'s view, naming the run while one holds the bench.
+    fn view_of(&self, l: &Lease) -> LeaseView {
+        let mut v = l.view();
+        if let Some(id) = self.run_in_flight() {
+            v.holder = format!("test run {id}");
+            v.run_id = Some(id);
+        }
+        v
     }
 
     fn study_in_flight(&self) -> bool {
@@ -144,6 +259,10 @@ impl LeaseSlot {
     /// The live lease, clearing one that has expired or sat idle.
     fn live<'a>(&self, inner: &'a mut Inner) -> Option<&'a mut Lease> {
         let now = Instant::now();
+        // A run holds the lease for its whole life, however long (decision 135).
+        if self.run_in_flight().is_some() {
+            return inner.lease.as_mut();
+        }
         let expired = inner.lease.as_ref().is_some_and(|l| now >= l.expires);
         let idle = !expired
             && inner.lease.as_ref().is_some_and(|l| now >= l.idle_since + IDLE_RELEASE)
@@ -163,7 +282,8 @@ impl LeaseSlot {
     }
 
     pub fn view(&self) -> Option<LeaseView> {
-        self.live(&mut self.inner.lock().unwrap()).map(|l| l.view())
+        let mut inner = self.inner.lock().unwrap();
+        self.live(&mut inner).map(|l| self.view_of(l))
     }
 
     /// Why nothing is live: [`LeaseError::IdleReleased`] naming the holder
@@ -196,6 +316,9 @@ impl LeaseSlot {
     fn next_end(&self) -> Option<Duration> {
         let inner = self.inner.lock().unwrap();
         let l = inner.lease.as_ref()?;
+        if self.run_in_flight().is_some() {
+            return Some(IDLE_RELEASE);
+        }
         let mut end = l.expires;
         if !self.study_in_flight() {
             end = end.min(l.idle_since + IDLE_RELEASE);
@@ -225,7 +348,7 @@ impl LeaseSlot {
         let ttl_s = check_ttl(ttl_s)?;
         let mut slot = self.inner.lock().unwrap();
         if let Some(l) = self.live(&mut slot) {
-            return Err(LeaseError::Held(Box::new(l.view())));
+            return Err(LeaseError::Held(Box::new(self.view_of(l))));
         }
         slot.idle_released = None;
         let mut bytes = [0u8; 16];
@@ -257,8 +380,8 @@ impl LeaseSlot {
             return Err(self.idle_or_none(&slot));
         }
         let l = slot.lease.as_mut().unwrap();
-        if token != Some(l.token.as_str()) {
-            return Err(LeaseError::Held(Box::new(l.view())));
+        if token != Some(l.token.as_str()) || self.run_in_flight().is_some() {
+            return Err(LeaseError::Held(Box::new(self.view_of(l))));
         }
         let ttl_s = check_ttl(ttl_s.unwrap_or(l.ttl_s))?;
         let d = Duration::from_secs(ttl_s);
@@ -274,8 +397,8 @@ impl LeaseSlot {
             return Err(self.idle_or_none(&slot));
         }
         let l = slot.lease.as_ref().unwrap();
-        if token != Some(l.token.as_str()) {
-            return Err(LeaseError::Held(Box::new(l.view())));
+        if token != Some(l.token.as_str()) || self.run_in_flight().is_some() {
+            return Err(LeaseError::Held(Box::new(self.view_of(l))));
         }
         tracing::info!("lease released by '{}'", l.holder);
         slot.lease = None;
@@ -294,8 +417,11 @@ impl LeaseSlot {
     /// idle clock. A refused call stamps nothing.
     pub fn admit(&self, token: Option<&str>) -> Result<Option<String>, Box<LeaseView>> {
         let mut slot = self.inner.lock().unwrap();
+        let run = self.run_in_flight();
         match self.live(&mut slot) {
             None => Ok(None),
+            // The run holds the bench: no token is admitted, the session's own included.
+            Some(l) if run.is_some() => Err(Box::new(self.view_of(l))),
             Some(l) if token == Some(l.token.as_str()) => {
                 l.idle_since = Instant::now();
                 l.last_call_at = Some(OffsetDateTime::now_utc());
@@ -577,6 +703,10 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     // A person's answer to a prompt, from whichever surface is in front of them; the prompt id,
     // not the lease, keeps a stale answer off a later prompt (decision 105).
     ("POST", "/study/{study_id}/prompt"),
+    // The go takes the lease itself, and a cancel from either token must reach a run that has it
+    // (decision 135); both check the run, not a lease token.
+    ("POST", "/test-runs/{run_id}/go"),
+    ("POST", "/test-runs/{run_id}/cancel"),
     ("POST", "/lease"),
     ("GET", "/lease"),
     ("PUT", "/lease"),
@@ -681,7 +811,7 @@ mod tests {
     #[test]
     fn a_study_in_flight_keeps_the_lease_and_the_clock_restarts_when_it_ends() {
         let study_lock: StudyLock = Arc::new(StdMutex::new(Some("study-1".into())));
-        let s = LeaseSlot::watching(study_lock.clone());
+        let s = LeaseSlot::watching(study_lock.clone(), RunLock::default());
         s.take("a", "p", 7200).unwrap();
         age(&s, IDLE_RELEASE * 2);
         assert!(s.view().is_some(), "kept while the run holds the study lock");
@@ -691,6 +821,39 @@ mod tests {
         assert!(s.view().is_some());
         age(&s, Duration::from_secs(20));
         assert!(s.view().is_none());
+    }
+
+    #[test]
+    fn a_run_longer_than_the_idle_release_keeps_the_lease_and_returns_it_with_a_fresh_clock() {
+        let run_lock = RunLock::default();
+        let s = LeaseSlot::watching(Arc::new(StdMutex::new(None)), run_lock);
+        let g = s.take("a", "p", 7200).unwrap();
+        s.start_run("run-1", Some("a")).unwrap();
+        // Two idle windows, and past the TTL: a run's lease neither idles nor expires.
+        age(&s, IDLE_RELEASE * 2);
+        s.inner.lock().unwrap().lease.as_mut().unwrap().expires = Instant::now();
+        let v = s.view().expect("kept while the run holds it");
+        assert_eq!(v.run_id.as_deref(), Some("run-1"));
+        assert!(s.admit(Some(&g.token)).is_err(), "not even the session's token is admitted");
+        assert!(s.admit(None).is_err());
+        assert!(matches!(s.renew(Some(&g.token), None), Err(LeaseError::Held(_))));
+        assert_eq!(s.start_run("run-2", Some("a")), Err(RunStartError::RunInFlight("run-1".into())));
+        assert!(s.end_run("run-1"));
+        assert_eq!(s.admit(Some(&g.token)), Ok(Some("a".to_string())), "the old token, TTL and clock restarted");
+        age(&s, IDLE_RELEASE - Duration::from_secs(10));
+        assert!(s.view().is_some());
+        age(&s, Duration::from_secs(20));
+        assert!(s.view().is_none(), "the idle release applies again after the run");
+    }
+
+    #[test]
+    fn a_run_starts_only_under_the_lease_of_the_session_that_prepared_it() {
+        let s = LeaseSlot::watching(Arc::new(StdMutex::new(None)), RunLock::default());
+        assert_eq!(s.start_run("r", Some("a")), Err(RunStartError::NoLease("a".into())));
+        s.take("b", "p", 60).unwrap();
+        assert!(matches!(s.start_run("r", Some("a")), Err(RunStartError::OtherHolder { .. })));
+        assert_eq!(s.start_run("r", None), Err(RunStartError::PreparedWithoutLease));
+        assert!(s.run_in_flight().is_none());
     }
 
     #[test]

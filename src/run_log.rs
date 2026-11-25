@@ -291,6 +291,22 @@ impl RunLog {
         self.append(body)
     }
 
+    /// A Test run's go (decision 135): the run, its hash, the go's scope and the session whose lease it took.
+    pub fn test_run_started(&self, run_id: &str, run_hash: &str, scope: Scope, session: &str) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test_run_started", "run_id": run_id, "run_hash": run_hash,
+            "scope": scope.as_str(), "session": session, "at_utc_ms": now_ms(),
+        }))
+    }
+
+    /// A Test run's end or cancel: `scope` is the cancelling token's, `None` when Core's executor ended it.
+    pub fn test_run_ended(&self, run_id: &str, status: &str, reason: Option<&str>, scope: Option<Scope>) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test_run_ended", "run_id": run_id, "status": status, "reason": reason,
+            "scope": scope.map_or("core", |s| s.as_str()), "at_utc_ms": now_ms(),
+        }))
+    }
+
     /// Every hash a `confirmed` entry binds. A log that does not verify is an error.
     pub fn confirmed_hashes(&self) -> Result<HashSet<String>> {
         self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;

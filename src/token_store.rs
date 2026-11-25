@@ -181,6 +181,18 @@ pub const CONFIRMATION_ROUTES: &[(&str, &str)] = &[
     ("POST", "/confirmations"),
 ];
 
+/// The go that starts a prepared Test run: the person's act on every Core, for the same reason as
+/// a confirmation (decision 135).
+pub const GO_ROUTES: &[(&str, &str)] = &[("POST", "/test-runs/{run_id}/go")];
+
+/// The `403` body of a [`GO_ROUTES`] refusal.
+pub const GO_REFUSAL: &str = "the go is the person's act on every Core: start the run from embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may prepare a run and read its card, never go";
+
+/// Whether `method` on the registered path pattern `path` is in [`GO_ROUTES`].
+pub fn is_go_route(method: &str, path: &str) -> bool {
+    GO_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
+}
+
 /// The `403` body of a [`CONFIRMATION_ROUTES`] refusal.
 pub const CONFIRMATION_REFUSAL: &str = "a confirmation is the person's act on every Core: confirm it in embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may list what waits and propose a definition, never obtain a card's nonce or confirm";
 

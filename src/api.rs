@@ -42,6 +42,8 @@ pub struct AppState {
     /// cleared (decision 14, `tasks/core/013`).
     pub hw_holder: Arc<StdMutex<Option<String>>>,
     pub study_lock: study::StudyLock,
+    /// The Test run holding the bench from its go to its end (`test_runs.rs`, decision 135).
+    pub run_lock: lease::RunLock,
     pub study_jobs: study::JobRegistry,
     /// Live push for `GET /study/{study_id}/events` (SSE) — every
     /// `StudyEvent` `study.rs` produces goes through this one process-wide
@@ -93,6 +95,7 @@ impl AppState {
     pub fn with_tokens(tokens: crate::token_store::Tokens, sealer: crate::signing::Sealer, run_log: crate::run_log::RunLog) -> Self {
         let (study_events, _rx) = tokio::sync::broadcast::channel(256);
         let study_lock: study::StudyLock = Arc::new(StdMutex::new(None));
+        let run_lock: lease::RunLock = Arc::new(StdMutex::new(None));
         let images = lease::ImageLog::at(run_log.data_dir());
         Self {
             tokens,
@@ -107,11 +110,12 @@ impl AppState {
             device_cancel: Arc::new(StdMutex::new(None)),
             host_prompt: Arc::new(StdMutex::new(None)),
             captures: crate::capture::CaptureRegistry::default(),
-            lease: lease::LeaseSlot::watching(study_lock.clone()),
+            lease: lease::LeaseSlot::watching(study_lock.clone(), run_lock.clone()),
             images,
             hw_lock: Arc::new(Mutex::new(())),
             hw_holder: Arc::new(StdMutex::new(None)),
             study_lock,
+            run_lock,
             study_jobs: Arc::new(StdMutex::new(HashMap::new())),
             study_events,
         }
@@ -228,6 +232,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/confirmations", post(confirmations::confirm_handler))
         .route("/test-runs", post(test_runs::prepare_handler))
         .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
+        .route("/test-runs/{run_id}/go", post(test_runs::go_handler))
+        .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
         .route("/run-log", get(run_log::run_log_handler))
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
@@ -302,6 +308,10 @@ async fn person_middleware(
         if crate::token_store::is_confirmation_route(req.method().as_str(), path) {
             return (StatusCode::FORBIDDEN, crate::token_store::CONFIRMATION_REFUSAL).into_response();
         }
+        // The go is the person's on every Core too (decision 135).
+        if crate::token_store::is_go_route(req.method().as_str(), path) {
+            return (StatusCode::FORBIDDEN, crate::token_store::GO_REFUSAL).into_response();
+        }
     }
     next.run(req).await
 }
@@ -322,6 +332,15 @@ async fn lease_middleware(
         .get::<axum::extract::MatchedPath>()
         .is_some_and(|p| lease::is_gated(req.method().as_str(), p.as_str()));
     if gated {
+        // A Test run holds the bench from its go to its end, the gaps between its studies too, and
+        // refuses the session's own token. The executor's calls (a setup call between benches,
+        // EMB-366) are admitted here, by `RUN_ADMITTED`, and nowhere else (decision 135).
+        let matched = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str());
+        if let Some(id) = state.run_lock.lock().unwrap().as_deref() {
+            if !matched.is_some_and(|m| RUN_ADMITTED.contains(&m)) {
+                return (StatusCode::CONFLICT, lease::run_refusal(id)).into_response();
+            }
+        }
         if let Err(view) = state.lease.admit(lease_token(req.headers())) {
             return (StatusCode::CONFLICT, view.refusal()).into_response();
         }
@@ -336,6 +355,10 @@ async fn lease_middleware(
     }
     next.run(req).await
 }
+
+/// The lease-gated routes a running Test run still admits: empty until the executor (EMB-366)
+/// names its setup calls between benches. Seam, decision 135.
+const RUN_ADMITTED: &[&str] = &[];
 
 /// The one lease-gated route a running study still admits (decision 95).
 const STUDY_CANCEL_ROUTE: &str = "/study/{study_id}/cancel";
@@ -3203,6 +3226,8 @@ mod tests {
         ("POST", "/confirmations", "/confirmations"),
         ("POST", "/test-runs", "/test-runs"),
         ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
+        ("POST", "/test-runs/{run_id}/go", "/test-runs/abc/go"),
+        ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
         ("GET", "/run-log", "/run-log"),
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
@@ -3261,7 +3286,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 61;
+    const DOCUMENTED_ROUTE_COUNT: usize = 63;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -4114,6 +4139,7 @@ mod tests {
         ("GET", "/confirmations/pending"),
         ("POST", "/test-runs"),
         ("GET", "/test-runs/{run_id}/card"),
+        ("POST", "/test-runs/{run_id}/cancel"),
         ("GET", "/run-log"),
         ("GET", "/study/{study_id}/log"),
         ("POST", "/study/{study_id}/published"),
@@ -4137,9 +4163,9 @@ mod tests {
     /// `AUTH_CASES` row is in exactly one of `PERSON_ROUTES` / `AGENT_ROUTES`.
     #[test]
     fn every_route_is_either_the_persons_or_the_agents() {
-        use crate::token_store::{CONFIRMATION_ROUTES, PERSON_ROUTES};
+        use crate::token_store::{CONFIRMATION_ROUTES, GO_ROUTES, PERSON_ROUTES};
         for (method, path, _) in AUTH_CASES {
-            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).any(|(m, p)| m == method && p == path);
+            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).any(|(m, p)| m == method && p == path);
             let agent = AGENT_ROUTES.iter().any(|(m, p)| m == method && p == path);
             assert!(
                 person ^ agent,
@@ -4148,7 +4174,7 @@ mod tests {
                  Core takes it only from the person (decision 132)"
             );
         }
-        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(AGENT_ROUTES) {
+        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(AGENT_ROUTES) {
             assert!(
                 AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is in a scope list but is not a registered route"

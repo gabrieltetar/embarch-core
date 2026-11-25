@@ -5,8 +5,9 @@
 //! reproduces it. `GET /test-runs/{run_id}/card` renders that run's card from
 //! Core's record, and carries a go nonce for the person's token only.
 //!
-//! Nothing here starts a run, powers anything or takes the bench. The go, which
-//! spends the nonce and takes the lease, is a later unit (EMB-365).
+//! Preparing starts nothing, powers nothing and takes no bench. `POST /test-runs/{run_id}/go`
+//! spends the nonce and moves the session's lease to the run (decision 135); the executor
+//! that runs the studies (EMB-366) is not here: a started run stays so until [`end_run`].
 
 use axum::{
     extract::{Path as UrlPath, State},
@@ -456,6 +457,128 @@ pub async fn card_handler(State(state): State<AppState>, UrlPath(run_id): UrlPat
     .await?
 }
 
+/// `POST /test-runs/{run_id}/go`'s body: what the card issued, which Core checks against its record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoRequest {
+    pub run_id: String,
+    pub run_hash: String,
+    pub nonce: String,
+}
+
+fn conflict(why: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::CONFLICT, why.into())
+}
+
+fn read_record(store: &std::path::Path, run_id: &str) -> Result<Value, (StatusCode, String)> {
+    let bytes = std::fs::read(run_path(store, run_id)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => (StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")),
+        _ => internal(e.into()),
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| internal(e.into()))
+}
+
+/// Where a go leaves its mark: written once, so a run starts once however many cards were issued.
+fn started_path(store: &std::path::Path, run_id: &str) -> PathBuf {
+    store.join(TEST_RUNS_DIR).join(format!("{run_id}.started.json"))
+}
+
+/// The inputs a prepared run lists that are still unconfirmed, read from the log as it stands now.
+fn unconfirmed_inputs(defs: &Definitions, log: &crate::run_log::RunLog, rec: &Value) -> Result<Vec<String>, (StatusCode, String)> {
+    let confirmed = log.confirmed_hashes().map_err(internal)?;
+    Ok(rec["inputs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| defs.standing(i["kind"].as_str().unwrap_or(""), i["hash"].as_str().unwrap_or(""), &confirmed) == Standing::Unconfirmed)
+        .map(|i| format!("{} {}", i["kind"].as_str().unwrap_or("?"), i["name"].as_str().unwrap_or("?")))
+        .collect())
+}
+
+/// Starts a prepared run on the person's go and moves the session's lease to it (decision 135).
+/// `403` to the agent's token (`person_middleware`). Refused, naming why: `422` for a body that
+/// is not the card's (`mismatched`), or a nonce that is `replayed` or `expired`; `409` for a run
+/// already started, an input still unconfirmed, or a session that no longer holds the lease.
+/// The go does not re-expand: the run keeps the hash it was prepared under, and a confirmation
+/// made since is read live, not folded into `run.json`.
+// route: POST /test-runs/{run_id}/go
+pub async fn go_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>, scope: Scope, Json(req): Json<GoRequest>) -> Reply {
+    if scope != Scope::Person {
+        return Err((StatusCode::FORBIDDEN, crate::token_store::GO_REFUSAL.to_string()));
+    }
+    if !is_run_id(&run_id) {
+        return Err((StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")));
+    }
+    let (defs, log, lease) = (state.definitions.clone(), state.run_log.clone(), state.lease.clone());
+    blocking(move || -> Reply {
+        let rec = read_record(log.data_dir(), &run_id)?;
+        let run_hash = rec["run_hash"].as_str().unwrap_or("").to_string();
+        if req.run_id != run_id {
+            return Err(refuse(format!("mismatched: the body names run {}, the route run {run_id}", req.run_id)));
+        }
+        if req.run_hash != run_hash {
+            return Err(refuse(format!("mismatched: the body carries run hash {}, Core holds {run_hash} for run {run_id}", req.run_hash)));
+        }
+        if started_path(log.data_dir(), &run_id).exists() {
+            return Err(conflict(format!("run {run_id} was already started: a run is started once, prepare another")));
+        }
+        let owed = unconfirmed_inputs(&defs, &log, &rec)?;
+        if !owed.is_empty() {
+            return Err(conflict(format!("not started: still unconfirmed: {}", owed.join(", "))));
+        }
+        let prepared_by = rec["lease_holder"].as_str().map(str::to_string);
+        // The nonce is spent only when nothing else would refuse the go.
+        lease.can_start_run(prepared_by.as_deref()).map_err(|e| conflict(format!("not started: {}", e.why())))?;
+        if let Err(why) = defs.spend_nonce(&req.nonce, &go_key(&run_id, &run_hash), crate::study::current_utc_ms()) {
+            let named = if why.contains("expired") { "expired" } else if why.contains("another card") { "mismatched" } else { "replayed" };
+            return Err(refuse(format!("{named}: {why}")));
+        }
+        lease.start_run(&run_id, prepared_by.as_deref()).map_err(|e| conflict(format!("not started: {}", e.why())))?;
+        let now = crate::study::current_utc_ms();
+        let mark = json!({ "run_id": run_id, "run_hash": run_hash, "started_utc_ms": now, "go_by": scope.as_str() });
+        if let Err(e) = write_new(&started_path(log.data_dir(), &run_id), &mark) {
+            lease.end_run(&run_id);
+            return Err(match e.kind() {
+                std::io::ErrorKind::AlreadyExists => conflict(format!("run {run_id} was already started")),
+                _ => internal(e.into()),
+            });
+        }
+        let session = prepared_by.unwrap_or_default();
+        if let Err(e) = log.test_run_started(&run_id, &run_hash, scope, &session) {
+            tracing::error!(run_id, "could not enter the run's start in the run log: {e:#}");
+        }
+        Ok((StatusCode::OK, Json(json!({ "run_id": run_id, "run_hash": run_hash, "state": "started", "started_utc_ms": now, "lease_holder": session }))))
+    })
+    .await?
+}
+
+/// Ends a started run (decision 135): releases the run lock, gives the lease back to its session
+/// under the old token with its TTL restarted, and records the end. `by` is the cancelling
+/// token's scope, `None` when the executor (EMB-366) ends it. `false` when `run_id` is not the run
+/// in flight. The seam the executor calls when its studies are done.
+pub fn end_run(state: &AppState, run_id: &str, status: &str, reason: Option<&str>, by: Option<Scope>) -> bool {
+    if !state.lease.end_run(run_id) {
+        return false;
+    }
+    if let Err(e) = state.run_log.test_run_ended(run_id, status, reason, by) {
+        tracing::error!(run_id, "could not enter the run's end in the run log: {e:#}");
+    }
+    true
+}
+
+/// Cancels the run in flight, from either token (`403` to neither); not lease-gated, so the
+/// run's hold does not refuse it. `409` when `run_id` is not started. Recorded with the token's scope.
+// route: POST /test-runs/{run_id}/cancel
+pub async fn cancel_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>, scope: Scope) -> Reply {
+    if end_run(&state, &run_id, "cancelled", Some("cancelled by request"), Some(scope)) {
+        return Ok((StatusCode::OK, Json(json!({ "run_id": run_id, "state": "cancelled", "by": scope.as_str() }))));
+    }
+    match state.lease.run_in_flight() {
+        Some(other) => Err(conflict(format!("run {run_id} is not the run in flight ({other} is): nothing was cancelled"))),
+        None => Err(conflict(format!("run {run_id} is not started: nothing to cancel"))),
+    }
+}
+
 /// What a go nonce is issued for: the run's id and `run.json`'s hash. Not a
 /// definition hash, so a confirmation's nonce cannot spend it or the reverse.
 pub fn go_key(run_id: &str, run_hash: &str) -> String {
@@ -640,6 +763,164 @@ mod tests {
         later["run"]["run_id"] = "run-5".into();
         let (st, why) = call(&s, AGENT, "POST", "/test-runs", Some(later)).await;
         assert_eq!(st, StatusCode::CREATED, "{why}");
+    }
+
+    /// Confirms every input the card still lists, as the person, one at a time: confirming a
+    /// suite confirms the tests it lists, so the list is read again after each.
+    async fn confirm_all(s: &AppState, run_id: &str) {
+        for _ in 0..10 {
+            let (_, card) = call(s, PERSON, "GET", &format!("/test-runs/{run_id}/card"), None).await;
+            let Some(i) = card["card"]["unconfirmed"].as_array().unwrap().first().cloned() else { return };
+            let hash = i["hash"].as_str().unwrap();
+            if i["kind"] == "capability" {
+                // The plan names it; Core keeps it only once it is posted.
+                post(s, "capability", json!({ "name": "role", "value": "source", "provenance": "declared" })).await;
+            }
+            let (_, c) = call(s, PERSON, "GET", &format!("/confirmations/{hash}/card"), None).await;
+            let (st, e) = call(s, PERSON, "POST", "/confirmations", Some(json!({ "hash": hash, "nonce": c["nonce"], "surface": "ui" }))).await;
+            assert_eq!(st, StatusCode::CREATED, "{e}");
+        }
+        panic!("inputs stayed unconfirmed");
+    }
+
+    /// A prepared, fully confirmed run under a lease: the state and the lease's token.
+    async fn ready(name: &str, run_id: &str) -> (AppState, String) {
+        let s = state(name);
+        let f = fixture(&s, run_id).await;
+        let token = s.lease.take("session-a", "a test", 600).unwrap().token;
+        assert_eq!(call(&s, AGENT, "POST", "/test-runs", Some(body(&f))).await.0, StatusCode::CREATED);
+        confirm_all(&s, run_id).await;
+        (s, token)
+    }
+
+    /// The go's body from a fresh card: its own nonce, the card's hash.
+    async fn go_body(s: &AppState, run_id: &str) -> Value {
+        let (_, card) = call(s, PERSON, "GET", &format!("/test-runs/{run_id}/card"), None).await;
+        json!({ "run_id": card["run_id"], "run_hash": card["run_hash"], "nonce": card["nonce"] })
+    }
+
+    async fn reset_with(s: &AppState, token: &str) -> (StatusCode, String) {
+        let r = build_router(s.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reset")
+                    .header("authorization", format!("Bearer {AGENT}"))
+                    .header(crate::lease::LEASE_HEADER, token)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st = r.status();
+        (st, String::from_utf8_lossy(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_agent_cannot_go_and_a_replayed_expired_or_mismatched_go_names_which() {
+        let (s, _) = ready("go-refusals", "run-g1").await;
+        let uri = "/test-runs/run-g1/go";
+        let good = go_body(&s, "run-g1").await;
+        assert_eq!(call(&s, AGENT, "POST", uri, Some(good.clone())).await.0, StatusCode::FORBIDDEN, "the agent's go is refused");
+        assert!(s.lease.run_in_flight().is_none());
+
+        let mut wrong_hash = good.clone();
+        wrong_hash["run_hash"] = "0".repeat(64).into();
+        let (st, why) = call(&s, PERSON, "POST", uri, Some(wrong_hash)).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(why.as_str().unwrap().starts_with("mismatched"), "{why}");
+
+        let mut other_card = good.clone();
+        other_card["nonce"] = s.definitions.issue_nonce("go:another-run:abc", crate::study::current_utc_ms()).into();
+        let (st, why) = call(&s, PERSON, "POST", uri, Some(other_card)).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(why.as_str().unwrap().starts_with("mismatched"), "{why}");
+
+        let mut unknown = good.clone();
+        unknown["nonce"] = "ab".repeat(32).into();
+        let (_, why) = call(&s, PERSON, "POST", uri, Some(unknown)).await;
+        assert!(why.as_str().unwrap().starts_with("replayed"), "{why}");
+
+        // An expired nonce: issued a long time ago.
+        let hash = good["run_hash"].as_str().unwrap();
+        let old = s.definitions.issue_nonce(&go_key("run-g1", hash), 1_000);
+        let mut expired = good.clone();
+        expired["nonce"] = old.into();
+        let (_, why) = call(&s, PERSON, "POST", uri, Some(expired)).await;
+        assert!(why.as_str().unwrap().starts_with("expired"), "{why}");
+
+        // None of that started it; the good go does, once, and a replay of it is refused.
+        let (st, started) = call(&s, PERSON, "POST", uri, Some(good.clone())).await;
+        assert_eq!(st, StatusCode::OK, "{started}");
+        assert_eq!(s.lease.run_in_flight().as_deref(), Some("run-g1"));
+        let (st, why) = call(&s, PERSON, "POST", uri, Some(good)).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_go_is_refused_while_an_input_is_unconfirmed_or_the_session_lost_the_lease() {
+        let s = state("go-state");
+        let f = fixture(&s, "run-g2").await;
+        let token = s.lease.take("session-a", "a test", 600).unwrap().token;
+        call(&s, AGENT, "POST", "/test-runs", Some(body(&f))).await;
+        let go = go_body(&s, "run-g2").await;
+        let (st, why) = call(&s, PERSON, "POST", "/test-runs/run-g2/go", Some(go.clone())).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(why.as_str().unwrap().contains("unconfirmed"), "{why}");
+        confirm_all(&s, "run-g2").await;
+        // The refusal did not spend the nonce, and a released lease is refused by name.
+        s.lease.release(Some(&token)).unwrap();
+        let (st, why) = call(&s, PERSON, "POST", "/test-runs/run-g2/go", Some(go.clone())).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(why.as_str().unwrap().contains("no longer holds the lease"), "{why}");
+        s.lease.take("session-b", "x", 60).unwrap();
+        let (_, why) = call(&s, PERSON, "POST", "/test-runs/run-g2/go", Some(go)).await;
+        assert!(why.as_str().unwrap().contains("held by 'session-b'"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_run_holds_the_lease_refuses_the_session_and_gives_it_back_when_it_ends() {
+        let (s, token) = ready("go-holds", "run-g3").await;
+        assert_ne!(reset_with(&s, &token).await.0, StatusCode::CONFLICT);
+        let go = go_body(&s, "run-g3").await;
+        assert_eq!(call(&s, PERSON, "POST", "/test-runs/run-g3/go", Some(go)).await.0, StatusCode::OK);
+
+        let (st, why) = reset_with(&s, &token).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(why.contains("run-g3"), "names the run: {why}");
+        assert!(matches!(s.lease.release(Some(&token)), Err(crate::lease::LeaseError::Held(_))), "the session cannot release it either");
+        let view = s.lease.view().unwrap();
+        assert_eq!((view.holder.as_str(), view.run_id.as_deref()), ("test run run-g3", Some("run-g3")));
+        // Reads of the run are open.
+        assert_eq!(call(&s, AGENT, "GET", "/test-runs/run-g3/card", None).await.0, StatusCode::OK);
+
+        assert!(end_run(&s, "run-g3", "completed", None, None));
+        assert_ne!(reset_with(&s, &token).await.0, StatusCode::CONFLICT, "the old token is admitted again");
+        assert!(!end_run(&s, "run-g3", "completed", None, None), "it ended once");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_from_either_token_ends_the_run_and_records_its_scope() {
+        for (bearer, scope) in [(AGENT, "agent"), (PERSON, "person")] {
+            let id = format!("run-c-{scope}");
+            let (s, token) = ready(&format!("cancel-{scope}"), &id).await;
+            assert_eq!(call(&s, AGENT, "POST", &format!("/test-runs/{id}/cancel"), None).await.0, StatusCode::CONFLICT, "not started yet");
+            let go = go_body(&s, &id).await;
+            assert_eq!(call(&s, PERSON, "POST", &format!("/test-runs/{id}/go"), Some(go)).await.0, StatusCode::OK);
+            let (st, r) = call(&s, bearer, "POST", &format!("/test-runs/{id}/cancel"), None).await;
+            assert_eq!(st, StatusCode::OK, "{r}");
+            assert!(s.lease.run_in_flight().is_none());
+            assert_ne!(reset_with(&s, &token).await.0, StatusCode::CONFLICT);
+            let log = s.run_log.lines().unwrap();
+            let ended = log.iter().find(|l| l["entry"]["type"] == "test_run_ended").unwrap();
+            assert_eq!((ended["entry"]["status"].as_str(), ended["entry"]["scope"].as_str()), (Some("cancelled"), Some(scope)));
+            let started = log.iter().find(|l| l["entry"]["type"] == "test_run_started").unwrap();
+            assert_eq!((started["entry"]["scope"].as_str(), started["entry"]["session"].as_str()), (Some("person"), Some("session-a")));
+            // A run is started once: a cancelled run does not start again.
+            let go = go_body(&s, &id).await;
+            assert_eq!(call(&s, PERSON, "POST", &format!("/test-runs/{id}/go"), Some(go)).await.0, StatusCode::CONFLICT);
+        }
     }
 
     #[test]
