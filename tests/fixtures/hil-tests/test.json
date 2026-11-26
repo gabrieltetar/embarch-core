@@ -2,7 +2,7 @@
   "schema": 1,
   "test_id": "vbus-5v-source-voltage",
   "title": "A source's VBUS holds 5 V at the default contract",
-  "study": { "file": "vbus-5v.study.json", "hash": "3f1c0f6a0d1b4e0d9d2a8f7e6c5b4a392817060504030201f0e0d0c0b0a09080" },
+  "study": { "file": "vbus-5v.study.json", "hash": "985e5888b3c5c8f1b7f57b05cd91a49c7780ee2d0814e92e92641ded9092c22b" },
   "requirements": ["vbus-default-5v", "vbus-ripple"],
   "revision_range": { "from": "3.0", "to": null },
   "bench": { "name": "pd-sink-bench", "config": "default" },

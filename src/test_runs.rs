@@ -19,7 +19,7 @@ use embarch_study_designer::hil_check::energises;
 use embarch_study_designer::hil_expand::{
     duration_bound, expand, Confirmation, DutIdentity, ExpandContext, Expansion, RunJson, RunTest, SuiteContent, Surface,
 };
-use embarch_study_designer::hil_test::{definition_hash, derived_diff, Capability, HookMapping, Plan, SuiteBench, SuiteManifest, TestDef};
+use embarch_study_designer::hil_test::{definition_hash, derived_diff, study_hash, Capability, HookMapping, Plan, SuiteBench, SuiteManifest, TestDef};
 use embarch_study_designer::host_study::{HostAction, HostStep, HostStudy};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -321,6 +321,7 @@ fn static_card(defs: &Definitions, res: &Resolved, exp: &Expansion, studies: &BT
     let by_def: BTreeMap<String, &TestDef> = res.tests.iter().map(|t| (t.hash(), t)).collect();
     let mut tests = Vec::new();
     for rt in &run.tests {
+        let expanded = exp.studies.iter().any(|s| s.test_id == rt.test_id);
         let study = exp.studies.iter().find(|s| s.test_id == rt.test_id).map(|s| &s.study).or_else(|| studies.get(&rt.study.file));
         let bench = res.manifest.benches.iter().find(|b| b.name == rt.bench.name);
         let (mut asks, mut powers) = (Vec::new(), Vec::new());
@@ -330,6 +331,8 @@ fn static_card(defs: &Definitions, res: &Resolved, exp: &Expansion, studies: &BT
             energising(&study.steps, bench, "steps", &mut powers);
             energising(&study.teardown, bench, "teardown", &mut powers);
         }
+        // Only a premade study Core was sent is checked here; an expanded template's is hashed by `expand` itself.
+        let checked = !expanded && studies.get(&rt.study.file).is_some_and(|s| study_hash(s) == rt.study.hash);
         let (orig, diff) = by_def.get(&rt.definition_hash).map(|d| origin(defs, d, &rt.definition_hash)).unwrap_or(("custom", None));
         tests.push(json!({
             "test_id": agent_text(&rt.test_id), "title": agent_text(&rt.title), "definition_hash": rt.definition_hash,
@@ -338,7 +341,7 @@ fn static_card(defs: &Definitions, res: &Resolved, exp: &Expansion, studies: &BT
             "prompts": asks, "energising": powers, "limits": limits(rt),
             "decision_rule": { "kind": rt.decision_rule.kind, "w_multiple": rt.decision_rule.w_multiple },
             "setup_terms": rt.setup_terms.iter().map(|t| json!({ "name": agent_text(&t.name), "unit": agent_text(&t.unit), "U": t.u, "k": t.k })).collect::<Vec<_>>(),
-            "study": { "file": agent_text(&rt.study.file), "hash": rt.study.hash, "bytes_checked_against_hash": false },
+            "study": { "file": agent_text(&rt.study.file), "hash": rt.study.hash, "bytes_checked_against_hash": checked },
         }));
     }
     let benches: Vec<Value> = run.benches.iter().map(|b| json!({ "name": agent_text(&b.name), "tests": b.tests.iter().map(|t| agent_text(t)).collect::<Vec<_>>() })).collect();
@@ -426,6 +429,18 @@ pub async fn prepare_handler(State(state): State<AppState>, Json(req): Json<Prep
             let (a, b) = (serde_json::to_value(&sent).unwrap_or_default(), serde_json::to_value(&core).unwrap_or_default());
             let at = first_diff(&a, &b, "").unwrap_or_else(|| "the canonical forms differ".into());
             return Err(refuse(format!("run.json is not what Core expands from its confirmed definitions and inputs; first difference at {at}")));
+        }
+        // Every premade study sent must be the one its test's `study.hash` names (decision 134).
+        for rt in exp.run.tests.iter().filter(|rt| !exp.studies.iter().any(|s| s.test_id == rt.test_id)) {
+            if let Some(study) = req.studies.get(&rt.study.file) {
+                let got = study_hash(study);
+                if got != rt.study.hash {
+                    return Err(refuse(format!(
+                        "test {}: study file {} hashes to {got}, its study.hash is {}",
+                        rt.test_id, rt.study.file, rt.study.hash
+                    )));
+                }
+            }
         }
         let run_hash = exp.run.hash();
         let record = json!({
@@ -820,6 +835,7 @@ mod tests {
         assert_eq!(c["benches"][0]["name"]["agent_text"], "pd-sink-bench");
         let t = &c["tests"][0];
         assert_eq!(t["origin"], "custom");
+        assert_eq!(t["study"]["bytes_checked_against_hash"], true, "a premade study that hashes to study.hash says so");
         let kinds: Vec<&str> = t["prompts"].as_array().unwrap().iter().map(|p| p["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["setup", "clearance", "observation"]);
         assert_eq!(t["prompts"][0]["text"]["agent_text"], "Wire the partner to port 1");
@@ -846,6 +862,23 @@ mod tests {
         assert!(s.definitions.spend_nonce(again["nonce"].as_str().unwrap(), &key, now).is_err(), "single use");
         assert_eq!(call(&s, AGENT, "GET", "/test-runs/nope/card", None).await.0, StatusCode::NOT_FOUND);
         assert_eq!(call(&s, AGENT, "GET", "/test-runs/a.b/card", None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_premade_study_that_does_not_hash_to_its_test_s_study_hash_is_refused_naming_both() {
+        let s = state("study-hash");
+        let f = fixture(&s, "run-h").await;
+        let mut edited = body(&f);
+        let file = f.run.tests[0].study.file.clone();
+        edited["studies"][&file]["name"] = "edited".into();
+        let (st, why) = call(&s, AGENT, "POST", "/test-runs", Some(edited)).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{why}");
+        let why = why.as_str().unwrap();
+        let mut sent = f.studies[&file].clone();
+        sent.name = "edited".into();
+        assert!(why.contains("vbus-5v-source-voltage") && why.contains(&file), "{why}");
+        assert!(why.contains(&study_hash(&sent)) && why.contains(&f.run.tests[0].study.hash), "{why}");
+        assert_eq!(call(&s, AGENT, "GET", "/test-runs/run-h/card", None).await.0, StatusCode::NOT_FOUND, "nothing is registered");
     }
 
     #[tokio::test]
