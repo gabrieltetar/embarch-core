@@ -966,7 +966,7 @@ pub fn execute<B: HostBackend>(
 /// Every step that runs, with where it is: the list's own steps, and for a `Repeat` its inner
 /// steps (one level, the designer's rule). `(list name, position, step)`; an inner step's
 /// position reads `"{repeat}.{inner}"`.
-fn flat_steps(study: &HostStudy) -> Vec<(&'static str, String, &HostStep)> {
+pub(crate) fn flat_steps(study: &HostStudy) -> Vec<(&'static str, String, &HostStep)> {
     let mut out = Vec::new();
     for (list, steps) in [("steps", &study.steps), ("teardown", &study.teardown)] {
         for (i, s) in steps.iter().enumerate() {

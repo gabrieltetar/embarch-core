@@ -62,6 +62,35 @@ fn last_sent() -> &'static Mutex<HashMap<String, Instant>> {
     LAST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Each instrument's last `*IDN?` reply, by name, process-wide: the smoke check writes it and the
+/// calibration line of a measurement reads it (decision 143). An instrument that did not answer
+/// has no entry.
+fn identities() -> &'static Mutex<HashMap<String, String>> {
+    static IDN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    IDN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keeps `reply` as `name`'s last `*IDN?` answer, or forgets the old one when `reply` is `None`.
+pub fn note_identity(name: &str, reply: Option<&str>) {
+    let mut map = identities().lock().unwrap();
+    match reply {
+        Some(r) => map.insert(name.to_string(), r.to_string()),
+        None => map.remove(name),
+    };
+}
+
+/// The last `*IDN?` reply the smoke check kept for `name`.
+pub fn last_identity(name: &str) -> Option<String> {
+    identities().lock().unwrap().get(name).cloned()
+}
+
+/// Whether a declared calibration `serial` is one of the comma-separated fields of an `*IDN?`
+/// `reply` (manufacturer, model, serial, firmware), compared exactly after trimming.
+pub fn idn_names_serial(reply: &str, serial: &str) -> bool {
+    let serial = serial.trim();
+    !serial.is_empty() && reply.split(',').any(|f| f.trim() == serial)
+}
+
 /// How long until `min_interval` has passed since the last exchange with
 /// `name` ended (the reply read, or the write flushed when nothing is read).
 fn pace_left(name: &str, min_interval: Duration) -> Duration {

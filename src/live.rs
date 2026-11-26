@@ -226,7 +226,7 @@ pub fn read_ranges(core: &mut impl CoreAccess, req: &MemReadRequest) -> Result<R
 
 /// Opens the role's probe behind the identity gate and the guarded attach, and hands the core to
 /// `f` together with the number of halts the gate made (`Validation.halts`, topology decision 47).
-fn with_core<T>(
+pub(crate) fn with_core<T>(
     chip: &str,
     probe_serial: &str,
     owner: &str,

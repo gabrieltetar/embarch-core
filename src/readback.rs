@@ -1,6 +1,5 @@
-//! Reads an image back through the probe and says which state holds (decision 142). Nothing
-//! calls [`readback`] from a route or a run yet; the smoke check and the run record are later
-//! units. It reads each segment of a board's newest `flashed-images.jsonl` entry in chunks of
+//! Reads an image back through the probe and says which state holds (decision 142). The smoke
+//! check calls it before a bench's first test (decision 143); the run record is a later unit. It reads each segment of a board's newest `flashed-images.jsonl` entry in chunks of
 //! [`live::MAX_WORDS`] words, each under its own short halt (`live::read_ranges`, decision 81),
 //! writes nothing, and hashes what came back.
 //!

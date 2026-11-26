@@ -162,12 +162,24 @@ fn metrology_for<'a>(inst: &'a Instrument, unit: &str) -> Option<&'a embarch_top
     hits.next().is_none().then_some(first)
 }
 
-/// `instrument.calibration` as a measurement carries it: the declared block, with the serial
-/// marked unchecked until the smoke check's `*IDN?` reply can be compared (EMB-368).
-fn calibration_json(c: &embarch_topology::hardware::instrument::Calibration) -> Value {
+/// `instrument.calibration` as a measurement carries it: the declared block. When the smoke check
+/// kept the instrument's `*IDN?` reply, the serial is compared with it (decision 143): a match is
+/// `serial_checked` and `applied`; a difference is `applied: false` with no due date, and the
+/// value reads as having no calibration. With no reply kept, the serial stays unchecked.
+fn calibration_json(c: &embarch_topology::hardware::instrument::Calibration, instrument: &str) -> Value {
+    let idn = crate::instrument::last_identity(instrument);
     let mut v = json!({"serial": c.serial, "certificate_ref": c.certificate_ref, "due": c.due, "serial_checked": false});
     if let Some(h) = &c.certificate_sha256 {
         v["certificate_sha256"] = json!(h);
+    }
+    if let Some(idn) = idn {
+        v["serial_checked"] = json!(true);
+        v["idn"] = json!(idn);
+        if !crate::instrument::idn_names_serial(&idn, &c.serial) {
+            v["applied"] = json!(false);
+            v["due"] = Value::Null;
+            v["note"] = json!("the instrument's *IDN? reply does not name the calibration's serial, so the calibration is not applied");
+        }
     }
     v
 }
@@ -205,7 +217,7 @@ fn measurement(
                 u_source = "source";
             }
             if let Some(cal) = &inst.calibration {
-                instrument["calibration"] = calibration_json(cal);
+                instrument["calibration"] = calibration_json(cal, name);
             }
         }
     }
@@ -294,6 +306,7 @@ mod tests {
         assert_eq!(m["u_source"], "source");
         assert_eq!(m["instrument"]["calibration"]["due"], "2026-01-01");
         assert_eq!(m["instrument"]["calibration"]["serial_checked"], false);
+        assert!(m["instrument"]["calibration"].get("applied").is_none());
         assert_eq!(m["declared_by"], json!([{"what": "instrument", "name": "dmm", "scope": "person"}]));
     }
 
@@ -313,5 +326,25 @@ mod tests {
         assert_eq!(v, json!({"name": "vbus", "value": 5.0}));
         let v = serde_json::to_value(read(&vbus(), "x", false, Addressed::Signal("pd".into()))).unwrap();
         assert_eq!(v, json!({"name": "vbus", "value": null, "incomplete": ["parse_failed"]}));
+    }
+
+    #[test]
+    fn a_calibration_whose_serial_the_idn_reply_does_not_name_is_not_applied_and_says_so() {
+        let mut inst = dmm(true);
+        inst.name = "dmm-cal-mismatch".into();
+        crate::instrument::note_identity("dmm-cal-mismatch", Some("ACME,DMM1,S2,1.0"));
+        let mut c = Collected { step: "s".into(), iteration: None, at_utc_ms: 5, parsed: read(&vbus(), "vbus: 5 mV", false, Addressed::Instrument("dmm-cal-mismatch".into())) };
+        let m = measurement(&c, &|_| None, &|_| Some(inst.clone()), &Declarations::new());
+        let cal = &m["instrument"]["calibration"];
+        assert_eq!((cal["serial_checked"].clone(), cal["applied"].clone(), cal["due"].clone()), (json!(true), json!(false), Value::Null));
+        assert!(cal["note"].as_str().unwrap().contains("not applied"));
+        // The same reply naming the serial applies it.
+        crate::instrument::note_identity("dmm-cal-mismatch", Some("ACME,DMM1,S1,1.0"));
+        c.step = "s".into();
+        let m = measurement(&c, &|_| None, &|_| Some(inst.clone()), &Declarations::new());
+        let cal = &m["instrument"]["calibration"];
+        assert_eq!((cal["serial_checked"].clone(), cal["due"].clone()), (json!(true), json!("2026-01-01")));
+        assert!(cal.get("applied").is_none());
+        crate::instrument::note_identity("dmm-cal-mismatch", None);
     }
 }

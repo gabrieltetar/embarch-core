@@ -604,10 +604,15 @@ impl ImageLog {
         self.0.map.lock().unwrap().values().map(FlashedEntry::status).collect()
     }
 
-    /// The latest entry per chip, with its segments. Tests only until the readback lands.
+    /// The latest entry per chip, with its segments.
     #[cfg(test)]
     pub fn entries(&self) -> Vec<FlashedEntry> {
         self.0.map.lock().unwrap().values().cloned().collect()
+    }
+
+    /// The latest entry that flashed the board on `probe_serial`, for the smoke check's readback.
+    pub fn entry_for_probe(&self, probe_serial: &str) -> Option<FlashedEntry> {
+        self.0.map.lock().unwrap().values().find(|e| e.probe_serial.as_deref() == Some(probe_serial)).cloned()
     }
 }
 

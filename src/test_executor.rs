@@ -1,4 +1,4 @@
-//! The executor of a started Test run (decision 136): bench by bench in `run.json`'s order, test by
+//! The executor of a started Test run (decisions 136, 143): bench by bench in `run.json`'s order, test by
 //! test, each test's precondition first, each run of it one host study through the existing
 //! executor with its teardown, each verdict from the shared crate's `judge_run` and `judge_test`.
 //!
@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::api::AppState;
 use crate::host_study::{detail, RunContext};
 use crate::measurements::SignalOrigin;
+use crate::smoke_check::{BenchAccess, BenchNeeds, SmokeFindings};
 use crate::token_store::Scope;
 
 /// The time a test is allowed beyond its worst-case study time, for its precondition and the
@@ -42,6 +43,11 @@ const PORT_WAIT_MS: u64 = 5_000;
 /// bench after the first adds to the run's deadline. **Chosen, not measured**: a person moving a
 /// cable and enrolling a board.
 const SETUP_WAIT_MS: u64 = 900_000;
+/// How long a bench board's hello line and an instrument's `*IDN?` wait for a reply in the smoke
+/// check (decision 143). **Chosen, not measured.**
+const SMOKE_WAIT_MS: u64 = 2_000;
+/// How long the smoke check waits for an instrument's port to enumerate. **Chosen, not measured.**
+const SMOKE_PORT_WAIT_MS: u64 = 5_000;
 
 /// What one run of a test's study left, ready for [`hil_judge::judge_run`].
 pub struct StudyRun {
@@ -76,6 +82,11 @@ pub trait Env {
     /// it ended. The default has no window.
     fn setup(&mut self, _bench: &RunBench, _config: &str, _missing: &[String]) -> SetupEnd {
         SetupEnd::Confirmed
+    }
+    /// The smoke check before `bench`'s first test (decision 143), over the `tests` it will run.
+    /// The default checks nothing.
+    fn smoke_check(&mut self, bench: &RunBench, _tests: &[&RunTest]) -> SmokeFindings {
+        SmokeFindings::new(&bench.name)
     }
     /// The run was cancelled (the route, or a study's own cancel).
     fn cancelled(&self) -> bool;
@@ -119,6 +130,8 @@ pub struct Progress {
     pub bench: Option<String>,
     pub test: Option<String>,
     pub results: Vec<TestResult>,
+    /// What each bench's smoke check found, in bench order, kept for the run record.
+    pub smoke: Vec<SmokeFindings>,
 }
 
 /// Every run's progress, by run id; each is shared with the executor that updates it.
@@ -130,6 +143,8 @@ pub struct RunOutcome {
     /// `completed`, `cancelled` or `deadline`.
     pub status: &'static str,
     pub results: Vec<TestResult>,
+    /// What each bench's smoke check found, in bench order.
+    pub smoke: Vec<SmokeFindings>,
 }
 
 fn skipped(test: &RunTest, why: Reason, note: &str) -> TestResult {
@@ -181,20 +196,24 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
     let mut results: Vec<TestResult> = Vec::new();
     let mut ended: Option<&'static str> = None;
     let mut after_fail = false;
-    let publish = |results: &[TestResult], bench: Option<&str>, test: Option<&str>| {
+    let mut smoke: Vec<SmokeFindings> = Vec::new();
+    // The DUT unit the first bench read: a later bench reading another is refused (decision 143).
+    let mut unit: Option<(String, String)> = None;
+    let publish = |results: &[TestResult], smoke: &[SmokeFindings], bench: Option<&str>, test: Option<&str>| {
         let mut p = progress.lock().unwrap();
         p.state = "running";
         p.bench = bench.map(str::to_string);
         p.test = test.map(str::to_string);
         p.results = results.to_vec();
+        p.smoke = smoke.to_vec();
     };
     for (n, bench) in run.benches.iter().enumerate() {
         let mut bench_error = false;
-        // The setup window before every bench after the first. The smoke check is EMB-368, so
-        // nothing is found missing yet (decision 139).
+        // The setup window before every bench after the first. It names nothing as missing: the
+        // smoke check runs after it, on whatever the person set up (decisions 139, 143).
         let mut setup_failed: Option<&str> = None;
         if n > 0 && ended.is_none() && !env.cancelled() {
-            publish(&results, Some(&bench.name), None);
+            publish(&results, &smoke, Some(&bench.name), None);
             let config = bench.tests.iter().find_map(|id| run.tests.iter().find(|t| &t.test_id == id)).map_or("", |t| t.bench.config.as_str());
             match env.setup(bench, config, &[]) {
                 SetupEnd::Confirmed => {}
@@ -202,6 +221,26 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
                 SetupEnd::TimedOut => setup_failed = Some("the setup prompt for this bench timed out"),
                 SetupEnd::Cancelled => ended = Some("cancelled"),
             }
+        }
+        // The smoke check before the bench's first test, the first bench included.
+        let mut smoke_failed: Option<String> = None;
+        if ended.is_none() && setup_failed.is_none() && !env.cancelled() {
+            publish(&results, &smoke, Some(&bench.name), None);
+            let tests: Vec<&RunTest> = bench.tests.iter().filter_map(|id| run.tests.iter().find(|t| &t.test_id == id)).collect();
+            let mut found = env.smoke_check(bench, &tests);
+            if let Some(id) = found.unit.clone() {
+                match &unit {
+                    None => unit = Some((bench.name.clone(), id)),
+                    Some((first, kept)) if *kept != id => found.failures.push(format!(
+                        "the DUT unit: bench '{first}' read hardware ID {kept}, this bench reads {id}; one unit goes through every bench"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if !found.failures.is_empty() {
+                smoke_failed = Some(found.failure_text());
+            }
+            smoke.push(found);
         }
         for id in &bench.tests {
             let Some(test) = run.tests.iter().find(|t| &t.test_id == id) else { continue };
@@ -216,6 +255,8 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
             } else if let Some(why) = setup_failed.take() {
                 bench_error = true;
                 errored(test, Reason::BenchStepFailed, why.to_string(), vec![])
+            } else if let Some(why) = &smoke_failed {
+                errored(test, Reason::SmokeCheck, why.clone(), vec![])
             } else if after_fail {
                 skipped(test, Reason::StoppedAfterFail, "stop_on_fail: an earlier test failed")
             } else if bench_error {
@@ -223,7 +264,7 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
             } else if let Some(missing) = test.requires.iter().find(|r| !results.iter().any(|x| &x.test_id == *r && x.judged.verdict == Verdict::Pass)) {
                 skipped(test, Reason::RequiresNotMet, &format!("it requires {missing}, which did not pass"))
             } else {
-                publish(&results, Some(&bench.name), Some(&test.test_id));
+                publish(&results, &smoke, Some(&bench.name), Some(&test.test_id));
                 run_test(test, bench, env, rules, started, limit, &mut ended)
             };
             match result.judged.verdict {
@@ -232,7 +273,7 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
                 _ => {}
             }
             results.push(result);
-            publish(&results, Some(&bench.name), None);
+            publish(&results, &smoke, Some(&bench.name), None);
         }
     }
     let status = ended.unwrap_or("completed");
@@ -242,8 +283,9 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
         p.bench = None;
         p.test = None;
         p.results = results.clone();
+        p.smoke = smoke.clone();
     }
-    RunOutcome { status, results }
+    RunOutcome { status, results, smoke }
 }
 
 /// One test: its precondition once, then `run_count` runs, each judged; the test is the worst run.
@@ -402,9 +444,13 @@ pub fn judge_measurements(test: &RunTest, doc: &Value) -> Vec<MeasurementRecord>
             // says so. Every other origin keeps the source-based reading.
             let calibration = &m["instrument"]["calibration"];
             let on_instrument = origin == Origin::Instrument;
+            // A calibration the smoke check found for another serial is not applied (decision 143):
+            // it speaks for nothing, so the value has none declared and cannot be expired by it.
+            let calibration_applied = calibration["applied"] != false;
             let calibration_expired = on_instrument
+                && calibration_applied
                 && calibration["due"].as_str().is_some_and(|due| due < utc_date(m["at_utc_ms"].as_u64().unwrap_or(0)).as_str());
-            let calibration_undeclared = if on_instrument { calibration.is_null() } else { source.is_none() };
+            let calibration_undeclared = if on_instrument { calibration.is_null() || !calibration_applied } else { source.is_none() };
             let by_person = m["declared_by"].as_array().is_some_and(|d| !d.is_empty() && d.iter().all(|x| x["scope"] == "person"));
             Some(MeasurementRecord {
                 measurement: name.to_string(),
@@ -474,7 +520,153 @@ impl CoreEnv {
     }
 }
 
+/// The smoke check's reach into Core's own bench: the topology tables, the probes through the
+/// identity gate, the boards' consoles and the instruments' ports, each under `hw_lock`.
+struct CoreBench<'a>(&'a CoreEnv);
+
+impl CoreBench<'_> {
+    fn lock(&self) -> Result<crate::api::HwGuard, String> {
+        self.0.handle.block_on(crate::api::acquire_hw_lock(&self.0.state, "a test run's smoke check")).map_err(|(_, m)| m)
+    }
+
+    /// The enrolled board a part id's signal leaves, and how to validate it.
+    fn board_of(&self, part: &str) -> Result<embarch_topology::hardware::EnrolledBoard, String> {
+        let link = embarch_topology::hardware::find_signal(part)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("no signal is declared under '{part}'"))?;
+        embarch_topology::hardware::find_signal_origin_board(&link).map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no board is enrolled where signal '{part}' leaves"))
+    }
+
+    fn validated_id(&self, board: &embarch_topology::hardware::EnrolledBoard) -> Result<String, String> {
+        let _guard = self.lock()?;
+        let v = match &board.probe_serial {
+            Some(serial) => embarch_topology::hardware::validate_serial_timed(serial),
+            None => embarch_topology::hardware::validate_role_timed(&board.role),
+        };
+        v.map(|v| v.board.hardware_id.unwrap_or_default()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn read_image(&self, board: crate::readback::Board, enrolled: Option<embarch_topology::hardware::EnrolledBoard>) -> crate::readback::ImageStatus {
+        use crate::readback::{readback, ImageStatus};
+        let refuse = |reason: String| match board {
+            crate::readback::Board::Dut => ImageStatus::Claim { reason },
+            crate::readback::Board::Bench => ImageStatus::Unverified { reason },
+        };
+        let Some(enrolled) = enrolled else { return refuse("no board is enrolled to read".into()) };
+        let Some(serial) = enrolled.probe_serial.clone() else { return readback(None::<&mut probe_rs::Core<'_>>, board, None, None) };
+        let entry = self.0.state.images.entry_for_probe(&serial);
+        let list = crate::readback::bench_list_from_env().ok();
+        let _guard = match self.lock() {
+            Ok(g) => g,
+            Err(e) => return refuse(e),
+        };
+        crate::live::with_core(&enrolled.chip, &serial, "a test run's smoke check", |core, _| Ok(readback(Some(core), board, entry.as_ref(), list.as_ref())))
+            .unwrap_or_else(|e| refuse(format!("{e:#}")))
+    }
+}
+
+impl BenchAccess for CoreBench<'_> {
+    fn signal_declared(&mut self, name: &str) -> Result<bool, String> {
+        embarch_topology::hardware::find_signal(name).map(|s| s.is_some()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn role_declared(&mut self, role: &str) -> Result<bool, String> {
+        embarch_topology::hardware::find_enrolled_by_role(role).map(|b| b.is_some()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn instrument_declared(&mut self, name: &str) -> Result<bool, String> {
+        embarch_topology::hardware::instrument::get(name).map(|i| i.is_some()).map_err(|e| format!("{e:#}"))
+    }
+
+    fn dut_identity(&mut self) -> Result<String, String> {
+        let dut = embarch_topology::hardware::find_enrolled_by_role(embarch_topology::hardware::DUT_ROLE)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or("no DUT is enrolled")?;
+        self.validated_id(&dut)
+    }
+
+    fn board_identity(&mut self, part: &str) -> Result<String, String> {
+        let board = self.board_of(part)?;
+        self.validated_id(&board)
+    }
+
+    fn hello(&mut self, part: &str, hello: &str) -> Result<String, String> {
+        let _guard = self.lock()?;
+        let req = crate::exchange::ExchangeRequest {
+            write: format!("{hello}\n"),
+            until: None,
+            timeout_ms: SMOKE_WAIT_MS,
+            discard_pending: true,
+            match_after_echo: true,
+            port_wait_ms: PORT_WAIT_MS,
+        };
+        let got = crate::api::run_signal_exchange(&self.0.state.captures, part, req).map_err(|(_, m)| m)?;
+        // The echo of the line is not an answer: a console that only echoes is not running its shell.
+        let reply = got.text.replacen(hello, "", 1).trim().to_string();
+        if reply.is_empty() { Err("nothing came back but the echo".into()) } else { Ok(reply) }
+    }
+
+    fn idn(&mut self, instrument: &str) -> Result<String, String> {
+        let _guard = self.lock()?;
+        let asked = (|| -> Result<String, String> {
+            let inst = embarch_topology::hardware::instrument::get(instrument).map_err(|e| format!("{e:#}"))?.ok_or("not declared")?;
+            let port = crate::instrument::find_port_waiting(&inst, SMOKE_PORT_WAIT_MS).map_err(|e| format!("{e:#}"))?.ok_or("its port is not enumerated")?;
+            let req = embarch_topology::hardware::InstrumentExchange { line: "*IDN?".into(), query: true, timeout_ms: SMOKE_WAIT_MS, port_wait_ms: 0 };
+            let got = crate::instrument::run(&inst, &port, &req).map_err(|e| format!("{e:#}"))?;
+            let reply = got.reply.trim().to_string();
+            if reply.is_empty() { Err("the reply was empty".to_string()) } else { Ok(reply) }
+        })();
+        crate::instrument::note_identity(instrument, asked.as_deref().ok());
+        asked
+    }
+
+    fn image(&mut self, part: Option<&str>) -> crate::readback::ImageStatus {
+        match part {
+            None => {
+                let dut = embarch_topology::hardware::find_enrolled_by_role(embarch_topology::hardware::DUT_ROLE).ok().flatten();
+                self.read_image(crate::readback::Board::Dut, dut)
+            }
+            Some(part) => {
+                let board = self.board_of(part).ok();
+                self.read_image(crate::readback::Board::Bench, board)
+            }
+        }
+    }
+}
+
 impl Env for CoreEnv {
+    fn smoke_check(&mut self, bench: &RunBench, tests: &[&RunTest]) -> SmokeFindings {
+        let mut needs = BenchNeeds::default();
+        let add = |v: &mut Vec<String>, s: &str| {
+            if !v.iter().any(|x| x == s) {
+                v.push(s.to_string());
+            }
+        };
+        for b in &bench.boards {
+            add(&mut needs.signals, &b.part);
+        }
+        for t in tests {
+            let Some(study) = self.studies.get(&t.test_id) else { continue };
+            for (_, _, step) in crate::host_study::flat_steps(study) {
+                match &step.action {
+                    HostAction::Exchange { signal, .. } => add(&mut needs.signals, signal),
+                    HostAction::Instrument { instrument, .. } => add(&mut needs.instruments, instrument),
+                    _ => {}
+                }
+            }
+        }
+        for s in &needs.signals.clone() {
+            if let Ok(Some(link)) = embarch_topology::hardware::find_signal(s) {
+                if let embarch_topology::hardware::SignalOrigin::Role(r) = link.origin() {
+                    if r != embarch_topology::hardware::DUT_ROLE {
+                        add(&mut needs.roles, r);
+                    }
+                }
+            }
+        }
+        crate::smoke_check::check_bench(&mut CoreBench(self), bench, &needs)
+    }
+
     fn setup(&mut self, bench: &RunBench, config: &str, missing: &[String]) -> SetupEnd {
         use crate::host_study::{PendingPrompt, PromptSlot, PromptEnd, PromptAnswer};
         self.setups += 1;
@@ -574,6 +766,7 @@ pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<St
         let body = json!({
             "run_id": run_id, "status": outcome.status, "ended_utc_ms": crate::study::current_utc_ms(),
             "results": outcome.results.iter().map(TestResult::to_json).collect::<Vec<_>>(),
+            "smoke_checks": outcome.smoke,
         });
         if let Err(e) = std::fs::write(crate::test_runs::result_path(state.run_log.data_dir(), &run_id), body.to_string()) {
             tracing::error!(run_id, "could not keep the run's result: {e}");
@@ -609,7 +802,7 @@ mod tests {
             "standard": { "name": "usb-pd", "revision": "3.2" },
             "dut": { "hardware_id": null, "declared_serial": "u", "board_revision": "A", "capabilities": [], "hooks": [] },
             "options": { "stop_on_fail": stop_on_fail },
-            "benches": benches.iter().map(|(n, t)| json!({ "name": n, "tests": t, "boards": [] })).collect::<Vec<_>>(),
+            "benches": benches.iter().map(|(n, t)| json!({ "name": n, "tests": t, "boards": [ { "part": "pd", "idle": "idle", "hello": "hello" } ] })).collect::<Vec<_>>(),
             "tests": tests,
         }))
         .unwrap_or_else(|e| panic!("{e}"))
@@ -625,10 +818,13 @@ mod tests {
         /// The benches a setup prompt was raised for, with the configuration, and how each ends.
         setups: Vec<(String, String)>,
         setup_ends: VecDeque<SetupEnd>,
+        /// One scripted bench access per smoke check, in order; none left is a pass.
+        smoke: VecDeque<crate::smoke_check::testing::Fake>,
+        smoked: Vec<String>,
     }
 
     fn fake(runs: Vec<StudyRun>) -> Fake {
-        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![], setups: vec![], setup_ends: VecDeque::new() }
+        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![], setups: vec![], setup_ends: VecDeque::new(), smoke: VecDeque::new(), smoked: vec![] }
     }
 
     fn steps(outcome: StepOutcome, target: Target) -> Vec<JudgeStep> {
@@ -659,9 +855,15 @@ mod tests {
 
     impl Env for Fake {
         fn setup(&mut self, bench: &RunBench, config: &str, missing: &[String]) -> SetupEnd {
-            assert!(missing.is_empty(), "no smoke check exists yet");
+            assert!(missing.is_empty(), "the setup prompt names nothing: the smoke check runs after it");
             self.setups.push((bench.name.clone(), config.to_string()));
             self.setup_ends.pop_front().unwrap_or(SetupEnd::Confirmed)
+        }
+        fn smoke_check(&mut self, bench: &RunBench, _: &[&RunTest]) -> SmokeFindings {
+            self.smoked.push(bench.name.clone());
+            let mut access = self.smoke.pop_front().unwrap_or_default();
+            let needs = crate::smoke_check::testing::needs();
+            crate::smoke_check::check_bench(&mut access, bench, &needs)
         }
         fn cancelled(&self) -> bool {
             self.cancel_after_runs.is_some_and(|n| self.ran.len() >= n)
@@ -711,6 +913,58 @@ mod tests {
             assert_eq!(env.ran, vec!["t1", "t4"]);
             assert_eq!(env.setups.len(), 2);
         }
+    }
+
+    use crate::readback::ImageStatus;
+    use crate::smoke_check::testing::Fake as Access;
+
+    #[test]
+    fn a_bench_failing_its_smoke_check_skips_its_tests_as_smoke_check_errors_naming_the_piece() {
+        let cases: Vec<(Access, &str)> = vec![
+            (Access { missing_signal: Some("pd"), ..Default::default() }, "signal 'pd': not declared"),
+            (Access { dut_id: Some(Err("mismatch".into())), ..Default::default() }, "the DUT: validate failed"),
+            (Access { silent_hello: true, ..Default::default() }, "bench board 'pd': no answer to its hello line"),
+            (Access { silent_idn: true, ..Default::default() }, "instrument 'dmm': no answer to *IDN?"),
+            (Access { dut_image: Some(ImageStatus::Differs { address: 0, length: 4 }), ..Default::default() }, "the DUT: its image differs"),
+        ];
+        for (access, piece) in cases {
+            let run = run_of(&[("a", &["t1", "t2"]), ("b", &["t3"])], vec![test("t1", "a", 1, &[]), test("t2", "a", 1, &[]), test("t3", "b", 1, &[])], false);
+            let mut env = fake(vec![pass()]);
+            env.smoke = VecDeque::from([access]);
+            let out = go(&run, &mut env);
+            let v = verdicts(&out);
+            assert_eq!(v[0], ("t1".to_string(), Verdict::Error, Some(Reason::SmokeCheck)), "{piece}");
+            assert_eq!(v[1], ("t2".to_string(), Verdict::Error, Some(Reason::SmokeCheck)), "{piece}");
+            assert!(out.results[0].note.as_deref().unwrap().contains(piece), "{:?}", out.results[0].note);
+            assert_eq!(v[2].1, Verdict::Pass, "bench b still runs");
+            assert_eq!(env.ran, vec!["t3"]);
+            assert_eq!(env.smoked, vec!["a", "b"], "the first bench is checked too");
+            assert_eq!(out.smoke.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_different_dut_unit_on_a_later_bench_refuses_that_bench_and_the_first_stands() {
+        let run = run_of(&[("a", &["t1"]), ("b", &["t2"])], vec![test("t1", "a", 1, &[]), test("t2", "b", 1, &[])], false);
+        let mut env = fake(vec![pass(), pass()]);
+        env.smoke = VecDeque::from([Access::default(), Access { dut_id: Some(Ok("DUT-2".into())), ..Default::default() }]);
+        let out = go(&run, &mut env);
+        let v = verdicts(&out);
+        assert_eq!(v[0].1, Verdict::Pass, "bench a's result stands");
+        assert_eq!(v[1], ("t2".to_string(), Verdict::Error, Some(Reason::SmokeCheck)));
+        assert!(out.results[1].note.as_deref().unwrap().contains("DUT-1") && out.results[1].note.as_deref().unwrap().contains("DUT-2"));
+        assert_eq!(env.ran, vec!["t1"]);
+    }
+
+    #[test]
+    fn a_passing_smoke_check_keeps_its_findings_on_the_progress_and_the_outcome() {
+        let run = run_of(&[("a", &["t1"])], vec![test("t1", "a", 1, &[])], false);
+        let mut env = fake(vec![pass()]);
+        let progress = Mutex::new(Progress::default());
+        let out = drive(&run, &mut env, &progress, &Rules::latest(), Duration::from_secs(60));
+        assert_eq!(out.smoke[0].unit.as_deref(), Some("DUT-1"));
+        assert_eq!(out.smoke[0].instruments[0].reply, "ACME,dmm,S1,1.0");
+        assert_eq!(progress.lock().unwrap().smoke, out.smoke);
     }
 
     #[test]
@@ -1025,6 +1279,16 @@ mod tests {
         ]});
         let got = judge_measurements(&test, &doc);
         assert_eq!(got.iter().map(|g| (g.evidence.calibration_expired, g.calibration_undeclared)).collect::<Vec<_>>(), [(true, false), (false, false), (false, true)]);
+    }
+
+    #[test]
+    fn a_calibration_not_applied_reads_as_undeclared_and_never_expired() {
+        let test = test("t1", "A", 1, &[]);
+        let doc = json!({"measurements": [
+            { "name": "a", "value": 1.0, "by": "bench", "at_utc_ms": 1_709_251_200_000u64, "instrument": { "name": "dmm", "kind": "instrument", "calibration": { "due": "2024-02-29", "applied": false } }, "incomplete": [], "declared_by": [] },
+        ]});
+        let got = judge_measurements(&test, &doc);
+        assert_eq!((got[0].evidence.calibration_expired, got[0].calibration_undeclared), (false, true));
     }
 
     #[test]
