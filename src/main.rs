@@ -35,6 +35,7 @@ mod readback;
 mod smoke_check;
 mod stream_store;
 mod test_executor;
+mod test_run_record;
 mod test_runs;
 mod study;
 mod token_store;
@@ -446,6 +447,8 @@ pub(crate) async fn serve(
     let state = api::AppState::with_tokens(tokens, signing::Sealer::resolve()?, run_log);
 
     let call_log = state.call_log.clone();
+    // A Test run the last Core was holding when it stopped is sealed as interrupted (decision 144).
+    test_run_record::seal_interrupted(&state.sealer, &state.run_log);
     let app = api::build_router(state);
 
     let addr = format!("{bind}:{port}");

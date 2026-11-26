@@ -448,7 +448,7 @@ pub async fn prepare_handler(State(state): State<AppState>, Json(req): Json<Prep
             "run": exp.run, "plan_hash": res.plan_hash, "suite_hash": res.manifest_hash,
             "lease_holder": holder, "prepared_utc_ms": crate::study::current_utc_ms(),
             "card": static_card(&defs, &res, &exp, &req.studies), "inputs": inputs(&res),
-            "studies": kept_studies(&exp, &req.studies),
+            "studies": kept_studies(&exp, &req.studies), "selection": exp.selection,
             "energising_steps": energising_by_test(&exp, &res, &req.studies),
         });
         write_new(&path, &record).map_err(|e| match e.kind() {
@@ -529,7 +529,7 @@ fn conflict(why: impl Into<String>) -> (StatusCode, String) {
     (StatusCode::CONFLICT, why.into())
 }
 
-fn read_record(store: &std::path::Path, run_id: &str) -> Result<Value, (StatusCode, String)> {
+pub(crate) fn read_record(store: &std::path::Path, run_id: &str) -> Result<Value, (StatusCode, String)> {
     let bytes = std::fs::read(run_path(store, run_id)).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => (StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")),
         _ => internal(e.into()),
@@ -540,6 +540,22 @@ fn read_record(store: &std::path::Path, run_id: &str) -> Result<Value, (StatusCo
 /// Where the executor leaves a run's verdicts when it ends.
 pub(crate) fn result_path(store: &std::path::Path, run_id: &str) -> PathBuf {
     store.join(TEST_RUNS_DIR).join(format!("{run_id}.result.json"))
+}
+
+/// Where a run's own signed record is kept (decision 144).
+pub(crate) fn record_path(store: &std::path::Path, run_id: &str) -> PathBuf {
+    store.join(TEST_RUNS_DIR).join(format!("{run_id}.test-run.dsse.json"))
+}
+
+/// The runs Core started that have no result: the executor died with Core (decision 144).
+pub(crate) fn started_run_ids(store: &std::path::Path) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(store.join(TEST_RUNS_DIR)) else { return vec![] };
+    let mut ids: Vec<String> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".started.json")).map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Where a go leaves its mark: written once, so a run starts once however many cards were issued.

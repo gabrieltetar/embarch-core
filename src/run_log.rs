@@ -233,20 +233,77 @@ impl RunLog {
     pub fn unpublished_ids(&self) -> Result<HashSet<String>> {
         let mut out = HashSet::new();
         self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
-        for l in self.lines()? {
+        let lines = self.lines()?;
+        // A study run of a Test run is held until the Test run is published, whatever was
+        // published of the study alone (decision 144).
+        let published_runs: HashSet<&str> =
+            lines.iter().filter(|l| l["entry"]["type"] == "published").filter_map(|l| l["entry"]["run_id"].as_str()).collect();
+        let held: HashSet<&str> = lines
+            .iter()
+            .filter(|l| l["entry"]["type"] == "test_run" && !l["entry"]["run_id"].as_str().is_some_and(|r| published_runs.contains(r)))
+            .flat_map(|l| l["entry"]["study_ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()))
+            .collect();
+        for l in &lines {
             let e = &l["entry"];
             let Some(id) = e["study_id"].as_str() else { continue };
             match e["type"].as_str() {
                 Some("run") => {
                     out.insert(id.to_string());
                 }
+                Some("published") if held.contains(id) => {}
                 Some("published" | "discarded") => {
                     out.remove(id);
                 }
                 _ => {}
             }
         }
+        // Publishing the Test run releases every study run it made.
+        for l in lines.iter().filter(|l| l["entry"]["type"] == "test_run") {
+            if l["entry"]["run_id"].as_str().is_some_and(|r| published_runs.contains(r)) {
+                for id in l["entry"]["study_ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                    out.remove(id);
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// The study runs of each Test run, by study id to run id: what retention sweeps as one unit
+    /// (decision 144).
+    pub fn test_run_units(&self) -> Result<HashMap<String, String>> {
+        self.verify()?.map_err(|e| anyhow::anyhow!("the run log is broken at line {}: {}", e.line, e.reason))?;
+        let mut out = HashMap::new();
+        for l in self.lines()? {
+            let e = &l["entry"];
+            if e["type"] != "test_run" {
+                continue;
+            }
+            let Some(run_id) = e["run_id"].as_str() else { continue };
+            for id in e["study_ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                out.insert(id.to_string(), run_id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// One test of a Test run, entered as the run ends (decision 144). `unit_key` is the DUT's
+    /// hardware ID the smoke check read, `dut_image` the DUT's image status on the test's bench,
+    /// `verdict` the test's, `None` for a test the run never reached.
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_entry(&self, run_id: &str, test_id: &str, definition_hash: &str, requirements: &[String], unit_key: Option<&str>, dut_image: Option<&str>, verdict: Option<&str>) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test", "run_id": run_id, "test_id": test_id, "definition_hash": definition_hash,
+            "requirements": requirements, "unit_key": unit_key, "dut_image": dut_image, "verdict": verdict,
+        }))
+    }
+
+    /// The whole Test run, entered once: the hash of its signed record (`None` when signing
+    /// failed), how it ended, and every study run it made (decision 144).
+    pub fn test_run_entry(&self, run_id: &str, status: &str, record_sha256: Option<&str>, study_ids: &[String]) -> Result<serde_json::Value> {
+        self.append(serde_json::json!({
+            "type": "test_run", "run_id": run_id, "status": status, "record_sha256": record_sha256,
+            "study_ids": study_ids, "at_utc_ms": now_ms(),
+        }))
     }
 
     /// Records the hash of the manifest a run was published under.
@@ -442,15 +499,33 @@ pub type Split<T> = (Vec<(T, PathBuf)>, Vec<(T, PathBuf)>);
 /// Splits `dirs` (newest first) into what retention keeps: every protected
 /// run, plus the newest `keep` of the rest. `keep == 0` keeps all.
 pub fn retained<T>(dirs: Vec<(T, PathBuf)>, keep: usize, protected: &HashSet<String>) -> Split<T> {
+    let units = installed().and_then(|l| l.test_run_units().ok()).unwrap_or_default();
+    retained_in_units(dirs, keep, protected, &units)
+}
+
+/// [`retained`] with the Test runs given: the study runs of one Test run (`units`, study id to run
+/// id) are one unit, counted once toward `keep` and kept or swept together by their newest
+/// member's place (decision 144).
+pub fn retained_in_units<T>(dirs: Vec<(T, PathBuf)>, keep: usize, protected: &HashSet<String>, units: &HashMap<String, String>) -> Split<T> {
     let mut kept = Vec::new();
     let mut gone = Vec::new();
     let mut unprotected = 0;
+    let mut decided: HashMap<&str, bool> = HashMap::new();
     for d in dirs {
-        let is_protected = d.1.file_name().and_then(|n| n.to_str()).is_some_and(|n| protected.contains(n));
-        if is_protected || keep == 0 || unprotected < keep {
-            if !is_protected {
+        let name = d.1.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_protected = protected.contains(name);
+        let keep_it = if is_protected || keep == 0 {
+            true
+        } else if let Some(unit) = units.get(name) {
+            *decided.entry(unit.as_str()).or_insert_with(|| {
                 unprotected += 1;
-            }
+                unprotected <= keep
+            })
+        } else {
+            unprotected += 1;
+            unprotected <= keep
+        };
+        if keep_it {
             kept.push(d);
         } else {
             gone.push(d);
@@ -805,5 +880,48 @@ mod tests {
         std::fs::remove_file(log.path()).unwrap();
         std::fs::create_dir(log.path()).unwrap();
         assert!(log.unpublished_ids().is_err());
+    }
+
+    fn test_run_with(log: &RunLog, run_id: &str, studies: &[&str]) {
+        for id in studies {
+            run_with(log, id, "completed", "Pass");
+        }
+        let ids: Vec<String> = studies.iter().map(|s| s.to_string()).collect();
+        log.test_run_entry(run_id, "completed", Some("ab"), &ids).unwrap();
+    }
+
+    #[test]
+    fn the_study_runs_of_an_unpublished_test_run_stay_protected_even_when_published_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::at(dir.path().to_path_buf());
+        test_run_with(&log, "r1", &["a", "b"]);
+        run_with(&log, "solo", "completed", "Pass");
+        log.publish("a", &"ab".repeat(32), Scope::Person).unwrap();
+        log.publish("solo", &"ab".repeat(32), Scope::Person).unwrap();
+        let held = log.unpublished_ids().unwrap();
+        assert!(held.contains("a") && held.contains("b"), "{held:?}");
+        assert!(!held.contains("solo"));
+        // The Test run's own publish releases them.
+        log.append(serde_json::json!({ "type": "published", "run_id": "r1", "manifest_sha256": "ab".repeat(32) })).unwrap();
+        run_with(&log, "c", "completed", "Pass");
+        let after = log.unpublished_ids().unwrap();
+        assert!(!after.contains("b") && !after.contains("a"), "a published Test run's studies are swept like any other: {after:?}");
+        assert!(after.contains("c"));
+    }
+
+    #[test]
+    fn retention_counts_a_test_run_as_one_unit_and_sweeps_its_studies_together() {
+        let d = |n: &str| (0u8, PathBuf::from(n));
+        let dirs = vec![d("new"), d("t2"), d("mid"), d("t1"), d("old")];
+        let units: HashMap<String, String> = [("t1", "r"), ("t2", "r")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let names = |v: &[(u8, PathBuf)]| v.iter().map(|d| d.1.to_str().unwrap().to_string()).collect::<Vec<_>>();
+        // keep 2 units of: new, {t2, t1}, mid, old -> new and the Test run stay, mid and old go.
+        let (kept, gone) = retained_in_units(dirs.clone(), 2, &HashSet::new(), &units);
+        assert_eq!(names(&kept), ["new", "t2", "t1"]);
+        assert_eq!(names(&gone), ["mid", "old"]);
+        // keep 1: only the newest unit stays; the Test run goes whole, none of it half.
+        let (kept, gone) = retained_in_units(dirs, 1, &HashSet::new(), &units);
+        assert_eq!(names(&kept), ["new"]);
+        assert_eq!(names(&gone), ["t2", "mid", "t1", "old"]);
     }
 }

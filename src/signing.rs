@@ -28,6 +28,8 @@ const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 pub const PREDICATE_TYPE: &str = "urn:embarch:predicate:study-run:v1";
 /// The envelope's file name inside a study's results directory.
 pub const RECORD_FILE: &str = "record.dsse.json";
+/// The predicate type of a Test run's own record (decision 144).
+pub const TEST_RUN_PREDICATE_TYPE: &str = "urn:embarch:predicate:test-run:v1";
 /// The first line of the one frame the challenge route signs.
 pub const CHALLENGE_TAG: &str = "embarch-core-auth-v1";
 
@@ -406,6 +408,28 @@ impl Sealer {
     }
 }
 
+impl Sealer {
+    /// Writes a Test run's record to `path`: a DSSE envelope over an in-toto Statement of the
+    /// [`TEST_RUN_PREDICATE_TYPE`] whose subjects are `subjects` (name, sha256) and whose predicate is
+    /// `predicate`, serialised as canonically as a study record is (decision 144).
+    pub fn seal_test_run(&self, path: &Path, subjects: &[(String, String)], predicate: serde_json::Value) -> Result<()> {
+        let statement = serde_json::json!({
+            "_type": STATEMENT_TYPE,
+            "subject": subjects.iter().map(|(n, d)| serde_json::json!({ "name": n, "digest": { "sha256": d } })).collect::<Vec<_>>(),
+            "predicateType": TEST_RUN_PREDICATE_TYPE,
+            "predicate": predicate,
+        });
+        let envelope = serde_json::to_vec(&sign_envelope(&self.key, &serde_json::to_vec(&statement)?))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("partial");
+        std::fs::write(&tmp, envelope).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("failed to finalize {}", path.display()))?;
+        Ok(())
+    }
+}
+
 /// The files a run's record vouches for, by path relative to `dir` with `/`:
 /// `events.json`, `measurements.json` and `study.json` when present, and every
 /// regular file directly under `streams/`. Sorted, so a record is reproducible.
@@ -517,7 +541,7 @@ async fn challenge_handler(
 // ---- tests ------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -541,7 +565,7 @@ mod tests {
 
     /// A DSSE check written from the DSSE v1 text alone, not through this
     /// module's `pae`: the way a third-party verifier would run it.
-    fn standard_dsse_check(envelope: &Envelope, public_key_hex: &str) -> std::result::Result<Vec<u8>, String> {
+    pub(crate) fn standard_dsse_check(envelope: &Envelope, public_key_hex: &str) -> std::result::Result<Vec<u8>, String> {
         let b = base64::engine::general_purpose::STANDARD;
         let payload = b.decode(&envelope.payload).map_err(|e| e.to_string())?;
         let mut signed = Vec::new();

@@ -1,0 +1,118 @@
+//! A Test run's own signed record and its run-log entries (decision 144): the run as it ended, a
+//! finish, a cancel or a deadline, and the run Core's restart left without an end.
+//!
+//! The record is `test-runs/{run_id}.test-run.dsse.json`, a DSSE envelope over an in-toto Statement
+//! of [`crate::signing::TEST_RUN_PREDICATE_TYPE`]. It vouches for `run.json` by its canonical hash
+//! and names each selected test with the hash of each study record it made and its verdict, or why
+//! it has none. The per-test study record is not changed by this (that is `tasks/core/170`).
+
+use serde_json::{json, Value};
+
+use crate::run_log::RunLog;
+use crate::signing::{sha256_of_file, Sealer, RECORD_FILE};
+use crate::smoke_check::SmokeFindings;
+use crate::test_executor::TestResult;
+use embarch_study_designer::hil_expand::RunJson;
+
+/// Why a test the run never reached has no verdict, and why a run Core's restart cut short has none.
+pub const NOT_RUN: &str = "not_run";
+const INTERRUPTED: &str = "interrupted";
+
+/// What the executor knows when the run ends.
+pub struct Ended<'a> {
+    pub status: &'a str,
+    pub reason: Option<&'a str>,
+    pub results: &'a [TestResult],
+    /// What a test with no result says: `not_run`, or `interrupted` for a run Core lost.
+    pub unreached: &'a str,
+    pub smoke: &'a [SmokeFindings],
+    /// The call log's range over the run, in the shape a study record carries it.
+    pub call_log: Option<Value>,
+}
+
+/// The DUT unit the run kept: the first bench's hardware ID.
+fn unit_key(smoke: &[SmokeFindings]) -> Option<&str> {
+    smoke.iter().find_map(|s| s.unit.as_deref())
+}
+
+/// The DUT's image status on `bench`, as the smoke check read it; `None` when the bench was not checked.
+fn dut_image(smoke: &[SmokeFindings], bench: &str) -> Option<String> {
+    let found = smoke.iter().find(|s| s.bench == bench)?.images.iter().find(|i| i.piece == "the DUT")?;
+    serde_json::to_value(&found.status).ok()?["status"].as_str().map(str::to_string)
+}
+
+fn verdict_of(r: &TestResult) -> String {
+    serde_json::to_value(r.judged.verdict).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+/// Signs the run's record and enters its tests and the run in the log. `record` is what the prepare
+/// kept (`run_hash`, `selection`). The log entries are made even when signing fails, with a null
+/// `record_sha256`, so the run is never missing from the log. Returns the record's hash.
+pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &Ended) -> Option<String> {
+    let run_hash = record["run_hash"].as_str().map(str::to_string).unwrap_or_else(|| run.hash());
+    let unit = unit_key(end.smoke);
+    let mut tests = Vec::new();
+    let mut study_ids: Vec<String> = Vec::new();
+    for t in &run.tests {
+        let result = end.results.iter().find(|r| r.test_id == t.test_id);
+        let studies: Vec<Value> = result
+            .map(|r| r.study_ids.iter().map(|id| json!({ "study_id": id, "record_sha256": sha256_of_file(&log.run_dir(id).join(RECORD_FILE)).ok() })).collect())
+            .unwrap_or_default();
+        study_ids.extend(result.into_iter().flat_map(|r| r.study_ids.iter().cloned()));
+        let verdict = result.map(verdict_of);
+        let reason = match result {
+            Some(r) => r.judged.reason.and_then(|x| serde_json::to_value(x).ok()).unwrap_or(Value::Null),
+            None => json!(end.unreached),
+        };
+        tests.push(json!({
+            "test_id": t.test_id, "bench": t.bench.name, "definition_hash": t.definition_hash, "requirements": t.requirements,
+            "verdict": verdict, "reason": reason, "note": result.and_then(|r| r.note.clone()),
+            "dut_image": dut_image(end.smoke, &t.bench.name), "study_records": studies,
+        }));
+    }
+    let ended = crate::study::current_utc_ms();
+    let mut predicate = json!({
+        "schema": 1, "run_id": run.run_id, "status": end.status, "reason": end.reason, "ended_utc_ms": ended,
+        "unit_key": unit, "selection": record["selection"], "tests": tests,
+        "observed": { "core": { "version": env!("CARGO_PKG_VERSION") }, "call_log": end.call_log },
+    });
+    if let Some(r) = &run.resumes {
+        predicate["resumes"] = json!(r);
+    }
+    let path = crate::test_runs::record_path(log.data_dir(), &run.run_id);
+    let mut subjects = vec![("run.json".to_string(), run_hash)];
+    if let Ok(h) = sha256_of_file(&crate::test_runs::result_path(log.data_dir(), &run.run_id)) {
+        subjects.push(("result.json".to_string(), h));
+    }
+    let hash = match sealer.seal_test_run(&path, &subjects, predicate).and_then(|()| sha256_of_file(&path)) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::error!(run_id = run.run_id, "could not sign the Test run's record: {e:#}");
+            None
+        }
+    };
+    for t in &run.tests {
+        let verdict = end.results.iter().find(|r| r.test_id == t.test_id).map(verdict_of);
+        if let Err(e) = log.test_entry(&run.run_id, &t.test_id, &t.definition_hash, &t.requirements, unit, dut_image(end.smoke, &t.bench.name).as_deref(), verdict.as_deref()) {
+            tracing::error!(run_id = run.run_id, test = t.test_id, "could not enter the test in the run log: {e:#}");
+        }
+    }
+    if let Err(e) = log.test_run_entry(&run.run_id, end.status, hash.as_deref(), &study_ids) {
+        tracing::error!(run_id = run.run_id, "could not enter the Test run in the run log: {e:#}");
+    }
+    hash
+}
+
+/// Seals each run Core started and never saw end: the executor died with Core, so what each test did
+/// is not known and none has a verdict (decision 144). Run at start, before the first go.
+pub fn seal_interrupted(sealer: &Sealer, log: &RunLog) {
+    for run_id in crate::test_runs::started_run_ids(log.data_dir()) {
+        if crate::test_runs::result_path(log.data_dir(), &run_id).exists() || crate::test_runs::record_path(log.data_dir(), &run_id).exists() {
+            continue;
+        }
+        let Ok(rec) = crate::test_runs::read_record(log.data_dir(), &run_id) else { continue };
+        let Ok(run) = serde_json::from_value::<RunJson>(rec["run"].clone()) else { continue };
+        let end = Ended { status: INTERRUPTED, reason: Some("Core restarted under the run"), results: &[], unreached: INTERRUPTED, smoke: &[], call_log: None };
+        seal(sealer, log, &rec, &run, &end);
+    }
+}

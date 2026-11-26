@@ -762,6 +762,7 @@ pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<St
     state.test_progress.lock().unwrap().insert(run_id.clone(), progress.clone());
     tokio::task::spawn_blocking(move || {
         let mut env = CoreEnv::new(state.clone(), handle, run_id.clone(), studies, energising);
+        let calls = crate::call_log::RunCalls::begin(&state.call_log);
         let outcome = drive(&run, &mut env, &progress, &Rules::latest(), deadline(&run));
         let body = json!({
             "run_id": run_id, "status": outcome.status, "ended_utc_ms": crate::study::current_utc_ms(),
@@ -772,6 +773,21 @@ pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<St
             tracing::error!(run_id, "could not keep the run's result: {e}");
         }
         let reason = (outcome.status == "deadline").then_some("the run passed its deadline");
+        // The run's own signed record and log entries, whichever way it ended (decision 144).
+        match crate::test_runs::read_record(state.run_log.data_dir(), &run_id) {
+            Ok(rec) => {
+                let end = crate::test_run_record::Ended {
+                    status: outcome.status,
+                    reason,
+                    results: &outcome.results,
+                    unreached: crate::test_run_record::NOT_RUN,
+                    smoke: &outcome.smoke,
+                    call_log: calls.and_then(|c| c.at_end()).map(|(v, _)| v),
+                };
+                crate::test_run_record::seal(&state.sealer, &state.run_log, &rec, &run, &end);
+            }
+            Err(e) => tracing::error!(run_id, "could not read the run's record to sign it: {e:?}"),
+        }
         crate::test_runs::end_run(&state, &run_id, outcome.status, reason, None);
     });
 }
@@ -1302,5 +1318,91 @@ mod tests {
         assert_eq!((got[0].origin, got[0].u, got[0].declared_by, got[0].calibration_undeclared), (Origin::Instrument, 10.0, DeclaredBy::Person, false));
         assert_eq!((got[1].origin, got[1].declared_by, got[1].calibration_undeclared), (Origin::DutReport, DeclaredBy::Agent, true));
         assert_eq!(got[1].evidence.incomplete, [Reason::ParseFailed]);
+    }
+
+    // ---- the run's own record and log entries (decision 144) ----
+
+    use crate::run_log::RunLog;
+    use crate::signing::{Envelope, Sealer};
+
+    fn entries_of(log: &RunLog, kind: &str) -> Vec<Value> {
+        log.lines().unwrap().into_iter().map(|l| l["entry"].clone()).filter(|e| e["type"] == kind).collect()
+    }
+
+    fn sealed(run: &RunJson, o: &RunOutcome, log: &RunLog, sealer: &Sealer) -> (Option<String>, Value) {
+        let rec = json!({ "run_hash": run.hash(), "selection": { "entries": [ { "test_id": "a1", "status": "selected" } ] } });
+        let end = crate::test_run_record::Ended { status: o.status, reason: None, results: &o.results, unreached: crate::test_run_record::NOT_RUN, smoke: &o.smoke, call_log: None };
+        let hash = crate::test_run_record::seal(sealer, log, &rec, run, &end);
+        let env: Envelope = serde_json::from_slice(&std::fs::read(crate::test_runs::record_path(log.data_dir(), &run.run_id)).unwrap()).unwrap();
+        let payload = crate::signing::tests::standard_dsse_check(&env, &sealer.key().public_key_hex()).expect("the record verifies");
+        (hash, serde_json::from_slice(&payload).unwrap())
+    }
+
+    #[test]
+    fn a_run_cancelled_on_its_second_bench_is_signed_with_every_test_a_verdict_or_a_reason() {
+        let log = RunLog::temp();
+        let sealer = Sealer::ephemeral();
+        std::fs::create_dir_all(log.run_dir("st")).unwrap();
+        std::fs::write(log.run_dir("st").join(crate::signing::RECORD_FILE), b"study record").unwrap();
+        let mut run = run_of(&[("A", &["a1"]), ("B", &["b1", "b2"])], vec![test("a1", "A", 1, &[]), test("b1", "B", 1, &[]), test("b2", "B", 1, &[]), test("loose", "A", 1, &[])], false);
+        run.resumes = Some("earlier".into());
+        let mut env = fake(vec![pass()]);
+        env.cancel_after_runs = Some(1);
+        let o = go(&run, &mut env);
+        assert_eq!(o.status, "cancelled");
+        let (hash, st) = sealed(&run, &o, &log, &sealer);
+        assert_eq!(st["predicateType"], crate::signing::TEST_RUN_PREDICATE_TYPE);
+        assert_eq!(st["subject"][0]["name"], "run.json");
+        assert_eq!(st["subject"][0]["digest"]["sha256"], run.hash().as_str());
+        let p = &st["predicate"];
+        assert_eq!((p["status"].as_str(), p["unit_key"].as_str(), p["resumes"].as_str()), (Some("cancelled"), Some("DUT-1"), Some("earlier")));
+        assert_eq!(p["selection"]["entries"][0]["test_id"], "a1");
+        let t = |i: usize| (p["tests"][i]["test_id"].as_str().unwrap(), p["tests"][i]["verdict"].as_str(), p["tests"][i]["reason"].as_str());
+        assert_eq!([t(0), t(1), t(2), t(3)], [("a1", Some("pass"), None), ("b1", Some("cancelled"), None), ("b2", Some("cancelled"), None), ("loose", None, Some("not_run"))]);
+        assert!(p["tests"][1]["note"].as_str().unwrap().contains("cancelled"));
+        assert_eq!(p["tests"][0]["study_records"][0]["study_id"], "st");
+        assert_eq!(p["tests"][0]["study_records"][0]["record_sha256"], crate::signing::sha256_of_file(&log.run_dir("st").join(crate::signing::RECORD_FILE)).unwrap().as_str());
+        assert_eq!(p["tests"][0]["dut_image"], "holds");
+        assert!(p["tests"][1]["dut_image"].is_null(), "bench B was never smoke-checked");
+
+        let tests = entries_of(&log, "test");
+        assert_eq!(tests.len(), 4);
+        assert_eq!(tests[0]["test_id"], "a1");
+        assert_eq!((tests[0]["verdict"].as_str(), tests[0]["unit_key"].as_str(), tests[0]["dut_image"].as_str()), (Some("pass"), Some("DUT-1"), Some("holds")));
+        assert_eq!(tests[0]["definition_hash"], "0".repeat(64).as_str());
+        let whole = entries_of(&log, "test_run");
+        assert_eq!(whole.len(), 1);
+        assert_eq!((whole[0]["record_sha256"].as_str(), whole[0]["status"].as_str()), (hash.as_deref(), Some("cancelled")));
+        assert!(log.verify().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_test_the_run_never_reached_names_not_run_and_a_resumes_less_run_omits_the_key() {
+        let log = RunLog::temp();
+        let sealer = Sealer::ephemeral();
+        let run = run_of(&[("A", &["a1"])], vec![test("a1", "A", 1, &[]), test("orphan", "A", 1, &[])], false);
+        let mut o = go(&run, &mut fake(vec![pass()]));
+        o.results.truncate(1);
+        let (_, st) = sealed(&run, &o, &log, &sealer);
+        assert!(st["predicate"].get("resumes").is_none());
+        assert_eq!((st["predicate"]["tests"][1]["verdict"].is_null(), st["predicate"]["tests"][1]["reason"].as_str()), (true, Some("not_run")));
+        assert!(entries_of(&log, "test")[1]["verdict"].is_null());
+    }
+
+    #[test]
+    fn a_run_core_lost_is_sealed_interrupted_once_with_no_verdicts() {
+        let log = RunLog::temp();
+        let sealer = Sealer::ephemeral();
+        let run = run_of(&[("A", &["a1"])], vec![test("a1", "A", 1, &[])], false);
+        let dir = log.data_dir().join("test-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r1.json"), json!({ "run_id": "r1", "run_hash": run.hash(), "run": run, "selection": null }).to_string()).unwrap();
+        std::fs::write(dir.join("r1.started.json"), "{}").unwrap();
+        crate::test_run_record::seal_interrupted(&sealer, &log);
+        crate::test_run_record::seal_interrupted(&sealer, &log);
+        let env: Envelope = serde_json::from_slice(&std::fs::read(crate::test_runs::record_path(log.data_dir(), "r1")).unwrap()).unwrap();
+        let st: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &sealer.key().public_key_hex()).unwrap()).unwrap();
+        assert_eq!((st["predicate"]["status"].as_str(), st["predicate"]["tests"][0]["reason"].as_str()), (Some("interrupted"), Some("interrupted")));
+        assert_eq!(entries_of(&log, "test_run").len(), 1);
     }
 }
