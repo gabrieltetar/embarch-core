@@ -393,10 +393,11 @@ pub enum StudyEvent {
         delay_before_ms: u32,
     },
     /// A host study's `Prompt` step is waiting for a person (decision 105). Also readable as
-    /// `pending_prompt` on `GET /study/{id}`, because this stream keeps no replay.
+    /// `pending_prompt` on `GET /study/{id}`, because this stream keeps no replay. A Test run's
+    /// prompt kind rides as `prompt_kind` here, since `kind` is this event's own tag (decision 143).
     PromptPending {
         study_id: String,
-        #[serde(flatten)]
+        #[serde(flatten, serialize_with = "flatten_pending_prompt")]
         prompt: crate::host_study::PendingPrompt,
     },
     /// The pending prompt ended: `answer` is `confirmed`, `cancelled`, `timed_out` or
@@ -410,6 +411,20 @@ pub enum StudyEvent {
     },
     /// The job's own `status`/`reason` changed — `"completed"` or `"failed"`.
     StatusChanged { study_id: String, status: String, reason: Option<String> },
+}
+
+/// Flattens a prompt into the `PromptPending` event with its `kind` renamed `prompt_kind`: the
+/// event's tag is `kind`, and two of them on one object lose the tag to any reader that keeps
+/// the last. `GET /study/{id}` serializes the prompt itself and keeps `kind`.
+fn flatten_pending_prompt<S: serde::Serializer>(prompt: &crate::host_study::PendingPrompt, ser: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    let mut value = serde_json::to_value(prompt).map_err(S::Error::custom)?;
+    if let Some(map) = value.as_object_mut() {
+        if let Some(kind) = map.remove("kind") {
+            map.insert("prompt_kind".to_string(), kind);
+        }
+    }
+    serde::Serialize::serialize(&value, ser)
 }
 
 // ---- pure validation (no HTTP, no hardware — unit-testable directly) ------

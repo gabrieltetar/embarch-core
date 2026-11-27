@@ -2198,6 +2198,25 @@ mod tests {
     }
 
     #[test]
+    fn a_test_runs_prompt_event_names_its_kind_as_prompt_kind_and_keeps_one_tag() {
+        let mut pending = slot_with("h1", 4).lock().unwrap().clone().unwrap().pending;
+        // A host study's prompt carries no kind: the event has neither key, as before.
+        let ev = serde_json::to_value(StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() }).unwrap();
+        assert!(ev.get("prompt_kind").is_none(), "{ev}");
+        pending.kind = Some(PromptKind::Observation);
+        let event = StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() };
+        let ev = serde_json::to_value(&event).unwrap();
+        assert_eq!((ev["kind"].as_str(), ev["prompt_kind"].as_str()), (Some("PromptPending"), Some("observation")));
+        // Serialized text has exactly one `"kind"` key, so a parser keeping the last still sees the tag.
+        let text = serde_json::to_string(&event).unwrap();
+        assert_eq!(text.matches("\"kind\":").count(), 1, "{text}");
+        assert!(text.contains("\"kind\":\"PromptPending\""), "{text}");
+        // The status body keeps `kind`.
+        let body = serde_json::to_value(&pending).unwrap();
+        assert_eq!((body["kind"].as_str(), body.get("prompt_kind")), (Some("observation"), None));
+    }
+
+    #[test]
     fn the_event_and_the_status_body_carry_bench_config_flat_only_when_named() {
         let mut pending = slot_with("h1", 4).lock().unwrap().clone().unwrap().pending;
         let ev = serde_json::to_value(StudyEvent::PromptPending { study_id: "h1".into(), prompt: pending.clone() }).unwrap();
