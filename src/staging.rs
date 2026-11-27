@@ -3,11 +3,13 @@
 //! A service Core runs under its own account, so a `firmware_path` it opened
 //! as given would read anything that account can, its signing key included.
 //! [`read`] is the one check every route that takes a path goes through: the
-//! name is resolved component by component under `<data dir>/staging/`, and
-//! a symlink, a hardlink, a junction or any other reparse point, a `..` and
-//! an absolute path outside the folder are each refused before the file is
-//! opened. The bytes are read from the handle that passed the check, so a
-//! link swapped in afterwards is never followed.
+//! name must be one plain file name directly under `<data dir>/staging/`, and
+//! a symlink, a hardlink, a junction or any other reparse point, a nested
+//! name, a `..` and an absolute path outside the folder are each refused. A
+//! nested name is refused because no-follow covers only a path's last
+//! component, and a folder swapped for a link after its check would be
+//! followed; with one component, the bytes are read from the handle that
+//! passed the check, so a link swapped in afterwards is never followed.
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -100,24 +102,18 @@ pub fn read(root: &Path, name: &str) -> Result<Vec<u8>, String> {
     } else {
         given
     };
-    let mut path = root.to_path_buf();
-    let mut parts = relative.components().peekable();
-    if parts.peek().is_none() {
-        return Err(refuse(name, "it names no file"));
-    }
-    while let Some(part) = parts.next() {
-        let Component::Normal(part) = part else {
-            return Err(refuse(name, "only plain names under the staging folder are taken"));
-        };
-        path.push(part);
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("'{name}' cannot be read from the staging folder: {e}"))?;
-        if is_link(&meta) {
-            return Err(refuse(name, "it passes through a link"));
-        }
-        if parts.peek().is_some() && !meta.is_dir() {
-            return Err(refuse(name, "a parent is not a folder"));
-        }
+    let mut parts = relative.components();
+    let (Some(Component::Normal(part)), None) = (parts.next(), parts.next()) else {
+        return Err(refuse(
+            name,
+            "only one plain file name directly under the staging folder is taken (no folders, no `..`)",
+        ));
+    };
+    let path = root.join(part);
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("'{name}' cannot be read from the staging folder: {e}"))?;
+    if is_link(&meta) {
+        return Err(refuse(name, "it is a link"));
     }
     let mut file = open_nofollow(&path)
         .map_err(|e| format!("'{name}' cannot be read from the staging folder: {e}"))?;
@@ -149,7 +145,6 @@ mod tests {
     fn plain_files_inside_are_read() {
         let d = staged();
         assert_eq!(read(d.path(), "app.hex").unwrap(), b"ok");
-        assert_eq!(read(d.path(), "sub/a.bin").unwrap(), b"sub");
         let abs = d.path().join("app.hex");
         assert_eq!(read(d.path(), abs.to_str().unwrap()).unwrap(), b"ok");
     }
@@ -161,6 +156,15 @@ mod tests {
         assert!(read(d.path(), "../x").unwrap_err().contains("refused"));
         assert!(read(d.path(), "sub/../app.hex").unwrap_err().contains("refused"));
         assert!(read(d.path(), outside.path().to_str().unwrap()).unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn nested_names_are_refused() {
+        let d = staged();
+        let nested = d.path().join("sub/a.bin");
+        for name in ["sub/a.bin", "./sub/a.bin", nested.to_str().unwrap()] {
+            assert!(read(d.path(), name).unwrap_err().contains("one plain file name"), "{name}");
+        }
     }
 
     #[test]
@@ -180,7 +184,7 @@ mod tests {
         assert!(read(d.path(), "sym").unwrap_err().contains("link"));
         let other = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(other.path(), d.path().join("dirlink")).unwrap();
-        assert!(read(d.path(), "dirlink/x").unwrap_err().contains("link"));
+        assert!(read(d.path(), "dirlink/x").unwrap_err().contains("refused"));
         std::fs::hard_link(d.path().join("app.hex"), d.path().join("hard")).unwrap();
         assert!(read(d.path(), "hard").unwrap_err().contains("hardlink"));
     }
