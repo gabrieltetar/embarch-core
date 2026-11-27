@@ -26,6 +26,7 @@ mod measurements;
 mod serial;
 mod session_run;
 mod service;
+mod staging;
 mod run_log;
 mod safe_off;
 mod signing;

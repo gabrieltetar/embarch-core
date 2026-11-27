@@ -778,24 +778,42 @@ async fn flash_handler(
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?;
         let base_address = req.base_address.as_deref().map(parse_base_address).transpose()?;
+        // A service Core opens nothing outside its staging folder (decision 160).
+        let staging = (crate::token_store::mode() == "service")
+            .then(|| crate::staging::dir().map_err(internal_err))
+            .transpose()?;
         let manifest_json = match req.manifest_path.as_deref() {
-            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to read manifest_path '{path}': {e}"),
-                )
-            })?),
+            Some(path) => {
+                let read = match &staging {
+                    Some(root) => crate::staging::read(root, path)
+                        .and_then(|b| String::from_utf8(b).map_err(|e| format!("'{path}' is not text: {e}"))),
+                    None => std::fs::read_to_string(path)
+                        .map_err(|e| format!("failed to read manifest_path '{path}': {e}")),
+                };
+                Some(read.map_err(|e| (StatusCode::BAD_REQUEST, e))?)
+            }
             None => None,
+        };
+        let (path, uploaded) = match &staging {
+            Some(root) => {
+                let bytes = crate::staging::read(root, &req.firmware_path)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+                // Flash the bytes that passed the check, never the name again.
+                let mut file = tempfile::NamedTempFile::new().map_err(internal_err)?;
+                std::io::Write::write_all(&mut file, &bytes).map_err(internal_err)?;
+                (file.path().to_path_buf(), Some(file))
+            }
+            None => (PathBuf::from(&req.firmware_path), None),
         };
         FlashArgs {
             chip: req.chip,
-            path: PathBuf::from(req.firmware_path),
+            path,
             format: req.format,
             base_address,
             probe_serial: req.probe_serial,
             erase: req.erase,
             manifest_json,
-            _uploaded: None,
+            _uploaded: uploaded,
         }
     };
 
