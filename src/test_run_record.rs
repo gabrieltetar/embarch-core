@@ -123,7 +123,7 @@ pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &
     let mut predicate = json!({
         "schema": 1, "run_id": run.run_id, "status": end.status, "reason": end.reason, "ended_utc_ms": ended,
         "unit_key": unit, "selection": record["selection"], "tests": tests,
-        "observed": { "core": { "version": env!("CARGO_PKG_VERSION") }, "mode": crate::token_store::mode(), "call_log": end.call_log },
+        "observed": { "core": { "version": env!("CARGO_PKG_VERSION") }, "mode": crate::token_store::mode(), "release": crate::service::current_release(), "call_log": end.call_log },
     });
     if let Some(r) = &run.resumes {
         predicate["resumes"] = json!(r);

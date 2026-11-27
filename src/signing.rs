@@ -372,6 +372,7 @@ impl Sealer {
         let mut observed = serde_json::json!({
             "core": { "version": env!("CARGO_PKG_VERSION") },
             "mode": crate::token_store::mode(),
+            "release": crate::service::current_release(),
             "ports_held": crate::port_hold::held(),
             "probes_held": crate::probe_hold::held(),
             "provenance": provenance,

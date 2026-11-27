@@ -398,7 +398,7 @@ fn test_report_data(state: &AppState, lines: &[Value], held: &Held, run_id: &str
         "go_by": go_by,
         "published_by": publisher.as_str(),
         "statement": FIXED_STATEMENT,
-        "attestation": attestation(person_acted),
+        "attestation": attestation(person_acted, &predicate["observed"]),
         "summary": summary,
         "requirements": requirements,
         "tests": tests,

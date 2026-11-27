@@ -78,6 +78,31 @@ fn check_release_record(record: Option<&str>, sha256: &str, path: &Path) -> Resu
     Ok(())
 }
 
+/// The release record's `{suite_version, manifest_sha256}` when it lists `sha256`, else `None`.
+fn release_of(record: Option<&str>, sha256: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(record?).ok()?;
+    let listed = value["binary_sha256"].as_array()?.iter().any(|h| h.as_str() == Some(sha256));
+    let (suite, manifest) = (value["suite_version"].as_str()?, value["manifest_sha256"].as_str()?);
+    listed.then(|| serde_json::json!({ "suite_version": suite, "manifest_sha256": manifest }))
+}
+
+/// The release this binary was installed from, as the signed record's `observed.release` carries
+/// it: `null` when `<data dir>/installed-release.json` is absent, unreadable or does not list
+/// this binary (a development Core). Read once per process.
+pub fn current_release() -> serde_json::Value {
+    static RELEASE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    RELEASE
+        .get_or_init(|| {
+            let read = || -> Result<Option<serde_json::Value>> {
+                let path = embarch_topology::local_machine_data_dir()?.join(RELEASE_RECORD_FILE);
+                let sha = self_sha256(&std::env::current_exe()?)?;
+                Ok(release_of(std::fs::read_to_string(path).ok().as_deref(), &sha))
+            };
+            read().ok().flatten().unwrap_or(serde_json::Value::Null)
+        })
+        .clone()
+}
+
 fn self_sha256(exe: &Path) -> Result<String> {
     let bytes = std::fs::read(exe)
         .with_context(|| format!("could not read {} to hash it", exe.display()))?;
@@ -674,6 +699,19 @@ pub mod windows {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_of_gives_the_files_two_values_only_when_it_lists_the_binary() {
+        let rec = r#"{"suite_version":"1.2.3","manifest_sha256":"ab","binary_sha256":["aa","bb"]}"#;
+        assert_eq!(
+            super::release_of(Some(rec), "bb"),
+            Some(serde_json::json!({ "suite_version": "1.2.3", "manifest_sha256": "ab" }))
+        );
+        assert_eq!(super::release_of(Some(rec), "cc"), None);
+        assert_eq!(super::release_of(None, "aa"), None);
+        assert_eq!(super::release_of(Some("not json"), "aa"), None);
+        assert_eq!(super::release_of(Some(r#"{"binary_sha256":["aa"]}"#), "aa"), None);
+    }
+
     use super::*;
 
     fn failed(code: i32, msg: &str) -> std::io::Error {

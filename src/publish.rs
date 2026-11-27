@@ -305,14 +305,27 @@ fn count_outcomes(events: &serde_json::Value) -> serde_json::Value {
 }
 
 /// What Core can say of who acted, as one label of the closed list in
-/// `notes/hil/06` that a milestone 1 Core can reach. Every Core is unattested
-/// in milestone 1, so a person's act is never "protected" (decision 119).
-pub(crate) fn attestation(person_acted: bool) -> serde_json::Value {
+/// `notes/hil/06`, and which Core said it: `core_mode` and `release` are copied from the signed
+/// record's `observed` (decision 119). A record with no `release` key predates the field and
+/// keeps the milestone 1 shape. A person's act is never "protected": no attested phase yet.
+pub(crate) fn attestation(person_acted: bool, observed: &serde_json::Value) -> serde_json::Value {
     let label = if person_acted { "person's acts not protected" } else { "agent-scoped only" };
-    serde_json::json!({
-        "label": label, "core_attested": false,
-        "reason": "milestone 1: this Core's key is readable by the agent, so a person's token proves nothing the agent could not have taken",
-    })
+    let Some(release) = observed.get("release") else {
+        return serde_json::json!({
+            "label": label, "core_attested": false,
+            "reason": "this Core's key is readable by the agent, so a person's token proves nothing the agent could not have taken",
+        });
+    };
+    let reason = match (observed["mode"].as_str(), release) {
+        (Some("service"), r) if r.is_object() => format!(
+            "signed by a service Core installed from release {} (manifest {}); attested only where `verify` matches the fingerprint the engineer gave",
+            r["suite_version"].as_str().unwrap_or(""),
+            r["manifest_sha256"].as_str().unwrap_or("")
+        ),
+        (Some("service"), _) => "signed by a service Core whose installed-release record does not list its binary; attested only where `verify` matches the fingerprint the engineer gave".to_string(),
+        _ => "unattested: signed by a development Core, whose key is readable by the agent, so a person's token proves nothing the agent could not have taken".to_string(),
+    };
+    serde_json::json!({ "label": label, "core_mode": observed["mode"], "release": release, "reason": reason })
 }
 
 /// `report-data.json` for the next revision of a study, from what Core holds.
@@ -356,7 +369,7 @@ fn report_data(
         "run_status": if run["clean"] == true { "completed" } else { "step_failed" },
         "steps": counts,
         "subject": { "study_name": events["study_name"], "provenance": events["provenance"] },
-        "attestation": attestation(person_acted),
+        "attestation": attestation(person_acted, &statement["predicate"]["observed"]),
         "go_by": go_by,
         "published_by": publisher.as_str(),
         "adopted": adopted,
@@ -973,6 +986,24 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn the_attestation_copies_the_records_mode_and_release_and_says_why() {
+        let rel = serde_json::json!({ "suite_version": "1.2.3", "manifest_sha256": "ab" });
+        let svc = attestation(false, &serde_json::json!({ "mode": "service", "release": rel }));
+        assert_eq!(svc["core_mode"], "service");
+        assert_eq!(svc["release"], rel);
+        assert!(svc.get("core_attested").is_none());
+        assert!(svc["reason"].as_str().unwrap().contains("service Core installed from release 1.2.3"));
+        let dev = attestation(true, &serde_json::json!({ "mode": "development", "release": null }));
+        assert_eq!(dev["label"], "person's acts not protected");
+        assert_eq!(dev["core_mode"], "development");
+        assert!(dev["release"].is_null());
+        assert!(dev["reason"].as_str().unwrap().starts_with("unattested"));
+        let old = attestation(false, &serde_json::json!({ "mode": "service" }));
+        assert_eq!(old["core_attested"], false);
+        assert!(old.get("core_mode").is_none());
+    }
+
     #[tokio::test]
     async fn a_studys_report_data_carries_a_run_status_and_no_tests_requirements_or_verdicts() {
         let state = AppState::new("agent".to_string());
@@ -982,6 +1013,8 @@ mod tests {
         assert_eq!(rd["run_status"], "step_failed");
         assert_eq!(rd["steps"]["fail"], 1);
         assert_eq!(rd["attestation"]["label"], "agent-scoped only");
+        assert_eq!(rd["attestation"]["core_mode"], "development");
+        assert!(rd["attestation"]["release"].is_null());
         assert_eq!(rd["go_by"], "agent");
         let text = serde_json::to_string(&rd).unwrap();
         for key in ["tests", "requirements", "verdicts"] {
