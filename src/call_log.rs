@@ -17,6 +17,11 @@
 //! is chained at once, the repeats are counted in memory and written as one
 //! `fold` entry when a different call arrives, the lease is released, or Core
 //! stops cleanly. A chained entry is never rewritten.
+//!
+//! **Fail closed (decision 158).** The log is written through a [`Store`]. Core is in the
+//! *cannot-log* state from an append that fails, or from free space below the reserved tail
+//! ([`CallLog::gate`]); the next append that succeeds with room left clears it. In it every gated
+//! route but a cancel answers `503`, and a study in flight starts no new step.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -29,7 +34,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::api::AppState;
@@ -65,6 +70,75 @@ pub const PREVIOUS_NOT_CLEAN: &str = "not a clean stop";
 pub const PREVIOUS_ANEW: &str = "log started anew";
 /// A start entry's `last_images`: the image log lives in memory, so after a start no board's last flasher is known.
 pub const LAST_IMAGES_UNKNOWN: &str = "unknown";
+
+/// The bytes one reserved-tail entry is budgeted (decision 158). Assumed, not measured: a `safe_off`
+/// entry holds one declaration's line, reply and error, well under it.
+pub const ENTRY_RESERVE_BYTES: u64 = 8192;
+/// The one gated route that is served in the cannot-log state: a cancel always runs.
+const CANCEL_ROUTE: (&str, &str) = ("POST", "/study/{study_id}/cancel");
+
+/// Where the log's lines are written and how much room is left, a seam so a test makes a write
+/// fail or the disk full on demand.
+pub trait Store: Send + Sync {
+    /// Appends one line to the file at `path` and makes it durable.
+    fn append(&self, path: &Path, line: &[u8]) -> std::io::Result<()>;
+    /// Bytes free for Core in the folder `dir`, or `None` when that cannot be read.
+    fn free_bytes(&self, dir: &Path) -> Option<u64>;
+}
+
+/// The real file and the real disk.
+pub struct FileStore;
+
+impl Store for FileStore {
+    fn append(&self, path: &Path, line: &[u8]) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        f.write_all(line)?;
+        f.sync_data()
+    }
+
+    #[cfg(unix)]
+    fn free_bytes(&self, dir: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a NUL-terminated path and `v` a zeroed `statvfs` the call fills.
+        (unsafe { libc::statvfs(c.as_ptr(), &mut v) } == 0).then(|| (v.f_bavail as u64).saturating_mul(v.f_frsize as u64))
+    }
+
+    #[cfg(windows)]
+    fn free_bytes(&self, dir: &Path) -> Option<u64> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut free: u64 = 0;
+        // SAFETY: `wide` is NUL-terminated and `free` is a valid out pointer; the other two are optional.
+        let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+        (ok != 0).then_some(free)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn free_bytes(&self, _dir: &Path) -> Option<u64> {
+        None
+    }
+}
+
+/// Why Core cannot log, and whether it is the space check (no entry is tried) or a failed write
+/// (the next entry is the probe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cannot {
+    reason: String,
+    space: bool,
+}
+
+/// What [`CallLog::gate`] says of a new gated call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    Open,
+    /// Core cannot log: `probe` is whether the refusal's own entry is tried, to find out if writes work again.
+    Refused { reason: String, probe: bool },
+}
 
 /// What the graceful stop did before the safe-off, for the `stop` entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -145,6 +219,10 @@ struct Inner {
     /// without re-reading a log that grows with every call.
     chain: Option<(String, u64)>,
     fold: Option<Fold>,
+    /// Set while Core cannot log (decision 158); the next append that succeeds with room left clears it.
+    cannot: Option<Cannot>,
+    /// The reserved tail as last computed, in bytes.
+    reserve: u64,
 }
 
 /// Where a call landed, for the response headers.
@@ -204,12 +282,64 @@ impl RunCalls {
 pub struct CallLog {
     path: PathBuf,
     inner: Arc<StdMutex<Inner>>,
+    store: Arc<dyn Store>,
+    /// How big the reserved tail is, from the declarations; unset, it is a `start` and a `stop` entry.
+    reserve_of: Arc<StdMutex<Option<ReserveFn>>>,
 }
+
+type ReserveFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl CallLog {
     /// A call log in `data_dir`.
     pub fn at(data_dir: PathBuf) -> Self {
-        Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(Inner { chain: None, fold: None })) }
+        Self::with_store(data_dir, Arc::new(FileStore))
+    }
+
+    /// A call log in `data_dir` written through `store`.
+    pub fn with_store(data_dir: PathBuf, store: Arc<dyn Store>) -> Self {
+        let inner = Inner { chain: None, fold: None, cannot: None, reserve: 2 * ENTRY_RESERVE_BYTES };
+        Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(inner)), store, reserve_of: Arc::new(StdMutex::new(None)) }
+    }
+
+    /// Says how big the reserved tail is: room for one entry per declared output's safe-off plus a
+    /// `start` and a `stop` (decision 158). Read again at each [`CallLog::gate`].
+    pub fn set_reserve(&self, f: impl Fn() -> u64 + Send + Sync + 'static) {
+        *self.reserve_of.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    fn reserve_now(&self) -> u64 {
+        let f = self.reserve_of.lock().unwrap().clone();
+        f.map_or(2 * ENTRY_RESERVE_BYTES, |f| f())
+    }
+
+    fn low_space(&self, tail: u64) -> Option<Cannot> {
+        let free = self.store.free_bytes(self.path.parent()?)?;
+        (free < tail).then(|| Cannot { reason: format!("free space {free} B is below the reserved tail {tail} B"), space: true })
+    }
+
+    /// Whether a new gated call may be served (decision 158). Open unless the last append failed
+    /// or free space is below the reserved tail; the space check is made afresh each time, so it
+    /// clears when room returns.
+    pub fn gate(&self) -> Gate {
+        let tail = self.reserve_now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.reserve = tail;
+        if let Some(c) = inner.cannot.clone().filter(|c| !c.space) {
+            return Gate::Refused { reason: c.reason, probe: true };
+        }
+        inner.cannot = self.low_space(tail);
+        match &inner.cannot {
+            None => Gate::Open,
+            Some(c) => Gate::Refused { reason: c.reason.clone(), probe: false },
+        }
+    }
+
+    /// Why Core cannot log now, or `None`: what a study consults before each step.
+    pub fn cannot_log(&self) -> Option<String> {
+        match self.gate() {
+            Gate::Open => None,
+            Gate::Refused { reason, .. } => Some(reason),
+        }
     }
 
     /// The folder the log's file is in, for a test that reopens it as a restarted Core would.
@@ -297,18 +427,26 @@ impl CallLog {
 
     /// Chains `body` onto the head and appends it, with the lock held. A log
     /// that does not verify is not extended: it stays as it is, to be read.
-    fn append(&self, inner: &mut Inner, mut body: serde_json::Value) -> Result<(u64, String)> {
+    fn append(&self, inner: &mut Inner, body: serde_json::Value) -> Result<(u64, String)> {
+        match self.write_entry(inner, body) {
+            Ok(r) => {
+                inner.cannot = self.low_space(inner.reserve);
+                Ok(r)
+            }
+            Err(e) => {
+                inner.cannot = Some(Cannot { reason: format!("{e:#}"), space: false });
+                Err(e)
+            }
+        }
+    }
+
+    fn write_entry(&self, inner: &mut Inner, mut body: serde_json::Value) -> Result<(u64, String)> {
         let (head, len) = self.chain_of(inner)?;
         body["prev"] = head.into();
         body["seq"] = len.into();
         let hash = sha256_hex(&serde_json::to_vec(&body)?);
         let line = serde_json::json!({ "entry": body, "hash": hash });
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
-        f.write_all(format!("{}\n", serde_json::to_string(&line)?).as_bytes())?;
-        f.sync_data()?;
+        self.store.append(&self.path, format!("{}\n", serde_json::to_string(&line)?).as_bytes())?;
         inner.chain = Some((hash.clone(), len + 1));
         Ok((len, hash))
     }
@@ -373,6 +511,18 @@ impl CallLog {
         self.append(&mut inner, body).map(|(seq, _)| seq)
     }
 
+    /// Enters the safe-off Core ran in place of a study's teardown, one `safe_off` entry per result,
+    /// into the reserved tail (decision 158): it does not ask [`CallLog::gate`]. `Err` names the
+    /// first entry that could not be written; the caller says so to the tracing log.
+    pub fn record_safe_off(&self, why: &str, results: &[crate::safe_off::SafeOffResult]) -> Result<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        for r in results {
+            let body = serde_json::json!({ "type": "safe_off", "at_utc_ms": now_ms(), "why": why, "result": r });
+            self.append(&mut inner, body)?;
+        }
+        Ok(results.len())
+    }
+
     /// Enters one call. `entry` carries everything but `prev` and `seq`; `key`
     /// is `Some` for a fold-eligible read and names what makes two reads identical.
     pub(crate) fn record(&self, entry: serde_json::Value, key: Option<String>) -> Result<Stamp> {
@@ -419,6 +569,15 @@ fn is_json(parts: &axum::http::request::Parts) -> bool {
         .is_some_and(|ct| ct.starts_with("application/json"))
 }
 
+/// The `503` of a refused call, naming the call log and why (decision 158).
+fn cannot_log_response(reason: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Core cannot write its call log ({reason}), so it refuses hardware calls until it can; a study's cancel and Core's own safe-off still run"),
+    )
+        .into_response()
+}
+
 fn too_large() -> Response {
     (StatusCode::PAYLOAD_TOO_LARGE, "request body too large for Core to log").into_response()
 }
@@ -448,9 +607,14 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
         .flatten();
     let body_sha256 = sha256_hex(&request_bytes);
 
+    // Fail closed (decision 158): a cancel always runs; every other gated call is refused while Core cannot log.
+    let refused = if (method.as_str(), route.as_str()) == CANCEL_ROUTE { Gate::Open } else { state.call_log.gate() };
     let note = BoardNote::default();
     let req = Request::from_parts(parts, Body::from(request_bytes));
-    let response = NOTE.scope(note.clone(), next.run(req)).await;
+    let response = match &refused {
+        Gate::Open => NOTE.scope(note.clone(), next.run(req)).await,
+        Gate::Refused { reason, .. } => cannot_log_response(reason),
+    };
 
     let (mut rparts, rbody) = response.into_parts();
     let (answer_sha256, answer) = match axum::body::to_bytes(rbody, MAX_BODY_BYTES).await {
@@ -483,6 +647,10 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
         "body_sha256": body_sha256, "body": body_json, "scope": scope, "lease": lease,
         "status": status, "answer_sha256": answer_sha256, "board": board,
     });
+    // A refusal for want of space is not entered: the reserved tail is for the safe-off.
+    if matches!(refused, Gate::Refused { probe: false, .. }) {
+        return Response::from_parts(rparts, Body::from(answer));
+    }
     let recorded = state.call_log.record(entry, key);
     if let Some(chip) = flashed {
         state.images.commit(&chip, scope, recorded.as_ref().ok().map(|s| s.seq));
@@ -498,7 +666,8 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
                 h.insert(REPEAT_HEADER, HeaderValue::from(r));
             }
         }
-        // Today a call is served either way; the fail-closed rule is a later phase (decision 122).
+        // The call has been served (a cancel, or a handler that ran before the write failed); Core is now
+        // in the cannot-log state and refuses the next one (decision 158).
         Err(e) => tracing::error!("could not enter the call in the call log: {e:#}"),
     }
     Response::from_parts(rparts, Body::from(answer))
@@ -870,5 +1039,117 @@ mod tests {
         let e = &entries(&s)[0];
         assert!(e["body"].is_null());
         assert_eq!(e["body_sha256"], sha256_hex(big.as_bytes()));
+    }
+
+    /// A store whose writes fail, and whose free space is set, on demand.
+    struct Flaky {
+        fail: std::sync::atomic::AtomicBool,
+        free: std::sync::atomic::AtomicU64,
+    }
+
+    impl Store for Flaky {
+        fn append(&self, path: &Path, line: &[u8]) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("disk is read-only"));
+            }
+            FileStore.append(path, line)
+        }
+        fn free_bytes(&self, _: &Path) -> Option<u64> {
+            Some(self.free.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    fn flaky() -> (AppState, Arc<Flaky>) {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let s = state();
+        let store = Arc::new(Flaky { fail: AtomicBool::new(false), free: AtomicU64::new(u64::MAX) });
+        let log = CallLog::with_store(s.call_log.path_dir(), store.clone());
+        (AppState { call_log: log, ..s }, store)
+    }
+
+    const NOT_CANCEL: &str = "/reset";
+    const CANCEL: &str = "/study/abc/cancel";
+
+    #[tokio::test]
+    async fn a_failed_write_refuses_every_gated_route_but_a_cancel_and_the_next_good_write_reopens() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (s, store) = flaky();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        let (st, _, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        store.fail.store(true, SeqCst);
+        // This call is served (its handler has run) and its entry fails: Core now cannot log.
+        let (st, _, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(s.call_log.cannot_log().is_some());
+        for (method, path) in crate::lease::LEASE_GATED {
+            if (*method, *path) == CANCEL_ROUTE {
+                continue;
+            }
+            let (st, _, text) = call(&router, TOKEN, method, &uri_of(path), None, Some("{}")).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{method} {path}");
+            assert!(text.contains("call log") && text.contains("disk is read-only"), "{text}");
+        }
+        // A cancel is not refused: it reaches the lease layer, which answers as it always does.
+        let (st, _, _) = call(&router, TOKEN, "POST", CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert_eq!(entries(&s).len(), 1, "nothing was written while it failed");
+        // The writer recovers: the next call's refusal is the probe that is logged, and the one after is served.
+        store.fail.store(false, SeqCst);
+        let (st, _, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(entries(&s).last().unwrap()["status"], 503);
+        let (st, h, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(h.contains_key(SEQ_HEADER), "served and logged");
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_cannot_be_logged_is_still_served() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (s, store) = flaky();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        store.fail.store(true, SeqCst);
+        let (st, h, _) = call(&router, TOKEN, "POST", CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(!h.contains_key(SEQ_HEADER));
+    }
+
+    #[tokio::test]
+    async fn free_space_below_the_reserved_tail_refuses_without_entering_and_the_safe_off_still_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (s, store) = flaky();
+        s.call_log.set_reserve(|| 10_000);
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        store.free.store(9_999, SeqCst);
+        let (st, _, text) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(text.contains("call log") && text.contains("9999 B"), "{text}");
+        assert!(entries(&s).is_empty(), "a refusal for want of space is not entered");
+        let (st, _, _) = call(&router, TOKEN, "POST", CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a cancel is served");
+        let result = crate::safe_off::SafeOffResult { kind: "signal", name: "load".into(), line: Some("off".into()), result: crate::safe_off::SENT, reply: None, error: None };
+        assert_eq!(s.call_log.record_safe_off("test", &[result.clone(), result]).unwrap(), 2);
+        let types: Vec<_> = entries(&s).iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
+        assert_eq!(types, ["call", "safe_off", "safe_off"]);
+        // Room returns: the next call is served and logged.
+        store.free.store(1_000_000, SeqCst);
+        let (st, h, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(h.contains_key(SEQ_HEADER));
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_spent_tail_fails_the_safe_off_entry_and_says_so_to_the_caller() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (s, store) = flaky();
+        store.fail.store(true, SeqCst);
+        let result = crate::safe_off::SafeOffResult { kind: "signal", name: "load".into(), line: None, result: crate::safe_off::NONE_DECLARED, reply: None, error: None };
+        assert!(s.call_log.record_safe_off("test", &[result]).is_err());
     }
 }

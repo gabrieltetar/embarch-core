@@ -501,11 +501,15 @@ async fn serve_bound(
 ) -> anyhow::Result<()> {
     let call_log = state.call_log.clone();
     let mode = token_store::mode();
+    {
+        let bench = bench.clone();
+        call_log.set_reserve(move || safe_off::reserve_bytes(bench.as_ref()));
+    }
 
     let results = safe_off_blocking(&bench).await;
     match call_log.record_start(mode, &results) {
         Ok(seq) => tracing::info!("call log: start entry {seq} written, {} safe-off result(s)", results.len()),
-        // The same rule as a call: today a log that cannot be written is logged and Core serves on (decision 122).
+        // The failed append is also the cannot-log state: Core serves, and refuses every gated call, until a write works (decision 158).
         Err(e) => tracing::error!("could not enter the start in the call log: {e:#}"),
     }
 

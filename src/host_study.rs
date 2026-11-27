@@ -437,6 +437,21 @@ pub trait HostBackend {
     fn prompt(&mut self, req: PromptRequest, cancel: Option<&AtomicBool>) -> PromptRun;
     /// Called once a step has run, so a backend can note what it switched on (decision 138).
     fn stepped(&mut self, _step: &HostStep, _rec: &StepRecord) {}
+    /// Why Core's call log cannot take an entry now, or `None` (decision 158). Asked before every
+    /// step: while it is `Some`, no new step starts.
+    fn cannot_log(&mut self) -> Option<String> {
+        None
+    }
+    /// Core's safe-off, run in place of the teardown that cannot be logged, with what it did
+    /// (decision 158). Called once, with the reason.
+    fn safe_off_instead(&mut self, _why: &str) -> Vec<crate::safe_off::SafeOffResult> {
+        Vec::new()
+    }
+}
+
+/// The stop reason of a study halted because the call log cannot be written.
+fn halted(why: &str) -> String {
+    format!("the call log cannot be written ({why}); no new step was started")
 }
 
 /// One step as the run recorded it: the study-designer result plus what Core saw.
@@ -501,6 +516,9 @@ pub struct RunEnd {
     pub reason: Option<String>,
     /// Teardown steps that did not pass. They never stop the rest of the teardown.
     pub teardown_failures: u32,
+    /// What Core's safe-off did in place of a teardown that could not be logged (decision 158);
+    /// `None` when the teardown ran.
+    pub teardown_replaced: Option<Vec<crate::safe_off::SafeOffResult>>,
     /// One marker per pass that started, in order, on the study clock.
     pub iterations: Vec<IterationMarker>,
     /// When each `Repeat` that started ran, on the study clock.
@@ -871,6 +889,9 @@ fn run_repeat<B: HostBackend>(
         if cancelled() {
             return Some(format!("cancelled before pass {} of '{}'", pass + 1, step.name));
         }
+        if let Some(why) = backend.cannot_log() {
+            return Some(halted(&why));
+        }
         acc.iterations.push(IterationMarker {
             list,
             repeat_index: index,
@@ -882,6 +903,9 @@ fn run_repeat<B: HostBackend>(
         for (j, s) in inner.iter().enumerate() {
             if cancelled() {
                 return Some(format!("cancelled before step '{}'", s.name));
+            }
+            if let Some(why) = backend.cannot_log() {
+                return Some(halted(&why));
             }
             let mut rec = run_step(&substitute(s, &value), list, index, backend, cancel, clock);
             rec.inner_index = Some(j as u32);
@@ -912,6 +936,9 @@ fn walk<B: HostBackend>(
         let i = i as u32;
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             return Some(format!("cancelled before step '{}'", step.name));
+        }
+        if let Some(why) = backend.cannot_log() {
+            return Some(halted(&why));
         }
         if let HostAction::Repeat { count, values, steps: inner } = &step.action {
             let started = clock.now();
@@ -944,7 +971,7 @@ pub fn execute<B: HostBackend>(
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     let mut acc = Acc { iterations: vec![], spans: vec![] };
-    let mut end = RunEnd { completed: true, reason: None, teardown_failures: 0, iterations: vec![], spans: vec![] };
+    let mut end = RunEnd { completed: true, reason: None, teardown_failures: 0, teardown_replaced: None, iterations: vec![], spans: vec![] };
     let main = catch_unwind(AssertUnwindSafe(|| {
         walk(&study.steps, HostList::Steps, backend, Some(cancel), clock, &mut acc, &mut on_step)
     }));
@@ -962,13 +989,20 @@ pub fn execute<B: HostBackend>(
     // Teardown: every step runs, the cancel flag is not consulted, and a failure is recorded
     // and walked past (`continue_on_fail` has no effect here).
     let mut failures = 0u32;
-    walk(&study.teardown, HostList::Teardown, backend, None, clock, &mut acc, &mut |rec: StepRecord| {
+    let stopped = walk(&study.teardown, HostList::Teardown, backend, None, clock, &mut acc, &mut |rec: StepRecord| {
         if !matches!(rec.result.outcome, Outcome::Pass) {
             failures += 1;
         }
         on_step(rec);
     });
     end.teardown_failures = failures;
+    // A teardown step runs only while it can be logged; when it cannot, Core's safe-off runs in
+    // the place of the rest, and the record says so (decision 158).
+    if let Some(why) = stopped {
+        end.teardown_replaced = Some(backend.safe_off_instead(&why));
+        let note = format!("the teardown was replaced by Core's safe-off: {why}");
+        end.reason = Some(end.reason.take().map_or(note.clone(), |r| format!("{r}; {note}")));
+    }
     end.iterations = acc.iterations;
     end.spans = acc.spans;
     end
@@ -1110,10 +1144,11 @@ impl HostEventsWriter {
     pub fn finish(mut self, end: &RunEnd, streams: &[serde_json::Value]) -> anyhow::Result<()> {
         write!(
             self.file,
-            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"streams\":{},\"iterations\":{},\"repeats\":{}}}",
+            "],\"completed\":{},\"stopped_reason\":{},\"teardown_failures\":{},\"teardown_replaced\":{},\"streams\":{},\"iterations\":{},\"repeats\":{}}}",
             end.completed,
             serde_json::to_string(&end.reason)?,
             end.teardown_failures,
+            serde_json::to_string(&end.teardown_replaced)?,
             serde_json::to_string(streams)?,
             serde_json::to_string(&end.iterations)?,
             serde_json::to_string(&end.spans)?
@@ -1444,6 +1479,20 @@ struct CoreBackend {
 }
 
 impl HostBackend for CoreBackend {
+    fn cannot_log(&mut self) -> Option<String> {
+        self.state.call_log.cannot_log()
+    }
+
+    fn safe_off_instead(&mut self, why: &str) -> Vec<crate::safe_off::SafeOffResult> {
+        let _guard = self.handle.block_on(crate::api::acquire_hw_lock(&self.state, "POST /host-studies")).ok();
+        let results = crate::safe_off::run(&crate::safe_off::LiveBench { captures: self.state.captures.clone() });
+        // Into the reserved tail; were it spent, Core has switched off all the same and says so here.
+        if let Err(e) = self.state.call_log.record_safe_off(why, &results) {
+            tracing::error!("the study's safe-off ran but could not be entered in the call log: {e:#}");
+        }
+        results
+    }
+
     fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure> {
         let _guard = self
             .handle
@@ -1841,6 +1890,10 @@ mod tests {
         prompt_answers: VecDeque<AnswerExtra>,
         /// What each `Prompt` asked.
         prompts: Vec<PromptRequest>,
+        /// The call log cannot be written once this many exchanges have run (decision 158).
+        log_closed_after: Option<usize>,
+        /// The reasons Core's safe-off was run in place of the teardown.
+        safe_off_runs: Vec<String>,
     }
 
     struct Port {
@@ -1881,6 +1934,8 @@ mod tests {
                 prompt_ends: VecDeque::new(),
                 prompt_answers: VecDeque::new(),
                 prompts: vec![],
+                log_closed_after: None,
+                safe_off_runs: vec![],
             }
         }
     }
@@ -1889,6 +1944,15 @@ mod tests {
     type InstrumentScript = Result<(&'static str, bool, Option<Ack>), ExchangeFailure>;
 
     impl HostBackend for Script {
+        fn cannot_log(&mut self) -> Option<String> {
+            self.log_closed_after.filter(|n| self.calls >= *n).map(|_| "disk full".to_string())
+        }
+
+        fn safe_off_instead(&mut self, why: &str) -> Vec<crate::safe_off::SafeOffResult> {
+            self.safe_off_runs.push(why.to_string());
+            vec![crate::safe_off::SafeOffResult { kind: "signal", name: "load".into(), line: Some("off".into()), result: crate::safe_off::SENT, reply: None, error: None }]
+        }
+
         fn exchange(&mut self, signal: &str, req: ExchangeRequest) -> Result<ExchangeResponse, ExchangeFailure> {
             (self.before)(self.calls);
             self.calls += 1;
@@ -2422,6 +2486,40 @@ mod tests {
         let (end, recs) = run(&refusing, &mut b, &AtomicBool::new(false));
         assert!(!end.completed);
         assert_eq!(recs[0].detail, detail::REFUSED);
+    }
+
+    #[test]
+    fn a_study_that_cannot_log_starts_no_new_step_and_its_teardown_is_replaced_by_the_safe_off() {
+        let s = study(vec![ex("a", "x", "pd: "), ex("b", "y", "pd: ")], vec![ex("safe", "s", "pd: ")]);
+        let mut b = Script::new(vec![ok_reply("x", "pd: ok"), ok_reply("y", "pd: ok"), ok_reply("s", "pd: ok")]);
+        b.log_closed_after = Some(1);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert_eq!(recs.iter().map(|r| r.result.step_name.as_str()).collect::<Vec<_>>(), ["a"], "'b' and the teardown step never start");
+        assert!(!end.completed);
+        let reason = end.reason.unwrap();
+        assert!(reason.contains("call log cannot be written") && reason.contains("replaced by Core's safe-off"), "{reason}");
+        assert_eq!(end.teardown_replaced.unwrap().len(), 1);
+        assert_eq!(b.safe_off_runs.len(), 1);
+        assert_eq!(b.written, ["x\n"]);
+    }
+
+    #[test]
+    fn a_study_that_can_log_runs_its_teardown_and_records_no_replacement() {
+        let s = study(vec![ex("a", "x", "pd: ")], vec![ex("safe", "s", "pd: ")]);
+        let mut b = Script::new(vec![ok_reply("x", "pd: ok"), ok_reply("s", "pd: ok")]);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert_eq!(recs.len(), 2);
+        assert!(end.teardown_replaced.is_none() && b.safe_off_runs.is_empty());
+    }
+
+    #[test]
+    fn a_log_that_closes_during_the_teardown_replaces_the_rest_of_it() {
+        let s = study(vec![ex("a", "x", "pd: ")], vec![ex("t1", "s1", "pd: "), ex("t2", "s2", "pd: ")]);
+        let mut b = Script::new(vec![ok_reply("x", "pd: ok"), ok_reply("s1", "pd: ok"), ok_reply("s2", "pd: ok")]);
+        b.log_closed_after = Some(2);
+        let (end, recs) = run(&s, &mut b, &AtomicBool::new(false));
+        assert_eq!(recs.iter().map(|r| r.result.step_name.as_str()).collect::<Vec<_>>(), ["a", "t1"]);
+        assert!(end.completed && end.teardown_replaced.is_some());
     }
 
     #[test]

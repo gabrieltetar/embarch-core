@@ -131,6 +131,15 @@ pub fn run(bench: &dyn Bench) -> Vec<SafeOffResult> {
     out
 }
 
+/// The reserved tail of the call log, in bytes (decision 158): room for one entry per declared
+/// output's safe-off plus a `start` and a `stop`. An instrument counts once per line (once if it
+/// has none); a table that cannot be read counts as one entry.
+pub fn reserve_bytes(bench: &dyn Bench) -> u64 {
+    let instruments = bench.instruments().map_or(1, |l| l.iter().map(|i| i.safe_off.len().max(1)).sum::<usize>());
+    let signals = bench.signals().map_or(1, |l| l.len());
+    (instruments + signals + 2) as u64 * crate::call_log::ENTRY_RESERVE_BYTES
+}
+
 /// The real bench: the declared instruments and signals, opened for real.
 pub struct LiveBench {
     pub captures: crate::capture::CaptureRegistry,
