@@ -1377,6 +1377,48 @@ mod tests {
     }
 
     #[test]
+    fn a_tests_study_record_carries_its_verdict_what_it_ran_against_and_run_json_and_still_verifies() {
+        let log = RunLog::temp();
+        let dir = log.run_dir("st");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.json"), json!({ "steps": [
+            { "list": "Steps", "step_name": "look", "prompt_id": 1, "detail": "confirmed", "answered_by": "cli", "answered_scope": "person" },
+            { "list": "Steps", "step_name": "send", "detail": "ok" },
+        ]}).to_string()).unwrap();
+        let plain = Sealer::ephemeral();
+        let job = crate::signing::SealJob { sealer: plain.clone(), kind: "host", build: None, submitted_by: None, calls: None };
+        plain.seal(&job, &dir, "st", 7).unwrap();
+        let before: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&serde_json::from_slice(&std::fs::read(dir.join(crate::signing::RECORD_FILE)).unwrap()).unwrap(), &plain.key().public_key_hex()).unwrap()).unwrap();
+        assert!(before["predicate"].get("test").is_none());
+
+        let run = run_of(&[("A", &["a1"])], vec![test("a1", "A", 1, &[])], false);
+        let o = go(&run, &mut fake(vec![pass()]));
+        let rec = json!({ "run_hash": run.hash(), "selection": null });
+        let end = crate::test_run_record::Ended { status: o.status, reason: None, results: &o.results, unreached: crate::test_run_record::NOT_RUN, smoke: &o.smoke, call_log: None };
+        let hash = crate::test_run_record::seal(&plain, &log, &rec, &run, &end);
+        let env: Envelope = serde_json::from_slice(&std::fs::read(dir.join(crate::signing::RECORD_FILE)).unwrap()).unwrap();
+        let st: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &plain.key().public_key_hex()).expect("the amended record verifies")).unwrap();
+        let names: Vec<&str> = st["subject"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["events.json", "run.json"]);
+        assert_eq!(st["subject"][1]["digest"]["sha256"], run.hash().as_str());
+        // everything else in the Statement is as `seal` wrote it
+        let mut rest = st["predicate"].clone();
+        let t = rest.as_object_mut().unwrap().remove("test").unwrap();
+        assert_eq!(rest, before["predicate"]);
+        assert_eq!((t["test_id"].as_str(), t["verdict"]["verdict"].as_str(), t["run"]["verdict"].as_str(), t["unit_key"].as_str()), (Some("a1"), Some("pass"), Some("pass"), Some("DUT-1")));
+        assert_eq!(t["images"][0]["piece"], "the DUT");
+        assert_eq!(t["images"][0]["status"], "holds");
+        assert!(t["identities"].as_array().unwrap().iter().any(|i| i["piece"] == "the DUT" && i["hardware_id"] == "DUT-1"));
+        assert!(t["instruments"].is_array());
+        assert_eq!(t["prompts"], json!([{ "list": "Steps", "step": "look", "prompt_id": 1, "detail": "confirmed", "answered_by": "cli", "answered_scope": "person" }]));
+        // the run's record names the amended record's hash
+        let run_rec: Envelope = serde_json::from_slice(&std::fs::read(crate::test_runs::record_path(log.data_dir(), "r1")).unwrap()).unwrap();
+        let rp: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&run_rec, &plain.key().public_key_hex()).unwrap()).unwrap();
+        assert_eq!(rp["predicate"]["tests"][0]["study_records"][0]["record_sha256"].as_str(), Some(crate::signing::sha256_of_file(&dir.join(crate::signing::RECORD_FILE)).unwrap().as_str()));
+        assert!(hash.is_some());
+    }
+
+    #[test]
     fn a_test_the_run_never_reached_names_not_run_and_a_resumes_less_run_omits_the_key() {
         let log = RunLog::temp();
         let sealer = Sealer::ephemeral();

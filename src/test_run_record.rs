@@ -12,7 +12,7 @@ use crate::run_log::RunLog;
 use crate::signing::{sha256_of_file, Sealer, RECORD_FILE};
 use crate::smoke_check::SmokeFindings;
 use crate::test_executor::TestResult;
-use embarch_study_designer::hil_expand::RunJson;
+use embarch_study_designer::hil_expand::{RunJson, RunTest};
 
 /// Why a test the run never reached has no verdict, and why a run Core's restart cut short has none.
 pub const NOT_RUN: &str = "not_run";
@@ -41,6 +41,54 @@ fn dut_image(smoke: &[SmokeFindings], bench: &str) -> Option<String> {
     serde_json::to_value(&found.status).ok()?["status"].as_str().map(str::to_string)
 }
 
+/// One judged verdict as a record states it: `{verdict, reason, qualifiers}`.
+fn judged_json(j: &embarch_study_designer::verdicts::Judged) -> Value {
+    json!({ "verdict": j.verdict, "reason": j.reason, "qualifiers": j.qualifiers })
+}
+
+/// The prompts a study asked, from its `events.json`: each step's id, who answered it and with which
+/// token's scope (decision 138). Empty when the study left no events or asked none.
+fn prompt_scopes(dir: &std::path::Path) -> Vec<Value> {
+    let events: Option<Value> = std::fs::read(dir.join("events.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    events
+        .and_then(|e| e["steps"].as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter(|s| s["prompt_id"].is_number())
+        .map(|s| json!({ "list": s["list"], "step": s["step_name"], "prompt_id": s["prompt_id"], "detail": s["detail"], "answered_by": s["answered_by"], "answered_scope": s["answered_scope"] }))
+        .collect()
+}
+
+/// What a study's record says of the test it was run for (decision 145): the run's verdict and the
+/// test's, and what the bench's smoke check found it ran against. `index` is the study's place among
+/// the test's runs. A bench never smoke-checked leaves those fields null.
+fn test_part(run_id: &str, t: &RunTest, result: &TestResult, index: usize, smoke: Option<&SmokeFindings>, prompts: Vec<Value>) -> Value {
+    json!({
+        "run_id": run_id, "test_id": t.test_id, "bench": t.bench.name, "definition_hash": t.definition_hash,
+        "run_index": index + 1, "run_count": t.run_count.max(1),
+        "run": result.runs.get(index).map(judged_json), "verdict": judged_json(&result.judged), "note": result.note,
+        "unit_key": smoke.and_then(|s| s.unit.clone()),
+        "images": smoke.map(|s| &s.images), "identities": smoke.map(|s| &s.identities), "instruments": smoke.map(|s| &s.instruments),
+        "prompts": prompts,
+    })
+}
+
+/// Amends each study record the run's tests made, before the run's own record hashes them. A study
+/// that left no record, or one that cannot be amended, is logged and left as it was.
+fn amend_studies(sealer: &Sealer, log: &RunLog, run: &RunJson, run_hash: &str, end: &Ended) {
+    for t in &run.tests {
+        let Some(result) = end.results.iter().find(|r| r.test_id == t.test_id) else { continue };
+        let smoke = end.smoke.iter().find(|s| s.bench == t.bench.name);
+        for (i, id) in result.study_ids.iter().enumerate() {
+            let dir = log.run_dir(id);
+            let part = test_part(&run.run_id, t, result, i, smoke, prompt_scopes(&dir));
+            if let Err(e) = sealer.amend_for_test(&dir, part, run_hash) {
+                tracing::error!(run_id = run.run_id, study_id = id, "could not amend the study's record with its test: {e:#}");
+            }
+        }
+    }
+}
+
 fn verdict_of(r: &TestResult) -> String {
     serde_json::to_value(r.judged.verdict).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
@@ -51,6 +99,7 @@ fn verdict_of(r: &TestResult) -> String {
 pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &Ended) -> Option<String> {
     let run_hash = record["run_hash"].as_str().map(str::to_string).unwrap_or_else(|| run.hash());
     let unit = unit_key(end.smoke);
+    amend_studies(sealer, log, run, &run_hash, end);
     let mut tests = Vec::new();
     let mut study_ids: Vec<String> = Vec::new();
     for t in &run.tests {

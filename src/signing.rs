@@ -409,6 +409,31 @@ impl Sealer {
 }
 
 impl Sealer {
+    /// Amends the record a study sealed with what its Test run knows (decision 145): the predicate
+    /// gains `test`, and `run.json` (`run_hash`, its canonical hash) joins the subjects, sorted
+    /// among them. Every other byte of the Statement is kept, and the envelope is signed again,
+    /// atomically, so the record verifies as any DSSE v1 envelope. A study outside a Test run is
+    /// never passed here and keeps the record `seal` wrote.
+    pub fn amend_for_test(&self, dir: &Path, test: serde_json::Value, run_hash: &str) -> Result<()> {
+        let path = dir.join(RECORD_FILE);
+        let envelope: Envelope = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?)?;
+        let payload = base64::engine::general_purpose::STANDARD.decode(&envelope.payload).context("the record's payload is not base64")?;
+        let mut statement: serde_json::Value = serde_json::from_slice(&payload)?;
+        let predicate = statement.get_mut("predicate").and_then(|p| p.as_object_mut()).context("the record has no predicate")?;
+        predicate.insert("test".to_string(), test);
+        let subjects = statement.get_mut("subject").and_then(|s| s.as_array_mut()).context("the record has no subjects")?;
+        subjects.retain(|s| s["name"] != "run.json");
+        subjects.push(serde_json::json!({ "name": "run.json", "digest": { "sha256": run_hash } }));
+        subjects.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        let signed = serde_json::to_vec(&sign_envelope(&self.key, &serde_json::to_vec(&statement)?))?;
+        let tmp = dir.join(format!("{RECORD_FILE}.partial"));
+        std::fs::write(&tmp, signed).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("failed to finalize {}", path.display()))?;
+        Ok(())
+    }
+}
+
+impl Sealer {
     /// Writes a Test run's record to `path`: a DSSE envelope over an in-toto Statement of the
     /// [`TEST_RUN_PREDICATE_TYPE`] whose subjects are `subjects` (name, sha256) and whose predicate is
     /// `predicate`, serialised as canonically as a study record is (decision 144).
