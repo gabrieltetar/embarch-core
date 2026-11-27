@@ -457,7 +457,13 @@ impl RunLog {
             return Err(DiscardError::AlreadyDiscarded);
         }
         if scope == Scope::Agent {
-            if self.latest(study_id, "published").map_err(fail)?.is_some() {
+            // A study run of a published Test run is published for this: the Test run's manifest
+            // names its captures (decisions 112, 149).
+            let test_run_published = match self.test_run_units().map_err(fail)?.get(study_id) {
+                Some(run_id) => self.lines().map_err(fail)?.iter().any(|l| l["entry"]["type"] == "published" && l["entry"]["run_id"] == run_id.as_str()),
+                None => false,
+            };
+            if test_run_published || self.latest(study_id, "published").map_err(fail)?.is_some() {
                 return Err(DiscardError::Refused("a published report rests on this run's captures"));
             }
             if run["entry"]["clean"] != true {
@@ -672,6 +678,25 @@ mod tests {
 
     fn entries(log: &RunLog) -> Vec<serde_json::Value> {
         log.lines().unwrap().into_iter().map(|l| l["entry"].clone()).collect()
+    }
+
+    #[test]
+    fn a_study_run_of_a_published_test_run_is_refused_to_the_agent_and_kept_free_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::at(dir.path().to_path_buf());
+        for id in ["a", "b", "c"] {
+            run_with(&log, id, "completed", "Pass");
+        }
+        let rec = |id: &str| serde_json::json!({ "study_id": id, "record_sha256": "x" });
+        log.test_run_entry("run-1", "completed", None, &[rec("a"), rec("b")]).unwrap();
+        log.test_run_entry("run-2", "completed", None, &[rec("c")]).unwrap();
+        // The Test run's published entry carries run_id and no study_id (decision 149).
+        log.append(serde_json::json!({ "type": "published", "run_id": "run-1", "manifest_sha256": "m" })).unwrap();
+        assert!(matches!(log.discard("a", Scope::Agent), Err(DiscardError::Refused(_))));
+        assert!(log.run_dir("a").join("streams/tap.bin").exists());
+        assert!(log.discard("a", Scope::Person).is_ok());
+        assert!(matches!(log.discard("b", Scope::Agent), Err(DiscardError::Refused(_))));
+        assert!(log.discard("c", Scope::Agent).is_ok());
     }
 
     #[test]
