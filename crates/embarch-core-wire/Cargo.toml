@@ -1,0 +1,16 @@
+[package]
+name = "embarch-core-wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The JSON embarch-core serves that a client also reads: the live study event, the dev-bench handshake answer, the outpost load answer and the lease-gated route table. serde, serde_json and the study-designer payload types only; embarch-core/decisions/wire.md has why."
+
+[dependencies]
+# The payloads `StudyEvent` carries (`StepResult`, `Sample`, `GattTranscriptEntry`,
+# `HostStepResult`, `PromptKind`) are that crate's own wire, so this one names them
+# rather than copying them. `alloc` is what its host-study types need.
+embarch-study-designer = { path = "../../../embarch-study-designer", features = ["alloc"] }
+serde = { version = "1.0.228", features = ["derive"] }
+# Only `PromptPending`'s flattening, which renames the prompt's `kind` to
+# `prompt_kind` and has always gone through a `serde_json::Value`.
+serde_json = "1.0.150"

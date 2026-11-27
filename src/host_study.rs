@@ -93,25 +93,7 @@ pub enum PromptAnswer {
     Cancelled,
 }
 
-/// Which surface relayed an answer. Recorded in the step's `answered_by`; never used to decide
-/// anything, since every surface relays the same person.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnsweredBy {
-    Ui,
-    Mcp,
-    Cli,
-}
-
-impl AnsweredBy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AnsweredBy::Ui => "ui",
-            AnsweredBy::Mcp => "mcp",
-            AnsweredBy::Cli => "cli",
-        }
-    }
-}
+pub use embarch_core_wire::{AnsweredBy, PendingPrompt, SwitchedOn};
 
 /// An observation's answer: its value (decision 138).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -184,16 +166,6 @@ pub struct PromptRun {
     pub answer: Option<AnswerExtra>,
 }
 
-/// One output Core last switched on, by the energising step it ran (decision 138).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SwitchedOn {
-    /// The signal or instrument the step addressed.
-    pub target: String,
-    /// The line it sent.
-    pub line: String,
-    pub step: String,
-}
-
 /// What a Test run tells the study it runs (decision 138); empty outside one.
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
@@ -202,41 +174,6 @@ pub struct RunContext {
     pub kinds: BTreeMap<String, PromptKind>,
     /// The steps the crate's `energises` marks, by name, computed at the prepare.
     pub energising: BTreeSet<String>,
-}
-
-/// The prompt a host study is waiting on, as `PromptPending` and `GET /study/{id}` show it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PendingPrompt {
-    /// 1-based within the study. An answer names it, so an answer meant for a prompt that has
-    /// already ended can never be taken for the next one.
-    pub prompt_id: u32,
-    pub list: HostList,
-    /// Position in `list`; for a prompt inside a `Repeat`, the `Repeat`'s position.
-    pub step_index: u32,
-    pub step_name: String,
-    pub text: String,
-    /// The bench configuration the step names, forwarded as the study wrote it (decision 107).
-    /// Core resolves nothing: the surface showing the prompt looks it up in the bench live there,
-    /// and a name that bench lacks is still shown. Absent when the step names none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bench_config: Option<String>,
-    /// The prompt's kind, from the Test run's `run.json` (decision 138); absent outside one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<PromptKind>,
-    /// An `observation`'s declared answer: the choices, or the number and its unit.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observation: Option<ObservationShape>,
-    /// The outputs Core last switched on, from the energising steps it ran, so the surface can
-    /// show them (decision 138). Absent when none, and always outside a Test run.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub switched_on: Vec<SwitchedOn>,
-    pub opened_utc_ms: u64,
-    pub deadline_utc_ms: u64,
-    /// Set only on a device study's session prompt (Start or Done, decision 127): which one, and
-    /// the run fields the Start prompt asks for. Absent on a host study's `Prompt`, so those
-    /// publish the bytes they did.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<crate::session_run::SessionPromptInfo>,
 }
 
 /// The one prompt slot: what is pending and, once a person has answered, the answer, which the
@@ -1540,7 +1477,7 @@ impl HostBackend for CoreBackend {
         let _ = self.state.study_events.send(StudyEvent::PromptResolved {
             study_id: self.study_id.clone(),
             prompt_id: pending.prompt_id,
-            answer: end.answer_str(),
+            answer: end.answer_str().to_string(),
             answered_by: end.answered_by(),
             resolved_utc_ms: now_ms(),
         });
@@ -2240,7 +2177,7 @@ mod tests {
         let ev = serde_json::to_value(StudyEvent::PromptResolved {
             study_id: "h1".into(),
             prompt_id: 4,
-            answer: PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Mcp).answer_str(),
+            answer: PromptEnd::Answered(PromptAnswer::Confirmed, AnsweredBy::Mcp).answer_str().to_string(),
             answered_by: Some(AnsweredBy::Mcp),
             resolved_utc_ms: 9,
         })

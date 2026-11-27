@@ -36,29 +36,7 @@ const DONE_PROMPT_ID: u32 = 2;
 const START_STEP_NAME: &str = "session start";
 const DONE_STEP_NAME: &str = "session done";
 
-/// Which of a session's two prompts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPhase {
-    Start,
-    Done,
-}
-
-/// One run field as a showing surface needs it to draw the form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunFieldInfo {
-    pub name: String,
-    pub label: String,
-    pub required: bool,
-}
-
-/// What a prompt says about itself when it belongs to a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SessionPromptInfo {
-    pub phase: SessionPhase,
-    /// The Start prompt's run fields, in declared order; empty on Done.
-    pub run_fields: Vec<RunFieldInfo>,
-}
+pub use embarch_core_wire::{RunFieldInfo, SessionPhase, SessionPromptInfo};
 
 /// One answered run field as it arrives over HTTP.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -217,7 +195,7 @@ fn resolved(p: &SessionPrompter, prompt_id: u32, answer: &'static str, answered_
     let _ = p.events.send(StudyEvent::PromptResolved {
         study_id: p.study_id.clone(),
         prompt_id,
-        answer,
+        answer: answer.to_string(),
         answered_by,
         resolved_utc_ms: now_ms(),
     });

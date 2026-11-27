@@ -36,6 +36,8 @@
 //! or the five-lies rules below has to be made in both this file and
 //! `embarch-ui/src/trace.rs`.
 
+pub use embarch_core_wire::LoadAnswer;
+use embarch_core_wire::{LoadSubject, LoadSummary};
 use std::collections::HashMap;
 
 use embarch_study_designer::outpost::{self, RecordKind};
@@ -114,63 +116,6 @@ pub struct Gap {
     /// reachable for the capture's first record-carrying frame, which has no
     /// earlier arrival to bound it with.
     pub unbounded_start: bool,
-}
-
-/// One traced subject's share of the capture window — the "load repartition"
-/// [`embarch-ui` decision 10 (trace)](../../../embarch-doc/embarch-ui/decisions/trace-view.md)
-/// defines and this module now also computes. Identical shape and identical
-/// exclusion rules to `embarch-ui/src/trace.rs`'s `LoadSubject`.
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadSubject {
-    pub key: String,
-    pub label: String,
-    pub unnamed: bool,
-    pub kind: &'static str,
-    pub entries: usize,
-    pub measured_spans: usize,
-    pub total_extent: u64,
-    pub share: f64,
-    pub excluded_spans: usize,
-    pub excluded_extent: u64,
-    pub gap_crossing_spans: usize,
-    pub open_ended_spans: usize,
-    pub open_started_spans: usize,
-    pub below_resolution_spans: usize,
-}
-
-/// The whole capture's load repartition, plus the coverage line: how much of
-/// the window is in a state a reader must doubt before trusting the rest.
-/// Identical shape to `embarch-ui/src/trace.rs`'s `LoadSummary`.
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadSummary {
-    pub unit: &'static str,
-    pub window_extent: u64,
-    pub gap_extent: u64,
-    pub gap_fraction: f64,
-    pub records_lost: u64,
-    pub has_time_base: bool,
-    pub thread_extent: u64,
-    pub idle_record_extent: u64,
-    pub isr_extent: u64,
-    pub unaccounted_extent: u64,
-    pub below_resolution_spans: usize,
-    pub subjects: Vec<LoadSubject>,
-}
-
-/// [`LoadSummary`], plus what a caller needs to judge whether this rendered
-/// CSV was read in full.
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadAnswer {
-    pub rows: usize,
-    /// Rows past [`MAX_ROWS`], never silently discarded from this count even
-    /// though they were dropped from the computation.
-    pub rows_dropped_by_cap: usize,
-    pub row_cap: usize,
-    /// Rows this parser refused: a line short of nine fields, or a
-    /// `frame_index` that did not parse. Same meaning as `embarch-ui`'s
-    /// `TraceView::rows_unparsed`.
-    pub rows_unparsed: usize,
-    pub summary: LoadSummary,
 }
 
 fn kind_of(name: &str) -> Option<RecordKind> {
@@ -370,7 +315,7 @@ fn summarize(lanes: &[Lane], gaps: &[Gap], unit: &'static str, t_from: u64, t_to
                 key: lane.key.clone(),
                 label: lane.label.clone(),
                 unnamed: lane.unnamed,
-                kind: lane.kind,
+                kind: lane.kind.to_string(),
                 entries: lane.spans.len(),
                 measured_spans: measured,
                 total_extent,
@@ -393,7 +338,7 @@ fn summarize(lanes: &[Lane], gaps: &[Gap], unit: &'static str, t_from: u64, t_to
     let gap_extent = merged_gap_extent(gaps, t_from, t_to);
 
     LoadSummary {
-        unit,
+        unit: unit.to_string(),
         window_extent,
         gap_extent,
         gap_fraction: share_of(gap_extent),

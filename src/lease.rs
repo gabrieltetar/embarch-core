@@ -621,38 +621,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Every route a live lease gates: a request without the token is refused
-/// `409`. Decision 93 has the reason for each edge case. Paired with
-/// [`LEASE_OPEN`]; a test requires every `AUTH_CASES` row to be in exactly
-/// one of the two, so a new route cannot be added without deciding.
-pub const LEASE_GATED: &[(&str, &str)] = &[
-    ("POST", "/flash"),
-    ("POST", "/reset"),
-    ("POST", "/bootload"),
-    ("PUT", "/bootload/ports"),
-    ("DELETE", "/bootload/ports"),
-    ("GET", "/serial-log"),
-    ("GET", "/dev-bench/hello"),
-    ("POST", "/probes/enroll"),
-    ("DELETE", "/probes/enrolled/{role}"),
-    ("PUT", "/probes/enrolled/{role}/board"),
-    ("DELETE", "/probes/by-serial/{serial}"),
-    ("POST", "/dev-bench/link"),
-    ("POST", "/signals"),
-    ("DELETE", "/signals/{name}"),
-    ("POST", "/signals/{name}/exchange"),
-    ("POST", "/signals/{name}/capture"),
-    ("DELETE", "/signals/{name}/capture"),
-    ("PUT", "/instruments"),
-    ("DELETE", "/instruments/{name}"),
-    ("POST", "/instruments/{name}/exchange"),
-    ("POST", "/live/mem-read"),
-    ("POST", "/live/core-state"),
-    ("POST", "/validate"),
-    ("POST", "/study"),
-    ("POST", "/host-studies"),
-    ("POST", "/study/{study_id}/cancel"),
-];
+pub use embarch_core_wire::LEASE_GATED;
 
 /// Routes a lease never gates: reads that touch no board, the lease's own
 /// routes (they check the token themselves), and reading a capture or a

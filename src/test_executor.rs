@@ -722,7 +722,7 @@ impl Env for CoreEnv {
         let _ = self.state.study_events.send(crate::study::StudyEvent::PromptResolved {
             study_id: self.run_id.clone(),
             prompt_id: pending.prompt_id,
-            answer: end.answer_str(),
+            answer: end.answer_str().to_string(),
             answered_by: match end {
                 PromptEnd::Answered(_, by) => Some(by),
                 _ => None,

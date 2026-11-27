@@ -825,6 +825,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ed25519-dalek",
+ "embarch-core-wire",
  "embarch-smp",
  "embarch-study-designer",
  "embarch-topology",
@@ -851,6 +852,15 @@ dependencies = [
  "windows-service",
  "windows-sys 0.61.2",
  "winreg",
+]
+
+[[package]]
+name = "embarch-core-wire"
+version = "0.1.0"
+dependencies = [
+ "embarch-study-designer",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
