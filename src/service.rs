@@ -369,24 +369,51 @@ fn write_windows_environment(service_name: &str, entries: &[String]) -> Result<(
 /// the crate's to hide or not, not something to paper over here with a
 /// racy is-it-running check.
 pub fn start() -> Result<()> {
-    elevate::ensure_elevated_or_fallback()?;
-
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
-    manager()?
-        .start(ServiceStartCtx { label })
-        .context("failed to start the embarch-core service (is it installed?)")?;
-    Ok(())
+    control(|m| m.start(ServiceStartCtx { label: label.clone() }))
+        .context("failed to start the embarch-core service (is it installed?)")
 }
 
 /// Stop the running background service, leaving it installed.
 pub fn stop() -> Result<()> {
-    elevate::ensure_elevated_or_fallback()?;
-
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
-    manager()?
-        .stop(ServiceStopCtx { label })
-        .context("failed to stop the embarch-core service (is it installed and running?)")?;
-    Ok(())
+    control(|m| m.stop(ServiceStopCtx { label: label.clone() }))
+        .context("failed to stop the embarch-core service (is it installed and running?)")
+}
+
+/// Runs a start or stop against the service manager as this user first
+/// (decision 163). Only a refusal for lack of rights falls through to the
+/// elevation prompt, which then behaves as it always did; any other failure is
+/// returned as it is.
+fn control(op: impl Fn(&dyn ServiceManager) -> std::io::Result<()>) -> Result<()> {
+    let mgr = manager()?;
+    let Err(e) = op(mgr.as_ref()) else {
+        return Ok(());
+    };
+    if elevate::is_elevated() || !is_rights_refusal(&e, cfg!(windows)) {
+        return Err(e.into());
+    }
+    tracing::debug!("service control refused without elevation ({e}); elevating");
+    elevate::ensure_elevated_or_fallback()?;
+    op(mgr.as_ref()).map_err(Into::into)
+}
+
+/// Whether a `service-manager` start/stop error is a refusal for lack of
+/// rights. The crate wraps a failed `sc.exe` or `systemctl` as an
+/// `io::Error` of kind `Other` whose text is `Command failed with exit code
+/// <n>: <stderr>`, so the text is all there is to read.
+fn is_rights_refusal(err: &std::io::Error, windows: bool) -> bool {
+    let text = err.to_string().to_lowercase();
+    if windows {
+        // `sc.exe` exits 5 (ERROR_ACCESS_DENIED) and prints "Access is denied."
+        text.contains("exit code 5:") || text.contains("access is denied")
+    } else {
+        // systemctl without a polkit grant: "Interactive authentication
+        // required." or "Access denied"; a permission error on the bus socket.
+        ["interactive authentication required", "access denied", "permission denied"]
+            .iter()
+            .any(|m| text.contains(m))
+    }
 }
 
 /// Stop and remove the background service.
@@ -648,6 +675,32 @@ pub mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed(code: i32, msg: &str) -> std::io::Error {
+        std::io::Error::other(format!("Command failed with exit code {code}: {msg}"))
+    }
+
+    #[test]
+    fn rights_refusal_windows() {
+        let denied = failed(5, "[SC] OpenService FAILED 5:\n\nAccess is denied.");
+        assert!(is_rights_refusal(&denied, true));
+        assert!(is_rights_refusal(&failed(5, ""), true));
+        // 1060 (not installed) and 1056 (already running) are not rights.
+        assert!(!is_rights_refusal(&failed(1060, "OpenService FAILED 1060"), true));
+        assert!(!is_rights_refusal(&failed(1056, "already running"), true));
+    }
+
+    #[test]
+    fn rights_refusal_systemd() {
+        let polkit = failed(1, "Failed to stop com.embarch.core.service: Interactive authentication required.");
+        assert!(is_rights_refusal(&polkit, false));
+        assert!(is_rights_refusal(&failed(1, "Failed to start x.service: Access denied"), false));
+        assert!(is_rights_refusal(&failed(1, "Permission denied"), false));
+        assert!(!is_rights_refusal(&failed(5, "Unit com.embarch.core.service not loaded."), false));
+        assert!(!is_rights_refusal(&failed(1, "Job failed. See journalctl"), false));
+        // A Windows-shaped refusal is not read as one on Linux.
+        assert!(!is_rights_refusal(&failed(5, "Access is denied."), false));
+    }
 
     #[test]
     fn command_line_quotes_the_exe() {
