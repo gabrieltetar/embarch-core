@@ -59,6 +59,24 @@ pub const FOLDED_READS: &[(&str, &str)] = &[
     ("GET", "/dev-bench/hello"),
 ];
 
+/// What a `start` entry's `previous` says of the run before it (decision 156).
+pub const PREVIOUS_CLEAN: &str = "clean stop";
+pub const PREVIOUS_NOT_CLEAN: &str = "not a clean stop";
+pub const PREVIOUS_ANEW: &str = "log started anew";
+/// A start entry's `last_images`: the image log lives in memory, so after a start no board's last flasher is known.
+pub const LAST_IMAGES_UNKNOWN: &str = "unknown";
+
+/// What the graceful stop did before the safe-off, for the `stop` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StopNote {
+    /// The id of the study or Test run in flight that was cancelled, if one was.
+    pub cancelled_study: Option<String>,
+    /// Whether that study had ended (its teardown run) before the safe-off. `true` when none was in flight.
+    pub study_ended: bool,
+    /// Whether `hw_lock` was still held when the wait for it ran out: the safe-off ran regardless.
+    pub hw_lock_held: bool,
+}
+
 /// The response headers a gated route's answer carries.
 pub const SEQ_HEADER: &str = "x-embarch-call-seq";
 pub const HASH_HEADER: &str = "x-embarch-call-hash";
@@ -194,7 +212,13 @@ impl CallLog {
         Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(Inner { chain: None, fold: None })) }
     }
 
-    fn lines(&self) -> Result<Vec<serde_json::Value>> {
+    /// The folder the log's file is in, for a test that reopens it as a restarted Core would.
+    #[cfg(test)]
+    pub fn path_dir(&self) -> PathBuf {
+        self.path.parent().unwrap().to_path_buf()
+    }
+
+    pub(crate) fn lines(&self) -> Result<Vec<serde_json::Value>> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -310,6 +334,43 @@ impl CallLog {
         if let Err(e) = self.flush_locked(&mut inner) {
             tracing::error!("could not write the call log's fold entry: {e:#}");
         }
+    }
+
+    /// Enters the `start` entry (decision 156): how the log's last run ended, the mode, what
+    /// the safe-off did and that `last_images` is unknown. The previous run ended cleanly
+    /// exactly when the log's last entry is a `stop`; anything else, a fold or a call a kill cut
+    /// off included, is [`PREVIOUS_NOT_CLEAN`].
+    pub fn record_start(&self, mode: &str, safe_off: &[crate::safe_off::SafeOffResult]) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let lines = self.lines()?;
+        let entry_of = |l: &serde_json::Value| l["entry"].clone();
+        let last_stop = lines.iter().rev().map(entry_of).find(|e| e["type"] == "stop");
+        let previous = match lines.last().map(entry_of) {
+            None => PREVIOUS_ANEW,
+            Some(e) if e["type"] == "stop" => PREVIOUS_CLEAN,
+            Some(_) => PREVIOUS_NOT_CLEAN,
+        };
+        let body = serde_json::json!({
+            "type": "start", "at_utc_ms": now_ms(), "mode": mode,
+            "previous": previous,
+            "previous_stop_utc_ms": last_stop.map(|e| e["at_utc_ms"].clone()),
+            "last_images": LAST_IMAGES_UNKNOWN,
+            "safe_off": safe_off,
+        });
+        self.append(&mut inner, body).map(|(seq, _)| seq)
+    }
+
+    /// Enters the `stop` entry (decision 156) after the pending fold: the studies cancelled,
+    /// whether they ended in time, and what the safe-off did.
+    pub fn record_stop(&self, mode: &str, stop: &StopNote, safe_off: &[crate::safe_off::SafeOffResult]) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        self.flush_locked(&mut inner)?;
+        let body = serde_json::json!({
+            "type": "stop", "at_utc_ms": now_ms(), "mode": mode,
+            "cancelled_study": stop.cancelled_study, "study_ended": stop.study_ended,
+            "hw_lock_held": stop.hw_lock_held, "safe_off": safe_off,
+        });
+        self.append(&mut inner, body).map(|(seq, _)| seq)
     }
 
     /// Enters one call. `entry` carries everything but `prev` and `seq`; `key`
