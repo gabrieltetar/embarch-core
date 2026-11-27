@@ -185,6 +185,19 @@ pub const CONFIRMATION_ROUTES: &[(&str, &str)] = &[
 /// a confirmation (decision 135).
 pub const GO_ROUTES: &[(&str, &str)] = &[("POST", "/test-runs/{run_id}/go")];
 
+/// The declarations only the person makes, on every Core (decision 147): the serial and board
+/// revision of a unit, and the person's own name. An agent's serial or name would be the agent's
+/// word for who ran the test.
+pub const DECLARATION_ROUTES: &[(&str, &str)] = &[("PUT", "/units/{unit_key}"), ("PUT", "/person")];
+
+/// The `403` body of a [`DECLARATION_ROUTES`] refusal.
+pub const DECLARATION_REFUSAL: &str = "a unit's serial and the person's name are the person's to declare, on every Core: declare it in embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may read them, never set them";
+
+/// Whether `method` on the registered path pattern `path` is in [`DECLARATION_ROUTES`].
+pub fn is_declaration_route(method: &str, path: &str) -> bool {
+    DECLARATION_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
+}
+
 /// The `403` body of a [`GO_ROUTES`] refusal.
 pub const GO_REFUSAL: &str = "the go is the person's act on every Core: start the run from embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may prepare a run and read its card, never go";
 

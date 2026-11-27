@@ -180,7 +180,7 @@ impl RunLog {
 
     /// Chains `body` onto the head and appends it. Refuses to extend a chain
     /// that does not verify: a broken log stays as it is, for someone to read.
-    fn append(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+    pub(crate) fn append(&self, body: serde_json::Value) -> Result<serde_json::Value> {
         let _w = self.write.lock().unwrap();
         self.append_locked(body)
     }

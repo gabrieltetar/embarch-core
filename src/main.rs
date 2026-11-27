@@ -20,6 +20,7 @@ mod host_study;
 mod lease;
 mod live;
 mod logs;
+mod manual;
 mod measurements;
 mod serial;
 mod session_run;

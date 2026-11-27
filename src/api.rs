@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, publish, run_log, serial, study, test_runs};
+use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, manual, publish, run_log, serial, study, test_runs};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -248,6 +248,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
         .route("/test-runs/{run_id}/go", post(test_runs::go_handler))
         .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
+        .route("/manual-verdicts", post(manual::manual_verdict_handler))
+        .route("/units/{unit_key}", put(manual::put_unit_handler))
+        .route("/units/{unit_key}", get(manual::get_unit_handler))
+        .route("/person", put(manual::put_person_handler))
+        .route("/person", get(manual::get_person_handler))
         .route("/run-log", get(run_log::run_log_handler))
         .route("/study/{study_id}/log", get(run_log::study_log_handler))
         .route("/study/{study_id}/published", post(run_log::publish_handler))
@@ -321,6 +326,10 @@ async fn person_middleware(
         // On every Core, not only an attested one (decision 133).
         if crate::token_store::is_confirmation_route(req.method().as_str(), path) {
             return (StatusCode::FORBIDDEN, crate::token_store::CONFIRMATION_REFUSAL).into_response();
+        }
+        // So are a unit's serial and the person's name (decision 147).
+        if crate::token_store::is_declaration_route(req.method().as_str(), path) {
+            return (StatusCode::FORBIDDEN, crate::token_store::DECLARATION_REFUSAL).into_response();
         }
         // The go is the person's on every Core too (decision 135).
         if crate::token_store::is_go_route(req.method().as_str(), path) {
@@ -3273,6 +3282,11 @@ mod tests {
         ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
         ("POST", "/test-runs/{run_id}/go", "/test-runs/abc/go"),
         ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
+        ("POST", "/manual-verdicts", "/manual-verdicts"),
+        ("PUT", "/units/{unit_key}", "/units/DUT-1"),
+        ("GET", "/units/{unit_key}", "/units/DUT-1"),
+        ("PUT", "/person", "/person"),
+        ("GET", "/person", "/person"),
         ("GET", "/run-log", "/run-log"),
         ("GET", "/study/{study_id}/log", "/study/abc/log"),
         ("POST", "/study/{study_id}/published", "/study/abc/published"),
@@ -3331,7 +3345,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 64;
+    const DOCUMENTED_ROUTE_COUNT: usize = 69;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3574,6 +3588,7 @@ mod tests {
             handler_name.strip_prefix("run_log::"),
             handler_name.strip_prefix("publish::"),
         ) {
+            _ if handler_name.starts_with("manual::") => (include_str!("manual.rs"), &handler_name["manual::".len()..]),
             _ if handler_name.starts_with("confirmations::") => (include_str!("confirmations.rs"), &handler_name["confirmations::".len()..]),
             _ if handler_name.starts_with("test_runs::") => (include_str!("test_runs.rs"), &handler_name["test_runs::".len()..]),
             (Some(stripped), _, _, _) => (include_str!("study.rs"), stripped),
@@ -4218,6 +4233,9 @@ mod tests {
         ("GET", "/test-runs/{run_id}"),
         ("GET", "/test-runs/{run_id}/card"),
         ("POST", "/test-runs/{run_id}/cancel"),
+        ("POST", "/manual-verdicts"),
+        ("GET", "/units/{unit_key}"),
+        ("GET", "/person"),
         ("GET", "/run-log"),
         ("GET", "/study/{study_id}/log"),
         ("POST", "/study/{study_id}/published"),
@@ -4241,9 +4259,9 @@ mod tests {
     /// `AUTH_CASES` row is in exactly one of `PERSON_ROUTES` / `AGENT_ROUTES`.
     #[test]
     fn every_route_is_either_the_persons_or_the_agents() {
-        use crate::token_store::{CONFIRMATION_ROUTES, GO_ROUTES, PERSON_ROUTES};
+        use crate::token_store::{CONFIRMATION_ROUTES, DECLARATION_ROUTES, GO_ROUTES, PERSON_ROUTES};
         for (method, path, _) in AUTH_CASES {
-            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).any(|(m, p)| m == method && p == path);
+            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).any(|(m, p)| m == method && p == path);
             let agent = AGENT_ROUTES.iter().any(|(m, p)| m == method && p == path);
             assert!(
                 person ^ agent,
@@ -4252,7 +4270,7 @@ mod tests {
                  Core takes it only from the person (decision 132)"
             );
         }
-        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(AGENT_ROUTES) {
+        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).chain(AGENT_ROUTES) {
             assert!(
                 AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is in a scope list but is not a registered route"
