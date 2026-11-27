@@ -61,7 +61,7 @@ pub(crate) fn is_sha256_hex(s: &str) -> bool {
 }
 
 /// A zip-relative name: printable ASCII, no `..`, no leading `/`, no `\`.
-fn safe_name(name: &str) -> bool {
+pub(crate) fn safe_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && !name.starts_with('/')
@@ -637,14 +637,8 @@ pub async fn file_handler(
         rdir.join(&name)
     } else {
         let run_dir = state.run_log.run_dir(&study_id);
-        let manifest = std::fs::read(rdir.join(MANIFEST_FILE)).ok();
-        let named = match manifest {
-            Some(bytes) => {
-                let env: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| not_found())?;
-                let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
-                let manifest: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
-                manifest["subject"].as_array().is_some_and(|s| s.iter().any(|x| x["name"] == name.as_str()))
-            }
+        let named = match manifest_names(&rdir, &name)? {
+            Some(named) => named,
             // No manifest yet: only the pending revision, once `report-data` has
             // opened it, serves the run's own files, the ones the manifest will sign.
             None => {
@@ -665,7 +659,22 @@ pub async fn file_handler(
         run_dir.join(&name)
     };
     let bytes = tokio::fs::read(&path).await.map_err(|_| not_found())?;
-    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+    Ok(served(bytes))
+}
+
+/// A revision's file as the bytes Core wrote, the one content type both publish file routes use.
+pub(crate) fn served(bytes: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+}
+
+/// Whether the revision's signed manifest names `name`; `None` when the revision has no manifest
+/// yet (it is pending, or never existed). Shared by a Study's and a Test run's file route.
+pub(crate) fn manifest_names(rdir: &std::path::Path, name: &str) -> Result<Option<bool>, Failure> {
+    let Ok(bytes) = std::fs::read(rdir.join(MANIFEST_FILE)) else { return Ok(None) };
+    let env: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| (StatusCode::NOT_FOUND, "the revision's manifest is unreadable".to_string()))?;
+    let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
+    Ok(Some(manifest["subject"].as_array().is_some_and(|s| s.iter().any(|x| x["name"] == name))))
 }
 
 /// A finished run's own `measurements.json`, byte for byte as Core wrote it as

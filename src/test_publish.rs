@@ -10,6 +10,7 @@
 use axum::{
     extract::{Path as UrlPath, State},
     http::StatusCode,
+    response::Response,
     Json,
 };
 use embarch_study_designer::hil_expand::RunJson;
@@ -20,8 +21,8 @@ use std::path::PathBuf;
 
 use crate::api::AppState;
 use crate::publish::{
-    attestation, call_log_claim, call_log_segment_of, check_api_names, check_files, core_run_files, internal, sha256_hex, sign_manifest, statement_bytes,
-    statement_of, write_file, Failure, Manifest, PublishRequest, REPORT_DATA_ENVELOPE_FILE, REPORT_DATA_FILE, REPORT_DATA_PREDICATE_TYPE,
+    attestation, call_log_claim, call_log_segment_of, check_api_names, check_files, core_run_files, internal, manifest_names, safe_name, served, sha256_hex, sign_manifest, statement_bytes,
+    statement_of, write_file, Failure, Manifest, PublishRequest, PUBLISH_FILES, REPORT_DATA_ENVELOPE_FILE, REPORT_DATA_FILE, REPORT_DATA_PREDICATE_TYPE,
 };
 use crate::signing::sha256_of_file;
 use crate::token_store::Scope;
@@ -410,6 +411,64 @@ pub async fn test_report_data_handler(State(state): State<AppState>, UrlPath(run
     .map_err(internal)?
 }
 
+/// A file of a Test run's revision, by the name the zip gives it, and the same rules as a Study's
+/// (decision 116): one of Core's five publish files, or any file the revision's signed manifest
+/// names; at the pending revision (opened by `report-data`, no manifest yet), the run's own files.
+/// Nothing else is served, and a name that is not a plain relative path is refused before any path
+/// is built. A name the manifest carries that Core did not make (embarch-api's) is `404`, as it is on
+/// a Study.
+// route: GET /test-runs/{run_id}/publish/{revision}/files/{*name}
+pub async fn test_file_handler(
+    State(state): State<AppState>,
+    UrlPath((run_id, revision, name)): UrlPath<(String, u64, String)>,
+) -> Result<Response, Failure> {
+    let not_found = || (StatusCode::NOT_FOUND, format!("revision {revision} of {run_id} has no file {name}"));
+    if !crate::test_runs::is_run_id(&run_id) || !safe_name(&name) {
+        return Err(not_found());
+    }
+    let path = tokio::task::spawn_blocking({
+        let (state, run_id, name) = (state.clone(), run_id.clone(), name.clone());
+        move || -> Result<Option<PathBuf>, Failure> {
+            let rdir = publish_dir(&state, &run_id, revision);
+            if PUBLISH_FILES.contains(&name.as_str()) {
+                return Ok(Some(rdir.join(&name)));
+            }
+            let store = state.run_log.data_dir();
+            let path = match name.as_str() {
+                RUN_FILE => rdir.join(RUN_FILE),
+                RESULT_FILE => crate::test_runs::result_path(store, &run_id),
+                RECORD_NAME => crate::test_runs::record_path(store, &run_id),
+                n => match n.strip_prefix(STUDIES_DIR).and_then(|r| r.strip_prefix('/')).and_then(|r| r.split_once('/')) {
+                    Some((id, rest)) => state.run_log.run_dir(id).join(rest),
+                    None => return Ok(None),
+                },
+            };
+            match manifest_names(&rdir, &name)? {
+                Some(true) => Ok(Some(path)),
+                Some(false) => Ok(None),
+                // No manifest yet: only the pending revision, once `report-data` has opened it,
+                // serves the run's own files, the ones the manifest will sign.
+                None => {
+                    let lines = state.run_log.lines().map_err(internal)?;
+                    if revision != revision_of(&lines, &run_id) || !rdir.join(REPORT_DATA_FILE).is_file() {
+                        return Ok(None);
+                    }
+                    let held = ended_run(&state, &lines, &run_id)?;
+                    let own = match name.strip_prefix(STUDIES_DIR).and_then(|r| r.strip_prefix('/')).and_then(|r| r.split_once('/')) {
+                        Some((id, rest)) => held.study_ids.iter().any(|s| s == id) && core_run_files(&state.run_log.run_dir(id))?.iter().any(|f| f == rest),
+                        None => name != RESULT_FILE || held.result_path.is_some(),
+                    };
+                    Ok(own.then_some(path))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(internal)??;
+    let bytes = tokio::fs::read(path.ok_or_else(not_found)?).await.map_err(|_| not_found())?;
+    Ok(served(bytes))
+}
+
 /// Signs the manifest over every file the Test run and its study runs produced and records the
 /// publish, with the run log's head, in the log.
 // route: POST /test-runs/{run_id}/publish
@@ -709,6 +768,55 @@ mod tests {
         let env: Envelope = serde_json::from_slice(&std::fs::read(publish_dir(&state, RID, 2).join(crate::publish::MANIFEST_FILE)).unwrap()).unwrap();
         let st2: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &state.sealer.key().public_key_hex()).unwrap()).unwrap();
         assert_eq!(st2["predicate"]["supersedes"]["manifest_sha256"], sha256_hex(&env_bytes).as_str());
+    }
+
+    async fn get(state: &AppState, uri: &str) -> (StatusCode, Vec<u8>) {
+        let req = axum::http::Request::builder().method("GET").uri(uri).header("authorization", "Bearer agent").body(axum::body::Body::empty()).unwrap();
+        let r = crate::api::build_router(state.clone()).oneshot(req).await.unwrap();
+        let status = r.status();
+        (status, axum::body::to_bytes(r.into_body(), 1 << 24).await.unwrap().to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_revisions_files_are_served_pending_and_signed_and_nothing_else() {
+        let state = AppState::new("agent".to_string());
+        finished(&state);
+        let url = |r: u64, n: &str| format!("/test-runs/{RID}/publish/{r}/files/{n}");
+        // Before report-data opens the revision, nothing of the run is served.
+        assert_eq!(get(&state, &url(1, "run.json")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, &url(1, "studies/st1/events.json")).await.0, StatusCode::NOT_FOUND);
+        send(&state, "/test-runs/run-1/report-data", "").await;
+        let mut served = Vec::new();
+        for n in ["run.json", "result.json", "test-run.dsse.json", "studies/st1/events.json", "studies/st2/streams/tap.bin", "report-data.json", "report-data.dsse.json"] {
+            let (s, b) = get(&state, &url(1, n)).await;
+            assert_eq!(s, StatusCode::OK, "{n}");
+            served.push((n, sha256_hex(&b)));
+        }
+        assert_eq!(get(&state, &url(1, "studies/st2/streams/tap.bin")).await.1, b"st2");
+        // Not a file of the run, not a study the run did not make, not a path out, not the pending
+        // revision's manifest, not another revision.
+        for n in ["../run-log.jsonl", "studies/st1/../../run-log.jsonl", "studies/st9/events.json", "studies/st1", "studies", "nothing.json", "report.pdf", "manifest.dsse.json", "/etc/passwd"] {
+            assert_eq!(get(&state, &url(1, n)).await.0, StatusCode::NOT_FOUND, "{n}");
+        }
+        assert_eq!(get(&state, &url(2, "run.json")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, "/test-runs/nope/publish/1/files/run.json").await.0, StatusCode::NOT_FOUND);
+        // The bytes are the ones the manifest then signs, and a file embarch-api made is not Core's to serve.
+        let pdf = "cd".repeat(32);
+        let (s, _) = send(&state, "/test-runs/run-1/publish", &format!(r#"{{"files":[{{"name":"report.pdf","sha256":"{pdf}"}}]}}"#)).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, env) = get(&state, &url(1, "manifest.dsse.json")).await;
+        assert_eq!(s, StatusCode::OK);
+        let env: Envelope = serde_json::from_slice(&env).unwrap();
+        let st: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &state.sealer.key().public_key_hex()).unwrap()).unwrap();
+        for (n, sha) in served {
+            let subject = st["subject"].as_array().unwrap().iter().find(|x| x["name"] == n).unwrap();
+            assert_eq!(subject["digest"]["sha256"], sha.as_str(), "{n}");
+            assert_eq!(get(&state, &url(1, n)).await.0, StatusCode::OK, "{n} after the manifest");
+        }
+        assert_eq!(get(&state, &url(1, "report.pdf")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, &url(1, "studies/st9/events.json")).await.0, StatusCode::NOT_FOUND);
+        // Revision 2 is pending but not yet opened.
+        assert_eq!(get(&state, &url(2, "run.json")).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

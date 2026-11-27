@@ -250,6 +250,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
         .route("/test-runs/{run_id}/report-data", post(test_publish::test_report_data_handler))
         .route("/test-runs/{run_id}/publish", post(test_publish::test_publish_handler))
+        .route("/test-runs/{run_id}/publish/{revision}/files/{*name}", get(test_publish::test_file_handler))
         .route("/manual-verdicts", post(manual::manual_verdict_handler))
         .route("/units/{unit_key}", put(manual::put_unit_handler))
         .route("/units/{unit_key}", get(manual::get_unit_handler))
@@ -3286,6 +3287,7 @@ mod tests {
         ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
         ("POST", "/test-runs/{run_id}/report-data", "/test-runs/abc/report-data"),
         ("POST", "/test-runs/{run_id}/publish", "/test-runs/abc/publish"),
+        ("GET", "/test-runs/{run_id}/publish/{revision}/files/{*name}", "/test-runs/abc/publish/1/files/report-data.json"),
         ("POST", "/manual-verdicts", "/manual-verdicts"),
         ("PUT", "/units/{unit_key}", "/units/DUT-1"),
         ("GET", "/units/{unit_key}", "/units/DUT-1"),
@@ -3349,7 +3351,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 71;
+    const DOCUMENTED_ROUTE_COUNT: usize = 72;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -4240,6 +4242,7 @@ mod tests {
         ("POST", "/test-runs/{run_id}/cancel"),
         ("POST", "/test-runs/{run_id}/report-data"),
         ("POST", "/test-runs/{run_id}/publish"),
+        ("GET", "/test-runs/{run_id}/publish/{revision}/files/{*name}"),
         ("POST", "/manual-verdicts"),
         ("GET", "/units/{unit_key}"),
         ("GET", "/person"),
