@@ -20,7 +20,7 @@ pub const STAGING_DIR: &str = "staging";
 
 /// `<data dir>/staging`, the folder the elevated install creates.
 pub fn dir() -> anyhow::Result<PathBuf> {
-    Ok(crate::token_store::local_data_dir()?.join(STAGING_DIR))
+    Ok(embarch_topology::local_machine_data_dir()?.join(STAGING_DIR))
 }
 
 /// Why a name was refused; the text goes to the caller as a `400`.

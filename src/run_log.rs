@@ -2,7 +2,7 @@
 //! and host, plus an entry for each publish and each discard of a run's
 //! captures, every entry carrying the hash of the one before it.
 //!
-//! The log lives beside the token files (`token_store::local_data_dir`) as
+//! The log lives beside the token files (`embarch_topology::local_machine_data_dir`) as
 //! `run-log.jsonl` and **no retention sweep, discard or restart touches it**:
 //! the sweep walks `study_results/`, and a discard deletes a run's capture
 //! files, never a log line. A line is `{"entry": {...}, "hash": "<sha256 hex>"}`

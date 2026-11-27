@@ -1,24 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Resolves the machine-wide local data directory embarch-core owns outright:
-/// `%ProgramData%\embarch` on Windows, `/var/lib/embarch` on Linux/macOS. The
-/// token file below and `study.rs`'s `study_results/<study_id>/` tree both
-/// live under this same root — the one place that convention is decided.
-#[cfg(windows)]
-pub fn local_data_dir() -> Result<PathBuf> {
-    let program_data =
-        std::env::var("ProgramData").context("ProgramData environment variable is not set")?;
-    Ok(PathBuf::from(program_data).join("embarch"))
-}
-
-#[cfg(unix)]
-pub fn local_data_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from("/var/lib/embarch"))
-}
-
 /// Where Core keeps its state, chosen once at start by `run`'s flags
-/// (decision 129). `Legacy` is every path under `local_data_dir()`, as before
+/// (decision 129). `Legacy` is every path under `embarch_topology::local_machine_data_dir()`, as before
 /// the flags existed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreLayout {
@@ -80,7 +64,7 @@ pub fn init_store(layout: StoreLayout) -> Result<()> {
     match &layout {
         StoreLayout::Legacy => {}
         StoreLayout::Service => {
-            require_store(&layout.store_in(local_data_dir()?))?;
+            require_store(&layout.store_in(embarch_topology::local_machine_data_dir()?))?;
         }
         StoreLayout::Development(dir) => {
             std::fs::create_dir_all(dir)
@@ -107,7 +91,7 @@ fn require_store(store: &Path) -> Result<()> {
 }
 
 fn store_dir_of(layout: &StoreLayout) -> Result<PathBuf> {
-    Ok(layout.store_in(local_data_dir()?))
+    Ok(layout.store_in(embarch_topology::local_machine_data_dir()?))
 }
 
 /// Holds `signing-key`, `public-key`, `run-log.jsonl`, `call-log.jsonl`,
@@ -118,12 +102,12 @@ pub fn store_dir() -> Result<PathBuf> {
 
 /// Where the token pair lives.
 pub fn token_dir() -> Result<PathBuf> {
-    Ok(layout().tokens_in(local_data_dir()?))
+    Ok(layout().tokens_in(embarch_topology::local_machine_data_dir()?))
 }
 
 /// The root of `<id>/` run directories (`study_results/`).
 pub fn results_root() -> Result<PathBuf> {
-    Ok(layout().tokens_in(local_data_dir()?).join("study_results"))
+    Ok(layout().tokens_in(embarch_topology::local_machine_data_dir()?).join("study_results"))
 }
 
 /// The agent's token file: `token_dir()/token`. The one file every existing
@@ -505,8 +489,8 @@ mod tests {
     #[test]
     fn this_process_is_legacy_until_a_layout_is_chosen() {
         assert_eq!(layout(), &StoreLayout::Legacy);
-        assert_eq!(store_dir().unwrap(), local_data_dir().unwrap());
-        assert_eq!(results_root().unwrap(), local_data_dir().unwrap().join("study_results"));
+        assert_eq!(store_dir().unwrap(), embarch_topology::local_machine_data_dir().unwrap());
+        assert_eq!(results_root().unwrap(), embarch_topology::local_machine_data_dir().unwrap().join("study_results"));
         assert_eq!(mode(), "development");
     }
 

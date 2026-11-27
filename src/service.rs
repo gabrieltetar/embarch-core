@@ -159,7 +159,7 @@ pub fn install_development() {
 /// binary's hash.
 pub fn install(bind: &str) -> Result<()> {
     let exe = std::env::current_exe().context("could not determine this executable's path")?;
-    let record_path = crate::token_store::local_data_dir()?.join(RELEASE_RECORD_FILE);
+    let record_path = embarch_topology::local_machine_data_dir()?.join(RELEASE_RECORD_FILE);
     check_release_record(
         std::fs::read_to_string(&record_path).ok().as_deref(),
         &self_sha256(&exe)?,

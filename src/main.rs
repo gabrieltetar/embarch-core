@@ -354,7 +354,7 @@ fn main() -> anyhow::Result<()> {
 
 /// Sets up `tracing` to write to both stderr (unchanged from before this
 /// decision) and a daily-rolling file under
-/// `token_store::local_data_dir()?.join("logs")` — `%ProgramData%\embarch\logs`
+/// `embarch_topology::local_machine_data_dir()?.join("logs")` — `%ProgramData%\embarch\logs`
 /// / `/var/lib/embarch/logs` (decision 16),
 /// retaining the last 7 daily files. Runs once, unconditionally, at the very
 /// top of `main`, before `Cli::parse()` or dispatch on the subcommand — so
@@ -437,7 +437,7 @@ where
 /// retention that way, but this crate has only ever had the daily-rolling
 /// file above.
 fn build_log_file_writer() -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
-    let log_dir = token_store::local_data_dir()?.join("logs");
+    let log_dir = embarch_topology::local_machine_data_dir()?.join("logs");
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix(logs::LOG_FILE_PREFIX)

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 pub(crate) const LOG_FILE_PREFIX: &str = "core.log";
 
 pub(crate) fn log_dir() -> Result<PathBuf> {
-    Ok(crate::token_store::local_data_dir()?.join("logs"))
+    Ok(embarch_topology::local_machine_data_dir()?.join("logs"))
 }
 
 /// Picks the lexicographically largest filename among `candidates` that
