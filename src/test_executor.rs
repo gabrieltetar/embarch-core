@@ -368,6 +368,14 @@ pub fn target_of(origin: Option<SignalOrigin>) -> Target {
     }
 }
 
+/// A [`Target`] as `events.json`'s step rows spell it: `dut` or `bench`.
+pub fn target_name(t: Target) -> &'static str {
+    match t {
+        Target::Dut => "dut",
+        Target::Bench => "bench",
+    }
+}
+
 fn walk_steps<'a>(steps: &'a [HostStep], out: &mut BTreeMap<&'a str, &'a HostAction>) {
     for s in steps {
         out.insert(s.name.as_str(), &s.action);
@@ -410,7 +418,13 @@ pub fn judge_steps(study: &HostStudy, kinds: &BTreeMap<String, PromptKind>, even
             let observation = kinds.get(name) == Some(&PromptKind::Observation);
             let outcome = outcome_of(detail, observation)?;
             let target = match action {
-                Some(HostAction::Exchange { signal, .. }) => target_of(origin(signal)),
+                // The row's own `target` is what the study recorded from its one lookup; the
+                // live `origin` serves only a row written without it (decision 155).
+                Some(HostAction::Exchange { signal, .. }) => match s["target"].as_str() {
+                    Some("bench") => Target::Bench,
+                    Some("dut") => Target::Dut,
+                    _ => target_of(origin(signal)),
+                },
                 Some(HostAction::Instrument { .. }) => Target::Bench,
                 _ => Target::Dut,
             };
@@ -1305,6 +1319,31 @@ mod tests {
             ],
             "a step a cancel cut short says nothing"
         );
+    }
+
+    #[test]
+    fn a_refusal_judges_by_the_target_the_row_recorded_not_a_second_lookup() {
+        let study: HostStudy = serde_json::from_value(json!({
+            "name": "s", "steps": [
+                { "name": "dut-line", "timeout_ms": 100, "action": { "Exchange": { "signal": "dut-console", "line": "x", "until": "ok" } } },
+                { "name": "partner-line", "timeout_ms": 100, "action": { "Exchange": { "signal": "partner", "line": "x", "until": "ok" } } }
+            ], "teardown": []
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let events = json!({ "steps": [
+            { "step_name": "dut-line", "signal": "dut-console", "target": "dut", "detail": "refused" },
+            { "step_name": "partner-line", "signal": "partner", "target": "bench", "detail": "refused" },
+        ]});
+        // A topology that has since changed its mind: the recorded targets still stand.
+        let flipped = |s: &str| match s {
+            "dut-console" => Some(SignalOrigin::Board("sn1".into())),
+            _ => Some(SignalOrigin::Role("dut".into())),
+        };
+        let steps = judge_steps(&study, &BTreeMap::new(), &events, &flipped);
+        assert_eq!(steps.iter().map(|s| s.target).collect::<Vec<_>>(), [Target::Dut, Target::Bench]);
+        let rules = Rules::latest();
+        let verdicts: Vec<(Verdict, Option<Reason>)> = steps.iter().map(|s| rules.step_verdict(s.target, s.outcome).map(|j| (j.verdict, j.reason)).unwrap()).collect();
+        assert_eq!(verdicts, [(Verdict::Fail, Some(Reason::StepFailed)), (Verdict::Error, Some(Reason::BenchStepFailed))]);
     }
 
     #[test]

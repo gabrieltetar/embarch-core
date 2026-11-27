@@ -484,6 +484,14 @@ pub struct StepRecord {
     /// An `observation`'s answer, the value it is recorded as (decision 138).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<crate::host_parse::Observed>,
+    /// The signal an `Exchange` step addressed; absent on every other step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// What that signal addressed when the step ended, `dut` or `bench`, from the one origin lookup
+    /// the study made ([`crate::test_executor::target_of`]); absent exactly when `signal` is
+    /// (decision 155).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<&'static str>,
 }
 
 /// How a run ended. `completed` is whether every step ran and none stopped the study.
@@ -671,7 +679,12 @@ fn run_step<B: HostBackend>(
         parsed: None,
         answered_scope: None,
         observed: None,
+        signal: None,
+        target: None,
     };
+    if let HostAction::Exchange { signal, .. } = &step.action {
+        rec.signal = Some(signal.clone());
+    }
     if !delayed {
         rec.result.outcome = fail("cancelled before the step ran");
         rec.detail = detail::CANCELLED;
@@ -1334,7 +1347,12 @@ fn run_job_with_origin<B: HostBackend>(
     let mut write_err: Option<String> = None;
     let mut parses: Vec<crate::host_parse::Collected> = Vec::new();
     let mut observed: Vec<crate::host_parse::CollectedObservation> = Vec::new();
-    let end = execute(study, backend, cancel, clock, |rec| {
+    let end = execute(study, backend, cancel, clock, |mut rec| {
+        // The one lookup of where the signal leaves: `judge_steps` reads this value back, so the
+        // verdict and the record cannot disagree (decision 155).
+        if let Some(signal) = &rec.signal {
+            rec.target = Some(crate::test_executor::target_name(crate::test_executor::target_of(signal_origin(signal))));
+        }
         if let Some(o) = &rec.observed {
             observed.push(crate::host_parse::CollectedObservation {
                 step: rec.result.step_name.clone(),
@@ -3286,6 +3304,29 @@ mod tests {
         let (events, m, subjects) = run_to_disk(&s, &mut Script::new(vec![ok_reply("x", "pd: ok")]), &|_| None);
         assert!(m.is_none() && events["steps"][0].get("parsed").is_none());
         assert!(!subjects.contains(&"measurements.json".to_string()));
+    }
+
+    #[test]
+    fn an_exchange_step_records_the_target_its_signal_was_judged_with_and_other_steps_none() {
+        let s = study(vec![parsing_ex("dut-line", "dut-console", "a"), parsing_ex("partner-line", "partner", "b"), parsing_ex("gone", "undeclared", "c"), wait("w", 1)], vec![]);
+        let mut b = Script::new(vec![vbus_reply("1"), vbus_reply("2"), vbus_reply("3")]);
+        let origin = |n: &str| match n {
+            "dut-console" => Some(SignalOrigin::Role("dut".into())),
+            "partner" => Some(SignalOrigin::Board("0671FF".into())),
+            _ => None,
+        };
+        let (events, _, subjects) = run_to_disk(&s, &mut b, &origin);
+        let rows: Vec<_> = events["steps"].as_array().unwrap().iter().map(|r| (r["signal"].clone(), r["target"].clone())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("dut-console".into(), "dut".into()),
+                ("partner".into(), "bench".into()),
+                ("undeclared".into(), "dut".into()),
+                (serde_json::Value::Null, serde_json::Value::Null)
+            ]
+        );
+        assert!(subjects.contains(&"events.json".to_string()), "events.json is a subject of the signed record");
     }
 
     #[test]
