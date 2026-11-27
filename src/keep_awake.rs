@@ -1,4 +1,4 @@
-//! Keeping the host awake while a Test run holds the lease (decision 151).
+//! Keeping the host awake while a Test run holds the lease (decision 152).
 //!
 //! The OS call sits behind [`KeepAwake`] so the hold and the release are tested without it. A
 //! [`Hold`] takes the hold when made and gives it back when dropped, so every way a run ends -
@@ -30,7 +30,7 @@ impl Drop for Hold<'_> {
 
 /// Windows: `SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`. The state belongs to the calling
 /// thread, so the run's own thread holds and releases it. Not measured: whether it keeps a
-/// service's host awake through an idle timeout (decision 151).
+/// service's host awake through an idle timeout (decision 152).
 #[cfg(windows)]
 pub struct HostKeepAwake;
 

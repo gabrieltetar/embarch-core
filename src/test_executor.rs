@@ -289,7 +289,7 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
 }
 
 /// [`drive`] with the host held awake for the whole run: held at the go, released on every way out
-/// (decision 151).
+/// (decision 152).
 pub fn drive_awake(keeper: &mut dyn crate::keep_awake::KeepAwake, run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules: &Rules, limit: Duration) -> RunOutcome {
     let _hold = crate::keep_awake::Hold::new(keeper);
     drive(run, env, progress, rules, limit)
