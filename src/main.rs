@@ -115,6 +115,11 @@ enum Command {
         /// wsl-host/remote (decision 6's amendment).
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
+        /// Register the service. Without it nothing is registered: a source
+        /// build runs as a development Core. Refuses unless
+        /// `<data dir>/installed-release.json` lists this binary's SHA-256.
+        #[arg(long)]
+        service: bool,
     },
     /// Stop and remove the background OS service.
     Uninstall,
@@ -250,7 +255,10 @@ fn main() -> anyhow::Result<()> {
             }
             build_runtime()?.block_on(run(bind, port))?;
         }
-        Command::Install { bind } => {
+        Command::Install { service: false, .. } => {
+            service::install_development();
+        }
+        Command::Install { bind, service: true } => {
             service::install(&bind)?;
             println!("embarch-core installed and started as a background service, bound to {bind}.");
         }

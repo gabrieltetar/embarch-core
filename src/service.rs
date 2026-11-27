@@ -17,17 +17,160 @@ fn manager() -> Result<Box<dyn ServiceManager>> {
     <dyn ServiceManager>::native().context("could not detect a service manager for this OS")
 }
 
-/// Register embarch-core as a background OS service (pointing back at this
-/// same binary with the `run` subcommand, `--bind` baked into the registered
-/// start command so it survives reboots without anyone having to re-run
-/// this) and start it.
+/// Name of the record the elevated install writes into the data dir, listing
+/// the SHA-256 of every binary a signed release installed (decision 157).
+pub const RELEASE_RECORD_FILE: &str = "installed-release.json";
+
+/// Linux and macOS: the account the service runs under (the elevated install
+/// creates it, decision 157).
+const SERVICE_USER: &str = "embarch";
+
+/// Windows: the virtual account named after the service. `sc config obj=`
+/// sets it after the create; the `sc` backend ignores `username`.
+const WINDOWS_SERVICE_ACCOUNT: &str = "NT SERVICE\\com.embarch.core";
+
+/// The account Core's service runs under, and how it is applied.
+#[derive(Debug, PartialEq, Eq)]
+enum Account {
+    /// Passed as `ServiceInstallCtx.username`.
+    User(&'static str),
+    /// Applied with `sc config <service> obj= <account>` after the create.
+    ScObj(&'static str),
+}
+
+fn account_for(windows: bool) -> Account {
+    if windows {
+        Account::ScObj(WINDOWS_SERVICE_ACCOUNT)
+    } else {
+        Account::User(SERVICE_USER)
+    }
+}
+
+/// `sc config` arguments that put the service under its virtual account.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn account_args(service: &str, account: &str) -> Vec<String> {
+    vec!["config".into(), service.into(), "obj=".into(), account.into()]
+}
+
+/// Refuses unless the record lists `sha256`. `record` is the file's text, or
+/// `None` when it does not exist.
+fn check_release_record(record: Option<&str>, sha256: &str, path: &Path) -> Result<()> {
+    let Some(text) = record else {
+        bail!(
+            "{} does not exist: `install --service` registers only a binary a signed release \
+             installed. A source build runs as a development Core; see `embarch deploy-core`.",
+            path.display()
+        );
+    };
+    let value: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let listed = value["binary_sha256"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|h| h.as_str() == Some(sha256)));
+    if !listed {
+        bail!(
+            "{} does not list this binary (sha256 {sha256}): `install --service` registers only \
+             a binary a signed release installed. A source build runs as a development Core; \
+             see `embarch deploy-core`.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn self_sha256(exe: &Path) -> Result<String> {
+    let bytes = std::fs::read(exe)
+        .with_context(|| format!("could not read {} to hash it", exe.display()))?;
+    Ok(crate::publish::sha256_hex(&bytes))
+}
+
+/// Whether a registration's command text (`ImagePath`, a unit's `ExecStart`,
+/// a launchd plist) starts Core with `--service`.
+fn command_runs_service(text: &str) -> bool {
+    text.replace("<string>", " ")
+        .replace("</string>", " ")
+        .split_whitespace()
+        .any(|t| t.trim_matches('"') == "--service")
+}
+
+/// The registered command text, if the service is registered.
+fn registered_command() -> Option<String> {
+    #[cfg(windows)]
+    {
+        winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+            .open_subkey(format!("SYSTEM\\CurrentControlSet\\Services\\{SERVICE_LABEL}"))
+            .ok()?
+            .get_value::<String, _>("ImagePath")
+            .ok()
+    }
+    #[cfg(not(windows))]
+    {
+        [
+            format!("/etc/systemd/system/{SERVICE_LABEL}.service"),
+            format!("/Library/LaunchDaemons/{SERVICE_LABEL}.plist"),
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    }
+}
+
+/// What `install --service` registers on a service manager that honours
+/// `username`: `run --service --bind <bind>` under Core's own account.
+fn install_ctx(
+    label: ServiceLabel,
+    exe: PathBuf,
+    bind: &str,
+    environment: Option<Vec<(String, String)>>,
+    account: &Account,
+) -> ServiceInstallCtx {
+    ServiceInstallCtx {
+        label,
+        program: exe,
+        args: ["run", "--service", "--bind", bind].map(OsString::from).to_vec(),
+        contents: None,
+        username: match account {
+            Account::User(u) => Some((*u).to_string()),
+            Account::ScObj(_) => None,
+        },
+        working_directory: None,
+        environment,
+        autostart: true,
+        restart_policy: RestartPolicy::OnFailure {
+            delay_secs: Some(RESTART_DELAY_SECS),
+            max_retries: Some(RESTART_RETRIES),
+            reset_after_secs: Some(RESTART_RESET_SECS),
+        },
+    }
+}
+
+/// `install` without `--service`: registers nothing (decision 157).
+pub fn install_development() {
+    println!(
+        "Nothing registered. A source build runs as a development Core \
+         (`embarch-core run --store <dir>`); a service Core comes from a signed release. \
+         To deploy this build for development, use `embarch deploy-core`."
+    );
+}
+
+/// Register a signed release's embarch-core as a background OS service under
+/// Core's own account (`run --service --bind`, `--bind` baked into the
+/// registered command so it survives reboots) and start it. Refuses before
+/// any service-manager call unless `installed-release.json` lists this
+/// binary's hash.
 pub fn install(bind: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("could not determine this executable's path")?;
+    let record_path = crate::token_store::local_data_dir()?.join(RELEASE_RECORD_FILE);
+    check_release_record(
+        std::fs::read_to_string(&record_path).ok().as_deref(),
+        &self_sha256(&exe)?,
+        &record_path,
+    )?;
+
     elevate::ensure_elevated_or_fallback()?;
 
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
     let mgr = manager()?;
-
-    let exe = std::env::current_exe().context("could not determine this executable's path")?;
+    let account = account_for(cfg!(windows));
 
     let explicit_token = std::env::var("EMBARCH_TOKEN").ok();
     if explicit_token.is_none() {
@@ -48,6 +191,7 @@ pub fn install(bind: &str) -> Result<()> {
             kept.join(", ")
         );
         apply_windows_failure_actions(SERVICE_LABEL)?;
+        apply_windows_account(SERVICE_LABEL, &account)?;
         mgr.start(ServiceStartCtx { label })
             .context("service reconfigured, but failed to start")?;
         return Ok(());
@@ -57,21 +201,7 @@ pub fn install(bind: &str) -> Result<()> {
         .clone()
         .map(|token| vec![("EMBARCH_TOKEN".to_string(), token)]);
 
-    mgr.install(ServiceInstallCtx {
-        label: label.clone(),
-        program: exe,
-        args: vec![OsString::from("run"), OsString::from("--bind"), OsString::from(bind)],
-        contents: None,
-        username: None,
-        working_directory: None,
-        environment,
-        autostart: true,
-        restart_policy: RestartPolicy::OnFailure {
-            delay_secs: Some(RESTART_DELAY_SECS),
-            max_retries: Some(RESTART_RETRIES),
-            reset_after_secs: Some(RESTART_RESET_SECS),
-        },
-    })
+    mgr.install(install_ctx(label.clone(), exe, bind, environment, &account))
     .context("failed to install embarch-core as a service")?;
 
     #[cfg(windows)]
@@ -84,6 +214,7 @@ pub fn install(bind: &str) -> Result<()> {
         }
         // `service_manager`'s sc backend ignores `restart_policy` (it warns so).
         apply_windows_failure_actions(SERVICE_LABEL)?;
+        apply_windows_account(SERVICE_LABEL, &account)?;
     }
 
     mgr.start(ServiceStartCtx { label })
@@ -97,10 +228,10 @@ const RESTART_RETRIES: u32 = 5;
 const RESTART_RESET_SECS: u32 = 3600;
 
 /// The service's command line as SCM stores it in `ImagePath`: the exe path
-/// quoted (it may hold spaces), then `run --bind <bind>`.
+/// quoted (it may hold spaces), then `run --service --bind <bind>`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_command_line(exe: &Path, bind: &str) -> String {
-    format!("\"{}\" run --bind {}", exe.display(), bind)
+    format!("\"{}\" run --service --bind {}", exe.display(), bind)
 }
 
 /// Merges an existing `Environment` value with an explicit token: every
@@ -184,6 +315,19 @@ fn rewrite_windows_registration(
         write_windows_environment(service_name, &merged)?;
     }
     Ok(environment_names(&merged))
+}
+
+#[cfg(windows)]
+fn apply_windows_account(service_name: &str, account: &Account) -> Result<()> {
+    let Account::ScObj(obj) = account else { return Ok(()) };
+    let out = std::process::Command::new("sc.exe")
+        .args(account_args(service_name, obj))
+        .output()
+        .context("could not run sc.exe config")?;
+    if !out.status.success() {
+        bail!("sc config obj= failed: {}", String::from_utf8_lossy(&out.stdout).trim());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -293,6 +437,12 @@ pub fn update(new_exe: &Path) -> Result<()> {
 
     if !new_exe.is_file() {
         bail!("new binary not found: {}", new_exe.display());
+    }
+    if registered_command().is_some_and(|c| command_runs_service(&c)) {
+        bail!(
+            "the registered service runs `--service`: a signed release replaces it through \
+             the elevated install, not `update`"
+        );
     }
 
     let label: ServiceLabel = SERVICE_LABEL.parse().context("invalid service label")?;
@@ -502,7 +652,7 @@ mod tests {
     #[test]
     fn command_line_quotes_the_exe() {
         let c = windows_command_line(Path::new("C:\\Program Files\\e.exe"), "0.0.0.0");
-        assert_eq!(c, "\"C:\\Program Files\\e.exe\" run --bind 0.0.0.0");
+        assert_eq!(c, "\"C:\\Program Files\\e.exe\" run --service --bind 0.0.0.0");
     }
 
     #[test]
@@ -519,5 +669,51 @@ mod tests {
         let a = failure_args("x");
         assert_eq!(a[3], "3600");
         assert_eq!(a[5].matches("restart/5000").count(), 5);
+    }
+
+    const SHA: &str = "ab";
+
+    #[test]
+    fn install_refuses_without_a_record_or_a_listed_hash() {
+        let p = Path::new("/var/lib/embarch/installed-release.json");
+        let e = check_release_record(None, SHA, p).unwrap_err().to_string();
+        assert!(e.contains("does not exist") && e.contains("embarch deploy-core"), "{e}");
+        let other = r#"{"binary_sha256":["cd"]}"#;
+        let e = check_release_record(Some(other), SHA, p).unwrap_err().to_string();
+        assert!(e.contains("does not list this binary"), "{e}");
+        assert!(check_release_record(Some("not json"), SHA, p).is_err());
+        assert!(check_release_record(Some(r#"{}"#), SHA, p).is_err());
+    }
+
+    #[test]
+    fn install_accepts_a_listed_hash() {
+        let p = Path::new("r.json");
+        let rec = r#"{"binary_sha256":["cd","ab"]}"#;
+        check_release_record(Some(rec), SHA, p).unwrap();
+    }
+
+    #[test]
+    fn registration_runs_service_under_cores_own_account() {
+        let label: ServiceLabel = SERVICE_LABEL.parse().unwrap();
+        let linux = install_ctx(label.clone(), "/x/e".into(), "0.0.0.0", None, &account_for(false));
+        assert_eq!(linux.args, ["run", "--service", "--bind", "0.0.0.0"].map(OsString::from));
+        assert_eq!(linux.username.as_deref(), Some("embarch"));
+        let win = install_ctx(label, "C:\\e.exe".into(), "127.0.0.1", None, &account_for(true));
+        assert_eq!(win.args, ["run", "--service", "--bind", "127.0.0.1"].map(OsString::from));
+        assert_eq!(win.username, None);
+        assert_eq!(account_for(true), Account::ScObj("NT SERVICE\\com.embarch.core"));
+        assert_eq!(
+            account_args(SERVICE_LABEL, WINDOWS_SERVICE_ACCOUNT),
+            ["config", "com.embarch.core", "obj=", "NT SERVICE\\com.embarch.core"]
+        );
+    }
+
+    #[test]
+    fn update_recognises_a_service_registration() {
+        assert!(command_runs_service("\"C:\\e.exe\" run --service --bind 127.0.0.1"));
+        assert!(command_runs_service("ExecStart=/usr/bin/e run --service --bind x"));
+        assert!(command_runs_service("<string>--service</string>"));
+        assert!(!command_runs_service("\"C:\\e.exe\" run --bind 127.0.0.1"));
+        assert!(!command_runs_service("ExecStart=/usr/bin/e run --bind x --store /a/--service-dir"));
     }
 }
