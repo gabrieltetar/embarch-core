@@ -14,6 +14,7 @@ mod exchange;
 mod flash_backend;
 mod hardware;
 mod instrument;
+mod keep_awake;
 mod host_counts;
 mod host_parse;
 mod host_study;

@@ -288,6 +288,13 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
     RunOutcome { status, results, smoke }
 }
 
+/// [`drive`] with the host held awake for the whole run: held at the go, released on every way out
+/// (decision 151).
+pub fn drive_awake(keeper: &mut dyn crate::keep_awake::KeepAwake, run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules: &Rules, limit: Duration) -> RunOutcome {
+    let _hold = crate::keep_awake::Hold::new(keeper);
+    drive(run, env, progress, rules, limit)
+}
+
 /// One test: its precondition once, then `run_count` runs, each judged; the test is the worst run.
 #[allow(clippy::too_many_arguments)]
 fn run_test(test: &RunTest, bench: &RunBench, env: &mut dyn Env, rules: &Rules, started: Instant, limit: Duration, ended: &mut Option<&'static str>) -> TestResult {
@@ -763,7 +770,7 @@ pub fn spawn(state: AppState, run_id: String, run: RunJson, studies: BTreeMap<St
     tokio::task::spawn_blocking(move || {
         let mut env = CoreEnv::new(state.clone(), handle, run_id.clone(), studies, energising);
         let calls = crate::call_log::RunCalls::begin(&state.call_log);
-        let outcome = drive(&run, &mut env, &progress, &Rules::latest(), deadline(&run));
+        let outcome = drive_awake(&mut crate::keep_awake::HostKeepAwake, &run, &mut env, &progress, &Rules::latest(), deadline(&run));
         let body = json!({
             "run_id": run_id, "status": outcome.status, "ended_utc_ms": crate::study::current_utc_ms(),
             "results": outcome.results.iter().map(TestResult::to_json).collect::<Vec<_>>(),
@@ -1157,6 +1164,54 @@ mod tests {
         assert_eq!(verdicts(&o)[0].1, Verdict::Error);
         assert!(o.results[0].note.as_deref().unwrap().contains("not declared"));
         assert_eq!(verdicts(&o)[1], ("t2".into(), Verdict::Skipped, Some(Reason::StoppedByError)));
+    }
+
+    fn awake(env: &mut Fake, run: &RunJson) -> (Vec<&'static str>, RunOutcome) {
+        let rec = crate::keep_awake::testing::Recorder::default();
+        let o = drive_awake(&mut rec.clone(), run, env, &Mutex::new(Progress::default()), &Rules::latest(), Duration::from_secs(60));
+        let seen = rec.0.lock().unwrap().clone();
+        (seen, o)
+    }
+
+    #[test]
+    fn a_run_holds_the_host_awake_once_and_releases_it_when_it_completes() {
+        let run = run_of(&[("A", &["t1"])], vec![test("t1", "A", 1, &[])], false);
+        let (seen, o) = awake(&mut fake(vec![pass()]), &run);
+        assert_eq!(o.status, "completed");
+        assert_eq!(seen, ["hold", "release"]);
+    }
+
+    #[test]
+    fn a_cancelled_run_releases_the_hold() {
+        let run = run_of(&[("A", &["t1", "t2"])], vec![test("t1", "A", 1, &[]), test("t2", "A", 1, &[])], false);
+        let mut env = fake(vec![pass()]);
+        env.cancel_after_runs = Some(1);
+        let (seen, o) = awake(&mut env, &run);
+        assert_eq!(o.status, "cancelled");
+        assert_eq!(seen, ["hold", "release"]);
+    }
+
+    #[test]
+    fn a_run_with_an_error_releases_the_hold() {
+        let run = run_of(&[("A", &["t1"])], vec![test("t1", "A", 1, &[])], false);
+        let mut env = fake(vec![StudyRun { steps: vec![], measurements: vec![], cancelled: false, aborted: Some("a signal is not declared".into()), study_id: None }]);
+        let (seen, o) = awake(&mut env, &run);
+        assert_eq!(o.results[0].judged.verdict, Verdict::Error);
+        assert_eq!(seen, ["hold", "release"]);
+    }
+
+    #[test]
+    fn a_run_that_panics_releases_the_hold() {
+        let run = run_of(&[("A", &["t1"])], vec![test("t1", "A", 1, &[])], false);
+        let rec = crate::keep_awake::testing::Recorder::default();
+        let mut keeper = rec.clone();
+        // No scripted study run: the fake panics inside the drive.
+        let mut env = fake(vec![]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_awake(&mut keeper, &run, &mut env, &Mutex::new(Progress::default()), &Rules::latest(), Duration::from_secs(60))
+        }));
+        assert!(r.is_err());
+        assert_eq!(*rec.0.lock().unwrap(), ["hold", "release"]);
     }
 
     #[test]
