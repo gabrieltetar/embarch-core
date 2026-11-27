@@ -100,6 +100,7 @@ pub fn declared_targets() -> Vec<(String, u32)> {
 
 /// Makes `owner` a holder and opens every declared port not already held.
 pub fn acquire(owner: Owner) {
+    crate::probe_hold::acquire(owner);
     acquire_with(owner, declared_targets());
 }
 
@@ -124,6 +125,7 @@ pub fn acquire_with(owner: Owner, targets: Vec<(String, u32)>) {
 
 /// Ends `owner`'s hold; the ports close when no owner is left.
 pub fn release(owner: Owner) {
+    crate::probe_hold::release(owner);
     with_state(|st| {
         if st.owners.remove(&owner) && st.owners.is_empty() {
             let n = st.ports.len();

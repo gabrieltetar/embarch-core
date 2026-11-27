@@ -33,6 +33,7 @@ mod outpost_load;
 mod outpost_manifest;
 mod outpost_preflight;
 mod port_hold;
+mod probe_hold;
 mod publish;
 mod readback;
 mod smoke_check;

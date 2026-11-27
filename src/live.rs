@@ -232,6 +232,16 @@ pub(crate) fn with_core<T>(
     owner: &str,
     f: impl FnOnce(&mut probe_rs::Core<'_>, u32) -> Result<T>,
 ) -> Result<T> {
+    // A probe Core holds is closed for the call and reopened after (decision 159).
+    crate::probe_hold::around(probe_serial, crate::probe_hold::Use::Core, || with_core_held(chip, probe_serial, owner, f))
+}
+
+fn with_core_held<T>(
+    chip: &str,
+    probe_serial: &str,
+    owner: &str,
+    f: impl FnOnce(&mut probe_rs::Core<'_>, u32) -> Result<T>,
+) -> Result<T> {
     let gate_halts = embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip)
         .context("board-identity gate refused this read")?
         .halts;
@@ -486,6 +496,10 @@ pub fn run_core_state(chip: &str, probe_serial: &str, role: &str, req: &CoreStat
 /// `S_RETIRE_ST` (clear on read) in the second read says whether instructions are retiring.
 /// A PPB read through the guarded attach: it never halts and needs no DMA clock (decision 85).
 pub fn read_dhcsr(chip: &str, probe_serial: &str) -> Result<u32> {
+    crate::probe_hold::around(probe_serial, crate::probe_hold::Use::Core, || read_dhcsr_held(chip, probe_serial))
+}
+
+fn read_dhcsr_held(chip: &str, probe_serial: &str) -> Result<u32> {
     embarch_topology::hardware::validate_serial_for_chip(probe_serial, chip).context("board-identity gate refused this read")?;
     let mut probe = crate::hardware::open_probe(Some(probe_serial), "exchange")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't read")?;

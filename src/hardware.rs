@@ -177,7 +177,22 @@ pub fn flash(
     erase: bool,
 ) -> Result<Vec<Range<u64>>> {
     let gated_serial = resolved_serial(probe_serial, "flash")?;
-    embarch_topology::hardware::validate_serial_for_chip(&gated_serial, chip)
+    // A probe Core holds is closed for the call and reopened after (decision 159).
+    crate::probe_hold::around(&gated_serial, crate::probe_hold::Use::Core, || {
+        flash_held(chip, firmware_path, format, base_address, probe_serial, erase, &gated_serial)
+    })
+}
+
+fn flash_held(
+    chip: &str,
+    firmware_path: &Path,
+    format: &str,
+    base_address: Option<u64>,
+    probe_serial: Option<&str>,
+    erase: bool,
+    gated_serial: &str,
+) -> Result<Vec<Range<u64>>> {
+    embarch_topology::hardware::validate_serial_for_chip(gated_serial, chip)
         .context("board-identity gate refused this flash")?;
 
     // **Which program writes the image is decided before anything is opened**
@@ -200,7 +215,10 @@ pub fn flash(
             embarch_topology::hardware::check_target_powered(&mut probe).context("can't flash")?;
         }
         // The vendor tool's own non-chip-erase mode runs; Core does not know its ranges.
-        flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase)?;
+        // The window is logged and not covered (decision 159).
+        crate::probe_hold::around(gated_serial, crate::probe_hold::Use::VendorTool, || {
+            flash_backend::run(&backend, chip, firmware_path, format, base_address, probe_serial, erase)
+        })?;
         return Ok(Vec::new());
     }
 
@@ -388,7 +406,13 @@ pub(crate) fn plan_erase(regions: &[NvmRegion], algos: &[AlgoInfo], chip: &str) 
 /// `target_reset()` alone silently never did.
 pub fn reset(chip: &str, probe_serial: Option<&str>) -> Result<()> {
     let gated_serial = resolved_serial(probe_serial, "reset")?;
-    embarch_topology::hardware::validate_serial_for_chip(&gated_serial, chip)
+    crate::probe_hold::around(&gated_serial, crate::probe_hold::Use::Core, || {
+        reset_held(chip, probe_serial, &gated_serial)
+    })
+}
+
+fn reset_held(chip: &str, probe_serial: Option<&str>, gated_serial: &str) -> Result<()> {
+    embarch_topology::hardware::validate_serial_for_chip(gated_serial, chip)
         .context("board-identity gate refused this reset")?;
     let mut probe = open_probe(probe_serial, "reset")?;
     embarch_topology::hardware::check_target_powered(&mut probe).context("can't reset")?;
