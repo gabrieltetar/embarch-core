@@ -253,6 +253,30 @@ fn runs_on_unit(lines: &[Value], unit_key: Option<&str>) -> Vec<Value> {
 
 /// `report-data.json` for the next revision of a Test run, from what Core holds. Deterministic for
 /// a given log and files: no clock and no log head, so publish can check what it signs.
+/// Each limit of a test with the decision rule, `U` and `w` its verdict was judged on (decision 154).
+/// `U` and `k` are the test's declared source for the measurement, which is what the executor's
+/// `judge_measurements` reads; a measurement with no source has none (`u`, `k` null, `u_declared`
+/// false) and was judged with `w = 0`, so `w` says 0 and not an invented band.
+fn limits_of(t: &embarch_study_designer::hil_expand::RunTest) -> Value {
+    let rule = &t.decision_rule;
+    Value::Array(
+        t.limits
+            .iter()
+            .map(|l| {
+                let source = t.sources.iter().find(|s| s.measurement == l.measurement);
+                let guard = rule.kind != "simple_acceptance";
+                let u = source.map(|s| s.u);
+                json!({
+                    "measurement": l.measurement, "unit": l.unit, "lower": l.lower, "upper": l.upper, "expect": l.expect,
+                    "rule": rule.kind, "w_multiple": rule.w_multiple,
+                    "u": u, "k": source.map(|s| s.k), "u_declared": source.is_some(),
+                    "w": if guard { rule.w_multiple * u.unwrap_or(0.0) } else { 0.0 },
+                })
+            })
+            .collect(),
+    )
+}
+
 fn test_report_data(state: &AppState, lines: &[Value], held: &Held, run_id: &str, publisher: Scope) -> Result<(Value, u64), Failure> {
     let prepared = crate::test_runs::read_record(state.run_log.data_dir(), run_id)?;
     let run: RunJson = serde_json::from_value(prepared["run"].clone()).map_err(internal)?;
@@ -267,11 +291,14 @@ fn test_report_data(state: &AppState, lines: &[Value], held: &Held, run_id: &str
         let result = results.and_then(|rs| rs.iter().find(|r| r["test_id"] == id));
         let judged = judged_of(result);
         let reached = judged.is_some();
+        let run_test = run.tests.iter().find(|r| r.test_id == id && Some(r.definition_hash.as_str()) == t["definition_hash"].as_str());
         tests.push(json!({
             "test_id": id, "bench": t["bench"], "definition_hash": t["definition_hash"], "requirements": t["requirements"],
             "verdict": t["verdict"], "reason": t["reason"], "qualifiers": result.map_or(json!([]), |r| r["qualifiers"].clone()),
             "counts": result.map_or(Value::Null, |r| r["counts"].clone()), "runs": result.map_or(json!([]), |r| r["runs"].clone()),
             "note": t["note"], "dut_image": t["dut_image"],
+            "decision_rule": run_test.map_or(Value::Null, |r| json!({ "kind": r.decision_rule.kind, "w_multiple": r.decision_rule.w_multiple })),
+            "limits": run_test.map_or(Value::Null, limits_of),
             "study_ids": t["study_records"].as_array().into_iter().flatten().map(|s| s["study_id"].clone()).collect::<Vec<_>>(),
         }));
         rows.push(TestRow {
@@ -565,6 +592,20 @@ mod tests {
         })
     }
 
+    /// A test that states a guard band of 1 x U over a limit its source declares `U = 10`, `k = 2` for.
+    fn guarded(mut t: Value) -> Value {
+        t["decision_rule"] = json!({ "kind": "guard_band", "w_multiple": 1.0 });
+        t["limits"] = json!([ { "measurement": "vbus", "unit": "mV", "lower": 4750.0, "upper": 5250.0 } ]);
+        t["sources"] = json!([ { "measurement": "vbus", "unit": "mV", "range_min": 0.0, "range_max": 9000.0, "resolution": 1.0, "U": 10.0, "k": 2.0 } ]);
+        t
+    }
+
+    /// A test under simple acceptance with a limit and no declared source for it.
+    fn limited(mut t: Value) -> Value {
+        t["limits"] = json!([ { "measurement": "ibus", "unit": "mA", "lower": null, "upper": 3000.0 } ]);
+        t
+    }
+
     fn run_json() -> RunJson {
         serde_json::from_value(json!({
             "schema": 1, "run_id": RID, "suite": { "id": "usb-pd", "version": "1" }, "plan_hash": null,
@@ -572,7 +613,7 @@ mod tests {
             "dut": { "hardware_id": UNIT, "declared_serial": "u1", "board_revision": "A", "capabilities": [], "hooks": [] },
             "options": { "stop_on_fail": false },
             "benches": [ { "name": "A", "tests": ["t1", "t2", "t3"], "boards": [ { "part": "pd", "idle": "idle", "hello": "hello" } ] } ],
-            "tests": [ test_json("t1", "A", &["R1", "R2"]), test_json("t2", "A", &["R1"]), test_json("t3", "A", &["R2"]) ],
+            "tests": [ guarded(test_json("t1", "A", &["R1", "R2"])), limited(test_json("t2", "A", &["R1"])), test_json("t3", "A", &["R2"]) ],
         }))
         .unwrap_or_else(|e| panic!("{e}"))
     }
@@ -676,6 +717,23 @@ mod tests {
         let payload = crate::signing::tests::standard_dsse_check(&env, &state.sealer.key().public_key_hex()).expect("verifies");
         let signed: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(signed["predicate"], serde_json::from_slice::<Value>(&std::fs::read(dir.join(REPORT_DATA_FILE)).unwrap()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn each_tests_limits_state_their_decision_rule_w_and_u_as_judged() {
+        let state = AppState::new("agent".to_string());
+        finished(&state);
+        let (s, b) = send(&state, "/test-runs/run-1/report-data", "").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let tests = &b["report_data"]["tests"];
+        assert_eq!(tests[0]["decision_rule"], json!({ "kind": "guard_band", "w_multiple": 1.0 }));
+        let l = &tests[0]["limits"][0];
+        assert_eq!((l["measurement"].as_str(), l["lower"].as_f64(), l["upper"].as_f64()), (Some("vbus"), Some(4750.0), Some(5250.0)));
+        assert_eq!((l["rule"].as_str(), l["w_multiple"].as_f64(), l["u"].as_f64(), l["k"].as_f64(), l["w"].as_f64(), l["u_declared"].as_bool()), (Some("guard_band"), Some(1.0), Some(10.0), Some(2.0), Some(10.0), Some(true)));
+        let l = &tests[1]["limits"][0];
+        assert_eq!((l["rule"].as_str(), l["w"].as_f64(), l["u_declared"].as_bool()), (Some("simple_acceptance"), Some(0.0), Some(false)));
+        assert_eq!((l["u"].clone(), l["k"].clone(), l["lower"].clone()), (Value::Null, Value::Null, Value::Null));
+        assert_eq!(tests[2]["limits"], json!([]));
     }
 
     #[tokio::test]
