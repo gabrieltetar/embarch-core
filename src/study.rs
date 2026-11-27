@@ -1284,7 +1284,9 @@ async fn enforce_dev_bench_gate(
     // `HelloAck` comparison needs, and re-reading it would be a second
     // answer to a question already answered.
     tokio::task::spawn_blocking(|| {
-        embarch_topology::hardware::validate_role(embarch_topology::hardware::DEV_BENCH_ROLE)
+        crate::probe_hold::around_role(embarch_topology::hardware::DEV_BENCH_ROLE, || {
+            embarch_topology::hardware::validate_role(embarch_topology::hardware::DEV_BENCH_ROLE)
+        })
     })
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("board-identity gate task panicked: {e:?}")))?

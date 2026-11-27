@@ -567,8 +567,8 @@ impl CoreBench<'_> {
     fn validated_id(&self, board: &embarch_topology::hardware::EnrolledBoard) -> Result<String, String> {
         let _guard = self.lock()?;
         let v = match &board.probe_serial {
-            Some(serial) => embarch_topology::hardware::validate_serial_timed(serial),
-            None => embarch_topology::hardware::validate_role_timed(&board.role),
+            Some(serial) => crate::probe_hold::around(serial, crate::probe_hold::Use::Core, || embarch_topology::hardware::validate_serial_timed(serial)),
+            None => crate::probe_hold::around_role(&board.role, || embarch_topology::hardware::validate_role_timed(&board.role)),
         };
         v.map(|v| v.board.hardware_id.unwrap_or_default()).map_err(|e| format!("{e:#}"))
     }

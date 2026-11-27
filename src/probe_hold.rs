@@ -190,6 +190,26 @@ pub fn around<T>(serial: &str, kind: Use, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// The probe serial of the board enrolled under `role`, if it has one. A role not enrolled, or a
+/// store that cannot be read, gives `None`: the gate then reports that itself.
+fn serial_of_role(role: &str) -> Option<String> {
+    embarch_topology::hardware::find_enrolled_by_role(role).ok().flatten().and_then(|b| b.probe_serial)
+}
+
+/// Runs a board-identity gate keyed by `role` with that board's held probe closed
+/// ([`around`], `Use::Core`): the gate opens the probe itself.
+pub fn around_role<T>(role: &str, f: impl FnOnce() -> T) -> T {
+    around_role_with(serial_of_role, role, f)
+}
+
+/// [`around_role`] over an explicit role-to-serial lookup.
+pub(crate) fn around_role_with<T>(lookup: impl FnOnce(&str) -> Option<String>, role: &str, f: impl FnOnce() -> T) -> T {
+    match lookup(role) {
+        Some(serial) => around(&serial, Use::Core, f),
+        None => f(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -281,5 +301,26 @@ pub(crate) mod tests {
         around("P1", Use::Core, || release(Owner::Lease));
         assert_eq!(live(), 0);
         assert!(held().is_empty());
+    }
+
+    #[test]
+    fn a_role_keyed_gate_closes_its_boards_probe_and_reopens_it() {
+        use_fake_opener();
+        acquire_with(Owner::Lease, vec!["P1".into()]);
+        let r: Result<(), &str> = around_role_with(
+            |role| (role == "dut").then(|| "P1".to_string()),
+            "dut",
+            || {
+                assert_eq!(live(), 0, "closed while the gate opens the probe");
+                Err("mismatch")
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!((live(), opens()), (1, 2), "reopened after the gate, on error too");
+
+        // A role with no enrolled probe runs the gate as before and leaves the hold alone.
+        around_role_with(|_| None, "dev-bench", || assert_eq!(live(), 1));
+        assert_eq!(opens(), 2);
+        release(Owner::Lease);
     }
 }

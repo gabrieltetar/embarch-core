@@ -1494,7 +1494,11 @@ async fn enroll_probe_handler(
     }
 
     let (board, up) = tokio::task::spawn_blocking(move || {
-        embarch_topology::hardware::enroll_reporting(&role, &chip, probe_serial.as_deref(), &name)
+        let enroll = || embarch_topology::hardware::enroll_reporting(&role, &chip, probe_serial.as_deref(), &name);
+        match probe_serial.as_deref() {
+            Some(serial) => crate::probe_hold::around(serial, crate::probe_hold::Use::Core, enroll),
+            None => enroll(),
+        }
     })
     .await
     .map_err(internal_err)?
@@ -2481,14 +2485,18 @@ async fn validate_handler(
     let _guard = acquire_hw_lock(&state, "POST /validate").await?;
 
     let result = tokio::task::spawn_blocking(move || match validate_target(&req)? {
-        crate::live::Target::Role(role) => Ok(embarch_topology::hardware::validate_role_timed(role)),
+        crate::live::Target::Role(role) => {
+            Ok(crate::probe_hold::around_role(role, || embarch_topology::hardware::validate_role_timed(role)))
+        }
         crate::live::Target::Probe(probe) => {
             // `validate_serial_timed` refuses an unenrolled probe as plain
             // text; ask first, so it is the same `404` a role answers.
             if embarch_topology::hardware::find_enrolled_by_probe(probe).map_err(internal_err)?.is_none() {
                 return Err((StatusCode::NOT_FOUND, format!("no board is enrolled on probe '{probe}'")));
             }
-            Ok(embarch_topology::hardware::validate_serial_timed(probe))
+            Ok(crate::probe_hold::around(probe, crate::probe_hold::Use::Core, || {
+                embarch_topology::hardware::validate_serial_timed(probe)
+            }))
         }
     })
     .await
