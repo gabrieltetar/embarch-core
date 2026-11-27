@@ -1,5 +1,5 @@
 //! A Test run's own signed record and its run-log entries (decision 144): the run as it ended, a
-//! finish, a cancel or a deadline, and the run Core's restart left without an end.
+//! finish, a cancel or a deadline, and the run Core's restart left without an end (decision 153).
 //!
 //! The record is `test-runs/{run_id}.test-run.dsse.json`, a DSSE envelope over an in-toto Statement
 //! of [`crate::signing::TEST_RUN_PREDICATE_TYPE`]. It vouches for `run.json` by its canonical hash
@@ -152,16 +152,32 @@ pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &
     hash
 }
 
-/// Seals each run Core started and never saw end: the executor died with Core, so what each test did
-/// is not known and none has a verdict (decision 144). Run at start, before the first go.
+/// Seals each run Core started and never saw end: the executor died with Core, so the test in
+/// flight and every later one is `interrupted` with no verdict, and each test the executor had
+/// finished keeps what it signed, read from the checkpoint it left (decision 153). The kept results
+/// go to `result.json` first, so the run reads back as `interrupted` with them and the record hashes
+/// the file. Run at start, before the first go.
 pub fn seal_interrupted(sealer: &Sealer, log: &RunLog) {
     for run_id in crate::test_runs::started_run_ids(log.data_dir()) {
-        if crate::test_runs::result_path(log.data_dir(), &run_id).exists() || crate::test_runs::record_path(log.data_dir(), &run_id).exists() {
+        if crate::test_runs::record_path(log.data_dir(), &run_id).exists() {
+            continue;
+        }
+        // A result the executor wrote is its own end; one this function wrote before dying is redone.
+        let kept: Option<Value> = std::fs::read(crate::test_runs::result_path(log.data_dir(), &run_id)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        if kept.is_some_and(|k| k["status"] != INTERRUPTED) {
             continue;
         }
         let Ok(rec) = crate::test_runs::read_record(log.data_dir(), &run_id) else { continue };
         let Ok(run) = serde_json::from_value::<RunJson>(rec["run"].clone()) else { continue };
-        let end = Ended { status: INTERRUPTED, reason: Some("Core restarted under the run"), results: &[], unreached: INTERRUPTED, smoke: &[], call_log: None };
+        let (results, smoke) = crate::test_runs::read_checkpoint(log.data_dir(), &run_id);
+        let body = json!({
+            "run_id": run_id, "status": INTERRUPTED, "ended_utc_ms": crate::study::current_utc_ms(),
+            "results": results.iter().map(TestResult::to_json).collect::<Vec<_>>(), "smoke_checks": smoke,
+        });
+        if let Err(e) = std::fs::write(crate::test_runs::result_path(log.data_dir(), &run_id), body.to_string()) {
+            tracing::error!(run_id, "could not keep the interrupted run's result: {e}");
+        }
+        let end = Ended { status: INTERRUPTED, reason: Some("Core restarted under the run"), results: &results, unreached: INTERRUPTED, smoke: &smoke, call_log: None };
         seal(sealer, log, &rec, &run, &end);
     }
 }

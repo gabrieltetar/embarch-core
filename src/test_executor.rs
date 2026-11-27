@@ -17,6 +17,7 @@ use embarch_study_designer::hil_judge::{self, DeclaredBy, FirmwareState, Measure
 use embarch_study_designer::hil_test::Precondition;
 use embarch_study_designer::host_study::{HostList, HostAction, HostStep, HostStudy, PromptKind};
 use embarch_study_designer::verdicts::{Counts, Evidence, Judged, Reason, Rules, StepOutcome, Target, Verdict};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -94,10 +95,14 @@ pub trait Env {
     fn precondition(&mut self, bench: &RunBench, test: &RunTest) -> Result<(), String>;
     /// Runs the test's study once, judged steps and measurements back.
     fn run_study(&mut self, test: &RunTest) -> StudyRun;
+    /// Called each time a test ends, with every result so far and every smoke check made: the real
+    /// bench keeps them so a Core restart keeps the finished verdicts (decision 153). The default
+    /// keeps nothing.
+    fn checkpoint(&mut self, _results: &[TestResult], _smoke: &[SmokeFindings]) {}
 }
 
 /// One test's result in the run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TestResult {
     pub test_id: String,
     pub bench: String,
@@ -273,6 +278,7 @@ pub fn drive(run: &RunJson, env: &mut dyn Env, progress: &Mutex<Progress>, rules
                 _ => {}
             }
             results.push(result);
+            env.checkpoint(&results, &smoke);
             publish(&results, &smoke, Some(&bench.name), None);
         }
     }
@@ -738,6 +744,12 @@ impl Env for CoreEnv {
         }
     }
 
+    fn checkpoint(&mut self, results: &[TestResult], smoke: &[SmokeFindings]) {
+        if let Err(e) = crate::test_runs::write_checkpoint(self.state.run_log.data_dir(), &self.run_id, results, smoke) {
+            tracing::error!(run_id = self.run_id, "could not keep the run's checkpoint: {e}");
+        }
+    }
+
     fn run_study(&mut self, test: &RunTest) -> StudyRun {
         let abort = |why: String| StudyRun { steps: vec![], measurements: vec![], cancelled: false, aborted: Some(why), study_id: None };
         let Some(study) = self.studies.get(&test.test_id).cloned() else {
@@ -844,10 +856,12 @@ mod tests {
         /// One scripted bench access per smoke check, in order; none left is a pass.
         smoke: VecDeque<crate::smoke_check::testing::Fake>,
         smoked: Vec<String>,
+        /// How many results each checkpoint held.
+        checkpoints: Vec<usize>,
     }
 
     fn fake(runs: Vec<StudyRun>) -> Fake {
-        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![], setups: vec![], setup_ends: VecDeque::new(), smoke: VecDeque::new(), smoked: vec![] }
+        Fake { runs: runs.into(), precondition_fails: vec![], cancel_after_runs: None, ran: vec![], prepared: vec![], setups: vec![], setup_ends: VecDeque::new(), smoke: VecDeque::new(), smoked: vec![], checkpoints: vec![] }
     }
 
     fn steps(outcome: StepOutcome, target: Target) -> Vec<JudgeStep> {
@@ -877,6 +891,9 @@ mod tests {
     }
 
     impl Env for Fake {
+        fn checkpoint(&mut self, results: &[TestResult], _: &[SmokeFindings]) {
+            self.checkpoints.push(results.len());
+        }
         fn setup(&mut self, bench: &RunBench, config: &str, missing: &[String]) -> SetupEnd {
             assert!(missing.is_empty(), "the setup prompt names nothing: the smoke check runs after it");
             self.setups.push((bench.name.clone(), config.to_string()));
@@ -1495,7 +1512,44 @@ mod tests {
     }
 
     #[test]
-    fn a_run_core_lost_is_sealed_interrupted_once_with_no_verdicts() {
+    fn every_finished_test_is_checkpointed_as_it_ends() {
+        let run = run_of(&[("A", &["a1", "a2"])], vec![test("a1", "A", 1, &[]), test("a2", "A", 1, &[])], false);
+        let mut env = fake(vec![pass(), pass()]);
+        go(&run, &mut env);
+        assert_eq!(env.checkpoints, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_run_core_lost_is_sealed_interrupted_once_keeping_the_verdicts_it_had_finished() {
+        let log = RunLog::temp();
+        let sealer = Sealer::ephemeral();
+        let run = run_of(&[("A", &["a1", "a2", "a3"])], vec![test("a1", "A", 1, &[]), test("a2", "A", 1, &[]), test("a3", "A", 1, &[])], false);
+        let dir = log.data_dir().join("test-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r1.json"), json!({ "run_id": "r1", "run_hash": run.hash(), "run": run, "selection": null }).to_string()).unwrap();
+        std::fs::write(dir.join("r1.started.json"), "{}").unwrap();
+        // The executor finished a1 and was in a2 when Core went down.
+        let done = go(&run, &mut fake(vec![pass(), pass(), pass()]));
+        let mut smoke = done.smoke.clone();
+        smoke.iter_mut().for_each(|s| s.unit = Some("DUT-1".into()));
+        crate::test_runs::write_checkpoint(log.data_dir(), "r1", &done.results[..1], &smoke).unwrap();
+        crate::test_run_record::seal_interrupted(&sealer, &log);
+        crate::test_run_record::seal_interrupted(&sealer, &log);
+        let env: Envelope = serde_json::from_slice(&std::fs::read(crate::test_runs::record_path(log.data_dir(), "r1")).unwrap()).unwrap();
+        let st: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &sealer.key().public_key_hex()).unwrap()).unwrap();
+        let p = &st["predicate"];
+        assert_eq!((p["status"].as_str(), p["unit_key"].as_str()), (Some("interrupted"), Some("DUT-1")));
+        let t = |i: usize| (p["tests"][i]["test_id"].as_str().unwrap(), p["tests"][i]["verdict"].as_str(), p["tests"][i]["reason"].as_str());
+        assert_eq!([t(0), t(1), t(2)], [("a1", Some("pass"), None), ("a2", None, Some("interrupted")), ("a3", None, Some("interrupted"))]);
+        assert!(st["subject"].as_array().unwrap().iter().any(|s| s["name"] == "result.json"));
+        let kept: Value = serde_json::from_slice(&std::fs::read(crate::test_runs::result_path(log.data_dir(), "r1")).unwrap()).unwrap();
+        assert_eq!((kept["status"].as_str(), kept["results"].as_array().map(Vec::len)), (Some("interrupted"), Some(1)));
+        assert_eq!(entries_of(&log, "test_run").len(), 1);
+        assert_eq!(entries_of(&log, "test")[0]["verdict"], "pass");
+    }
+
+    #[test]
+    fn a_run_core_lost_before_any_test_ended_is_sealed_interrupted_with_none() {
         let log = RunLog::temp();
         let sealer = Sealer::ephemeral();
         let run = run_of(&[("A", &["a1"])], vec![test("a1", "A", 1, &[])], false);
@@ -1504,10 +1558,9 @@ mod tests {
         std::fs::write(dir.join("r1.json"), json!({ "run_id": "r1", "run_hash": run.hash(), "run": run, "selection": null }).to_string()).unwrap();
         std::fs::write(dir.join("r1.started.json"), "{}").unwrap();
         crate::test_run_record::seal_interrupted(&sealer, &log);
-        crate::test_run_record::seal_interrupted(&sealer, &log);
         let env: Envelope = serde_json::from_slice(&std::fs::read(crate::test_runs::record_path(log.data_dir(), "r1")).unwrap()).unwrap();
         let st: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&env, &sealer.key().public_key_hex()).unwrap()).unwrap();
         assert_eq!((st["predicate"]["status"].as_str(), st["predicate"]["tests"][0]["reason"].as_str()), (Some("interrupted"), Some("interrupted")));
-        assert_eq!(entries_of(&log, "test_run").len(), 1);
+        assert!(st["predicate"]["tests"][0]["verdict"].is_null());
     }
 }

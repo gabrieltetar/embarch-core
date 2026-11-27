@@ -547,6 +547,39 @@ pub(crate) fn record_path(store: &std::path::Path, run_id: &str) -> PathBuf {
     store.join(TEST_RUNS_DIR).join(format!("{run_id}.test-run.dsse.json"))
 }
 
+/// Where the executor keeps each finished test as it ends (decision 153).
+pub(crate) fn checkpoint_path(store: &std::path::Path, run_id: &str) -> PathBuf {
+    store.join(TEST_RUNS_DIR).join(format!("{run_id}.checkpoint.json"))
+}
+
+/// Where a run's resume is marked: written once, naming the run that resumed it (decision 153).
+fn resumed_path(store: &std::path::Path, run_id: &str) -> PathBuf {
+    store.join(TEST_RUNS_DIR).join(format!("{run_id}.resumed.json"))
+}
+
+/// Keeps every result so far and every smoke check made, replacing the last checkpoint whole:
+/// written beside it and renamed, so a crash leaves the previous one (decision 153).
+pub(crate) fn write_checkpoint(
+    store: &std::path::Path,
+    run_id: &str,
+    results: &[crate::test_executor::TestResult],
+    smoke: &[crate::smoke_check::SmokeFindings],
+) -> std::io::Result<()> {
+    let path = checkpoint_path(store, run_id);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&json!({ "run_id": run_id, "results": results, "smoke_checks": smoke }))?)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// The finished tests and smoke checks a run kept; empty for a run that kept none or whose file
+/// does not parse.
+pub(crate) fn read_checkpoint(store: &std::path::Path, run_id: &str) -> (Vec<crate::test_executor::TestResult>, Vec<crate::smoke_check::SmokeFindings>) {
+    let kept: Value = std::fs::read(checkpoint_path(store, run_id)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let results = serde_json::from_value(kept["results"].clone()).unwrap_or_default();
+    let smoke = serde_json::from_value(kept["smoke_checks"].clone()).unwrap_or_default();
+    (results, smoke)
+}
+
 /// The runs Core started that have no result: the executor died with Core (decision 144).
 pub(crate) fn started_run_ids(store: &std::path::Path) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir(store.join(TEST_RUNS_DIR)) else { return vec![] };
@@ -642,6 +675,122 @@ pub async fn go_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<
     .await?
 }
 
+/// `POST /test-runs/{run_id}/resume`'s body: the id the new run takes, used once like any prepare's.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeRequest {
+    pub run_id: String,
+}
+
+/// The card of `rec` cut down to `keep`, the tests a resume still runs: its tests and each bench's
+/// list, and the duration bound over what is left.
+fn resume_card(card: &Value, keep: &RunJson) -> Value {
+    let mut card = card.clone();
+    let wanted = |v: &Value| keep.tests.iter().any(|t| v["agent_text"].as_str() == Some(t.test_id.as_str()));
+    if let Some(tests) = card["tests"].as_array_mut() {
+        tests.retain(|t| wanted(&t["test_id"]));
+    }
+    card["benches"] = keep
+        .benches
+        .iter()
+        .map(|b| json!({ "name": agent_text(&b.name), "tests": b.tests.iter().map(|t| agent_text(t)).collect::<Vec<_>>() }))
+        .collect();
+    card["duration_bound_ms"] = json!(duration_bound(keep));
+    card
+}
+
+/// Prepares a new run of what an `interrupted` run left pending, linked to it by `resumes`
+/// (decision 153); `201` as a prepare, with the tests kept and the tests pending. The new run is
+/// cut from the interrupted run's own record, so nothing is re-expanded: its tests are the ones
+/// with no kept result, a test that required a kept `pass` no longer requires it, and its card,
+/// inputs and studies are the old ones for those tests. It needs its own card and go, and its
+/// smoke check reads the images back like any run's. Refused: `404` for a run Core has none of;
+/// `409` for a run that is not `interrupted` (never started, in flight, or ended another way),
+/// one already resumed, one with nothing pending, or a `run_id` already used; `400` for a bad id.
+// route: POST /test-runs/{run_id}/resume
+pub async fn resume_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>, Json(req): Json<ResumeRequest>) -> Reply {
+    if !is_run_id(&run_id) {
+        return Err((StatusCode::NOT_FOUND, format!("Core has no prepared run {run_id}")));
+    }
+    if !is_run_id(&req.run_id) {
+        return Err((StatusCode::BAD_REQUEST, format!("run_id must be 1 to {MAX_RUN_ID_LEN} characters of letters, digits, `-` and `_`")));
+    }
+    let log = state.run_log.clone();
+    let holder = state.lease.view().map(|v| v.holder);
+    let in_flight = state.lease.run_in_flight().as_deref() == Some(run_id.as_str());
+    blocking(move || -> Reply {
+        let store = log.data_dir();
+        let rec = read_record(store, &run_id)?;
+        if !started_path(store, &run_id).exists() {
+            return Err(conflict(format!("run {run_id} was never started: only an interrupted run is resumed")));
+        }
+        let ended: Option<Value> = std::fs::read(result_path(store, &run_id)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let status = ended.as_ref().and_then(|e| e["status"].as_str()).unwrap_or("interrupted");
+        if in_flight || status != "interrupted" {
+            return Err(conflict(format!("run {run_id} is {}, not interrupted: only an interrupted run is resumed", if in_flight { "in flight" } else { status })));
+        }
+        if let Some(by) = std::fs::read(resumed_path(store, &run_id)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+            return Err(conflict(format!("run {run_id} was already resumed by {}: a run is resumed once", by["resumed_by"].as_str().unwrap_or("another run"))));
+        }
+        if run_path(store, &req.run_id).exists() {
+            return Err(conflict(format!("run {} is already prepared: a run id is used once", req.run_id)));
+        }
+        let old: RunJson = serde_json::from_value(rec["run"].clone()).map_err(|e| internal(anyhow::anyhow!("the kept run.json no longer parses: {e}")))?;
+        let (results, _) = crate::test_runs::read_checkpoint(store, &run_id);
+        let finished: BTreeSet<&str> = results.iter().map(|r| r.test_id.as_str()).collect();
+        let passed: BTreeSet<&str> = results.iter().filter(|r| r.judged.verdict == embarch_study_designer::verdicts::Verdict::Pass).map(|r| r.test_id.as_str()).collect();
+        let mut run = old.clone();
+        run.run_id = req.run_id.clone();
+        run.resumes = Some(run_id.clone());
+        run.tests.retain(|t| !finished.contains(t.test_id.as_str()));
+        run.tests.iter_mut().for_each(|t| t.requires.retain(|r| !passed.contains(r.as_str())));
+        let left: BTreeSet<String> = run.tests.iter().map(|t| t.test_id.clone()).collect();
+        run.benches.iter_mut().for_each(|b| b.tests.retain(|t| left.contains(t)));
+        run.benches.retain(|b| !b.tests.is_empty());
+        if run.tests.is_empty() {
+            return Err(conflict(format!("run {run_id} has nothing pending: every test finished before the restart")));
+        }
+        let run_hash = run.hash();
+        let hashes: BTreeSet<&str> = run.tests.iter().map(|t| t.definition_hash.as_str()).collect();
+        let mut record = rec.clone();
+        record["run_id"] = json!(run.run_id);
+        record["run_hash"] = json!(run_hash);
+        record["submitted_hash"] = json!(run_hash);
+        record["run"] = json!(run);
+        record["resumes"] = json!(run_id);
+        record["lease_holder"] = json!(holder);
+        record["prepared_utc_ms"] = json!(crate::study::current_utc_ms());
+        record["card"] = resume_card(&rec["card"], &run);
+        if let Some(inputs) = record["inputs"].as_array_mut() {
+            inputs.retain(|i| i["kind"] != "test" || hashes.contains(i["hash"].as_str().unwrap_or("")));
+        }
+        for key in ["studies", "energising_steps"] {
+            if let Some(m) = record[key].as_object_mut() {
+                m.retain(|k, _| left.contains(k));
+            }
+        }
+        // The marker first: two resumes of one run cannot both write it.
+        let marker = resumed_path(store, &run_id);
+        write_new(&marker, &json!({ "resumed_by": run.run_id })).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => conflict(format!("run {run_id} was already resumed: a run is resumed once")),
+            _ => internal(e.into()),
+        })?;
+        if let Err(e) = write_new(&run_path(store, &run.run_id), &record) {
+            let _ = std::fs::remove_file(&marker);
+            return Err(match e.kind() {
+                std::io::ErrorKind::AlreadyExists => conflict(format!("run {} is already prepared: a run id is used once", run.run_id)),
+                _ => internal(e.into()),
+            });
+        }
+        let kept: Vec<&str> = finished.iter().copied().collect();
+        Ok((StatusCode::CREATED, Json(json!({
+            "run_id": run.run_id, "run_hash": run_hash, "resumes": run_id, "lease_holder": holder,
+            "duration_bound_ms": duration_bound(&run), "pending": run.tests.iter().map(|t| &t.test_id).collect::<Vec<_>>(), "kept": kept,
+        }))))
+    })
+    .await?
+}
+
 /// Starts the executor on the run the go just started, from the record the prepare kept: its
 /// `run.json` and the study each test runs. `Err` when the record cannot be read back.
 fn start_executor(state: &AppState, run_id: &str, rec: &Value) -> Result<(), String> {
@@ -670,8 +819,8 @@ pub fn end_run(state: &AppState, run_id: &str, status: &str, reason: Option<&str
 /// Where a run is: its state, the bench and test it is on, every verdict so far, and the prompt
 /// it waits on with its text (`notes/hil/03-test.md`, "A run", item 6). Either token; reads no port.
 /// A finished run answers from the result the executor kept, a prepared one from its record, `404`
-/// for a run Core has none of. `started` with no progress is a run whose Core restarted
-/// under it (`interrupted`; decision 136, open).
+/// for a run Core has none of. A run Core restarted under reads `interrupted` with the verdicts it had finished
+/// (decision 153).
 // route: GET /test-runs/{run_id}
 pub async fn status_handler(State(state): State<AppState>, UrlPath(run_id): UrlPath<String>) -> Reply {
     if !is_run_id(&run_id) {
@@ -1218,6 +1367,150 @@ mod tests {
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(call(&s, AGENT, "POST", "/test-runs/run-s4/cancel", None).await.0, StatusCode::OK);
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A bench that counts the smoke checks it is asked for and the tests it runs.
+    #[derive(Default)]
+    struct Counting {
+        smoked: Vec<String>,
+        ran: Vec<String>,
+    }
+
+    impl crate::test_executor::Env for Counting {
+        fn smoke_check(&mut self, bench: &embarch_study_designer::hil_expand::RunBench, _: &[&RunTest]) -> crate::smoke_check::SmokeFindings {
+            self.smoked.push(bench.name.clone());
+            crate::smoke_check::SmokeFindings::new(&bench.name)
+        }
+        fn cancelled(&self) -> bool {
+            false
+        }
+        fn precondition(&mut self, _: &embarch_study_designer::hil_expand::RunBench, t: &RunTest) -> Result<(), String> {
+            self.ran.push(t.test_id.clone());
+            Ok(())
+        }
+        fn run_study(&mut self, _: &RunTest) -> crate::test_executor::StudyRun {
+            crate::test_executor::StudyRun { steps: vec![], measurements: vec![], cancelled: false, aborted: None, study_id: None }
+        }
+    }
+
+    /// A run started and lost to a restart, whose record lists two tests (the fixture's, and `t2`
+    /// which requires it), with the first finished and passed.
+    async fn interrupted(name: &str, run_id: &str) -> (AppState, String) {
+        let (s, _) = ready(name, run_id).await;
+        let go = go_body(&s, run_id).await;
+        assert_eq!(call(&s, PERSON, "POST", &format!("/test-runs/{run_id}/go"), Some(go)).await.0, StatusCode::OK);
+        s.lease.end_run(run_id);
+        let store = s.run_log.data_dir().to_path_buf();
+        let mut rec = read_record(&store, run_id).unwrap();
+        let first = rec["run"]["tests"][0].clone();
+        let id = first["test_id"].as_str().unwrap().to_string();
+        let mut second = first.clone();
+        second["test_id"] = json!("t2");
+        second["requires"] = json!([id]);
+        rec["run"]["tests"].as_array_mut().unwrap().push(second);
+        rec["run"]["benches"][0]["tests"].as_array_mut().unwrap().push(json!("t2"));
+        let study = rec["studies"][&id].clone();
+        rec["studies"]["t2"] = study;
+        let mut card_test = rec["card"]["tests"][0].clone();
+        card_test["test_id"] = agent_text("t2");
+        rec["card"]["tests"].as_array_mut().unwrap().push(card_test);
+        std::fs::write(run_path(&store, run_id), rec.to_string()).unwrap();
+        let first_result = crate::test_executor::TestResult {
+            test_id: id.clone(),
+            bench: "pd-sink-bench".into(),
+            judged: embarch_study_designer::verdicts::Judged { verdict: embarch_study_designer::verdicts::Verdict::Pass, reason: None, qualifiers: vec![] },
+            counts: None,
+            runs: vec![],
+            study_ids: vec![],
+            note: None,
+        };
+        write_checkpoint(&store, run_id, &[first_result], &[]).unwrap();
+        crate::test_run_record::seal_interrupted(&s.sealer, &s.run_log);
+        (s, id)
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_keeps_its_verdicts_and_its_resume_is_a_new_run_of_the_rest_with_its_own_go() {
+        let (s, first) = interrupted("resume", "run-r1").await;
+        let (_, status) = call(&s, AGENT, "GET", "/test-runs/run-r1", None).await;
+        assert_eq!((status["state"].as_str(), status["verdicts"][0]["verdict"].as_str(), status["verdicts"].as_array().map(Vec::len)), (Some("interrupted"), Some("pass"), Some(1)), "{status}");
+        let (st, r) = call(&s, AGENT, "POST", "/test-runs/run-r1/resume", Some(json!({ "run_id": "run-r2" }))).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        assert_eq!((r["resumes"].as_str(), r["pending"].clone(), r["kept"].clone()), (Some("run-r1"), json!(["t2"]), json!([first])));
+        let rec = read_record(s.run_log.data_dir(), "run-r2").unwrap();
+        let run: RunJson = serde_json::from_value(rec["run"].clone()).unwrap();
+        assert_eq!((run.resumes.as_deref(), run.tests.len(), run.tests[0].test_id.as_str()), (Some("run-r1"), 1, "t2"));
+        assert!(run.tests[0].requires.is_empty(), "the kept pass satisfies the requires");
+        assert_eq!(rec["card"]["tests"].as_array().map(Vec::len), Some(1));
+        assert_eq!(rec["studies"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()), Some(vec!["t2".to_string()]));
+        // Once only, and a second id does not get round it.
+        let again = call(&s, AGENT, "POST", "/test-runs/run-r1/resume", Some(json!({ "run_id": "run-r3" }))).await;
+        assert_eq!(again.0, StatusCode::CONFLICT, "{}", again.1);
+        assert!(again.1.as_str().unwrap().contains("already resumed by run-r2"));
+        // Its own card and go: the first run's go does not start it.
+        confirm_all(&s, "run-r2").await;
+        let stale = json!({ "run_id": "run-r2", "run_hash": status["run_hash"], "nonce": go_body(&s, "run-r1").await["nonce"] });
+        assert_eq!(call(&s, PERSON, "POST", "/test-runs/run-r2/go", Some(stale)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let go = go_body(&s, "run-r2").await;
+        let (st, started) = call(&s, PERSON, "POST", "/test-runs/run-r2/go", Some(go)).await;
+        assert_eq!((st, started["state"].as_str()), (StatusCode::OK, Some("started")), "{started}");
+        // The run it resumes is not started again by it.
+        assert!(started_path(s.run_log.data_dir(), "run-r1").exists());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_runs_smoke_check_reads_the_images_back_again_and_only_the_pending_test_runs() {
+        let (s, _) = interrupted("resume-smoke", "run-m1").await;
+        let (st, _) = call(&s, AGENT, "POST", "/test-runs/run-m1/resume", Some(json!({ "run_id": "run-m2" }))).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let run: RunJson = serde_json::from_value(read_record(s.run_log.data_dir(), "run-m2").unwrap()["run"].clone()).unwrap();
+        let mut env = Counting::default();
+        let progress = std::sync::Mutex::new(crate::test_executor::Progress::default());
+        let out = crate::test_executor::drive(&run, &mut env, &progress, &embarch_study_designer::verdicts::Rules::latest(), std::time::Duration::from_secs(60));
+        assert_eq!((env.smoked, env.ran, out.results.len()), (vec!["pd-sink-bench".to_string()], vec!["t2".to_string()], 1));
+    }
+
+    #[tokio::test]
+    async fn a_resume_is_refused_for_a_run_that_is_not_interrupted_or_that_is_unknown() {
+        let (s, _) = ready("resume-refused", "run-x1").await;
+        async fn resume(s: &AppState, id: &str, new: &str) -> (StatusCode, Value) {
+            call(s, AGENT, "POST", &format!("/test-runs/{id}/resume"), Some(json!({ "run_id": new }))).await
+        }
+        assert_eq!(resume(&s, "run-nope", "run-x2").await.0, StatusCode::NOT_FOUND);
+        let (st, why) = resume(&s, "run-x1", "run-x2").await;
+        assert_eq!((st, why.as_str().unwrap().contains("never started")), (StatusCode::CONFLICT, true));
+        let go = go_body(&s, "run-x1").await;
+        call(&s, PERSON, "POST", "/test-runs/run-x1/go", Some(go)).await;
+        let (st, why) = resume(&s, "run-x1", "run-x2").await;
+        assert_eq!((st, why.as_str().unwrap().contains("in flight")), (StatusCode::CONFLICT, true));
+        s.lease.end_run("run-x1");
+        std::fs::write(result_path(s.run_log.data_dir(), "run-x1"), json!({ "status": "completed", "results": [] }).to_string()).unwrap();
+        let (st, why) = resume(&s, "run-x1", "run-x2").await;
+        assert_eq!((st, why.as_str().unwrap().contains("completed")), (StatusCode::CONFLICT, true));
+        assert_eq!(resume(&s, "run-x1", "bad/id").await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_every_test_finished_has_nothing_to_resume() {
+        let (s, first) = ready("resume-none", "run-n1").await;
+        let go = go_body(&s, "run-n1").await;
+        call(&s, PERSON, "POST", "/test-runs/run-n1/go", Some(go)).await;
+        s.lease.end_run("run-n1");
+        let done = crate::test_executor::TestResult {
+            test_id: read_record(s.run_log.data_dir(), "run-n1").unwrap()["run"]["tests"][0]["test_id"].as_str().unwrap().into(),
+            bench: "pd-sink-bench".into(),
+            judged: embarch_study_designer::verdicts::Judged { verdict: embarch_study_designer::verdicts::Verdict::Fail, reason: None, qualifiers: vec![] },
+            counts: None,
+            runs: vec![],
+            study_ids: vec![],
+            note: None,
+        };
+        let _ = first;
+        write_checkpoint(s.run_log.data_dir(), "run-n1", &[done], &[]).unwrap();
+        crate::test_run_record::seal_interrupted(&s.sealer, &s.run_log);
+        let (st, why) = call(&s, AGENT, "POST", "/test-runs/run-n1/resume", Some(json!({ "run_id": "run-n2" }))).await;
+        assert_eq!((st, why.as_str().unwrap().contains("nothing pending")), (StatusCode::CONFLICT, true));
+        assert!(!run_path(s.run_log.data_dir(), "run-n2").exists() && !resumed_path(s.run_log.data_dir(), "run-n1").exists());
     }
 
     #[test]

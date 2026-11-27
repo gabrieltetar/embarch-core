@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use embarch_study_designer::hil_image::{identity, BenchFirmwareList, Segment, BENCH_FIRMWARE_SCHEMA};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lease::{sha256_hex, FlashedEntry};
 use crate::live::{check, read_ranges, CoreAccess, MemReadRequest, Range, MAX_WORDS};
@@ -29,7 +29,7 @@ pub enum Board {
 }
 
 /// What a readback found.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum ImageStatus {
     /// DUT: every segment read back equals the segment Core flashed.

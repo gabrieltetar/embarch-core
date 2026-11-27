@@ -7,7 +7,7 @@
 //! `error` with reason `smoke_check`. Every check runs, so the findings name every failing piece.
 
 use embarch_study_designer::hil_expand::RunBench;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::readback::ImageStatus;
 
@@ -47,21 +47,21 @@ pub trait BenchAccess {
 }
 
 /// One board's identity as validate read it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityFinding {
     pub piece: String,
     pub hardware_id: String,
 }
 
 /// One instrument's `*IDN?` reply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdnFinding {
     pub instrument: String,
     pub reply: String,
 }
 
 /// One board's image status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageFinding {
     pub piece: String,
     #[serde(flatten)]
@@ -69,7 +69,7 @@ pub struct ImageFinding {
 }
 
 /// Everything one bench's check found, kept on the run's progress and outcome.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmokeFindings {
     pub bench: String,
     pub identities: Vec<IdentityFinding>,

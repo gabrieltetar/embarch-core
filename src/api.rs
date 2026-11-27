@@ -248,6 +248,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
         .route("/test-runs/{run_id}/go", post(test_runs::go_handler))
         .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
+        .route("/test-runs/{run_id}/resume", post(test_runs::resume_handler))
         .route("/test-runs/{run_id}/report-data", post(test_publish::test_report_data_handler))
         .route("/test-runs/{run_id}/publish", post(test_publish::test_publish_handler))
         .route("/test-runs/{run_id}/publish/{revision}/files/{*name}", get(test_publish::test_file_handler))
@@ -3285,6 +3286,7 @@ mod tests {
         ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
         ("POST", "/test-runs/{run_id}/go", "/test-runs/abc/go"),
         ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
+        ("POST", "/test-runs/{run_id}/resume", "/test-runs/abc/resume"),
         ("POST", "/test-runs/{run_id}/report-data", "/test-runs/abc/report-data"),
         ("POST", "/test-runs/{run_id}/publish", "/test-runs/abc/publish"),
         ("GET", "/test-runs/{run_id}/publish/{revision}/files/{*name}", "/test-runs/abc/publish/1/files/report-data.json"),
@@ -3351,7 +3353,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 72;
+    const DOCUMENTED_ROUTE_COUNT: usize = 73;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -4240,6 +4242,7 @@ mod tests {
         ("GET", "/test-runs/{run_id}"),
         ("GET", "/test-runs/{run_id}/card"),
         ("POST", "/test-runs/{run_id}/cancel"),
+        ("POST", "/test-runs/{run_id}/resume"),
         ("POST", "/test-runs/{run_id}/report-data"),
         ("POST", "/test-runs/{run_id}/publish"),
         ("GET", "/test-runs/{run_id}/publish/{revision}/files/{*name}"),

@@ -696,6 +696,8 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("POST", "/test-runs"),
     ("GET", "/test-runs/{run_id}"),
     ("GET", "/test-runs/{run_id}/card"),
+    // A resume prepares a file from a kept record, as a prepare does (decision 153).
+    ("POST", "/test-runs/{run_id}/resume"),
     ("POST", "/manual-verdicts"),
     ("PUT", "/units/{unit_key}"),
     ("GET", "/units/{unit_key}"),
