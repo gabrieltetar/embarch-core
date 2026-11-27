@@ -578,6 +578,10 @@ struct StatusResponse {
     /// processes undetected — which is exactly the failure the split was
     /// made to prevent.
     study_designer_schema_version: u32,
+    /// The same number under the suite's settled name (decision 162).
+    /// `study_designer_schema_version` stays beside it until both readers
+    /// have moved and a released Core has served this key.
+    host_type_schema_version: u32,
     /// This Core binary's own crate version — `CARGO_PKG_VERSION`, the
     /// version field of `embarch-core --version`'s line (which also names the
     /// commit since decision 100; this field does not), resolved at compile
@@ -648,6 +652,7 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResp
         status: "ok",
         probes,
         study_designer_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
+        host_type_schema_version: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
         core_version: env!("CARGO_PKG_VERSION"),
         binary_sha256: binary_sha256(),
         lease: state.lease.view(),
@@ -3791,6 +3796,7 @@ mod tests {
             status: "ok",
             probes: Vec::new(),
             study_designer_schema_version: 7,
+            host_type_schema_version: 7,
             core_version: "9.9.9",
             binary_sha256: Some("a".repeat(64)),
             lease: None,
@@ -3813,6 +3819,7 @@ mod tests {
             [
                 "binary_sha256",
                 "core_version",
+                "host_type_schema_version",
                 "keyid",
                 "last_images",
                 "lease",
@@ -3826,6 +3833,7 @@ mod tests {
              /status row in the same commit"
         );
         assert_eq!(json["core_version"], "9.9.9");
+        assert_eq!(json["host_type_schema_version"], json["study_designer_schema_version"]);
     }
 
     /// `mode`, `keyid` and `study_in_flight` (decision 129): the study id while
