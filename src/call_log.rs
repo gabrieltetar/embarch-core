@@ -1130,6 +1130,80 @@ mod tests {
         assert_eq!((e.scope.as_str(), e.call_log_seq), ("agent", Some(seq)));
     }
 
+    fn enrolled_row(role: &str, probe: &str) -> embarch_topology::hardware::EnrolledBoard {
+        embarch_topology::hardware::EnrolledBoard {
+            role: role.into(),
+            name: String::new(),
+            chip: "nrf54l15".into(),
+            probe_serial: Some(probe.into()),
+            hardware_id: None,
+            confirmed_at_utc_ms: None,
+            link_port_serial: None,
+            link_port_interface: None,
+        }
+    }
+
+    /// Runs one gated call whose stand-in handler fills the note as the real handler does, and
+    /// returns the entry's `board`.
+    async fn board_of(path: &'static str, fill: fn(&BoardNote)) -> serde_json::Value {
+        let s = state();
+        s.images.record(crate::lease::FlashedImage {
+            chip: "nrf54l15".into(),
+            probe_serial: None,
+            path: "p".into(),
+            sha256: Some("feed".into()),
+            flashed_at: String::new(),
+            lease_holder: None,
+        });
+        let router = Router::new()
+            .route(&path.replace("/s/", "/{name}/").replace("/nope/", "/{name}/"), axum::routing::post(move || async move {
+                fill(&board_note());
+                "ok"
+            }))
+            .layer(axum::middleware::from_fn_with_state(s.clone(), call_log_middleware))
+            .layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+                req.extensions_mut().insert(Scope::Agent);
+                next.run(req).await
+            }));
+        router.oneshot(Request::builder().method("POST").uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        entries(&s)[0]["board"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_bootload_and_a_validate_entry_name_the_enrolled_board() {
+        let b = board_of("/bootload", |n| {
+            n.set(Some("dut"), None, None);
+            crate::api::note_board(n, &enrolled_row("dut", "0010"));
+        })
+        .await;
+        assert_eq!((b["role"].as_str(), b["probe_serial"].as_str(), b["chip"].as_str()), (Some("dut"), Some("0010"), Some("nrf54l15")));
+        assert_eq!(b["image_sha256"], "feed");
+        // A validate that finds no row keeps the name it was asked about and no chip.
+        let b = board_of("/validate", |n| n.set(None, Some("0099"), None)).await;
+        assert_eq!((b["role"].is_null(), b["probe_serial"].as_str(), b["chip"].is_null()), (true, Some("0099"), true));
+    }
+
+    #[tokio::test]
+    async fn an_exchange_or_capture_entry_names_the_board_the_signal_leaves() {
+        use embarch_topology::hardware::SignalOrigin;
+        let by_role = board_of("/signals/s/exchange", |n| {
+            crate::api::note_signal_origin(n, SignalOrigin::Role("dut"), Some(&enrolled_row("dut", "0010")));
+        })
+        .await;
+        assert_eq!((by_role["role"].as_str(), by_role["probe_serial"].as_str(), by_role["chip"].as_str()), (Some("dut"), Some("0010"), Some("nrf54l15")));
+        // A bench board is named by its probe; with no row enrolled now, there is no chip.
+        let by_probe = board_of("/signals/s/capture", |n| {
+            crate::api::note_signal_origin(n, SignalOrigin::Board { probe_serial: "0042" }, None);
+        })
+        .await;
+        assert_eq!((by_probe["probe_serial"].as_str(), by_probe["role"].is_null(), by_probe["chip"].is_null()), (Some("0042"), true, true));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_cannot_name_a_board_keeps_board_null() {
+        assert!(board_of("/signals/nope/exchange", |_| {}).await.is_null());
+    }
+
     #[test]
     fn a_note_outside_a_logged_call_is_a_no_op() {
         board_note().set(Some("dut"), None, None);

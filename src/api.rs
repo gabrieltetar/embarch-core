@@ -1068,9 +1068,12 @@ async fn bootload_handler(
         // The outpost manifest is keyed by chip (`ManifestSlot`), and an
         // enrolled DUT row is the only thing that says which chip this is.
         // With none, no flash of this DUT could have bound one either.
-        let dut_chip = embarch_topology::hardware::find_enrolled_by_role(dut)
-            .map_err(internal_err)?
-            .map(|row| row.chip);
+        let dut_row = embarch_topology::hardware::find_enrolled_by_role(dut).map_err(internal_err)?;
+        note.set(Some(dut), None, None);
+        if let Some(row) = &dut_row {
+            note_board(&note, row);
+        }
+        let dut_chip = dut_row.map(|row| row.chip);
         let result = bootload::run(&mut bootload::UsbBench, &ports, &plan, &taps, &bootload::PLACEHOLDER_TIMEOUTS, || {
             // The same rule `/flash` follows for an image with no manifest:
             // the one stored describes firmware that is about to be gone.
@@ -1911,8 +1914,12 @@ async fn signal_exchange_handler(
     crate::exchange::check(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let _guard = acquire_hw_lock(&state, "POST /signals/{name}/exchange").await?;
     let captures = state.captures.clone();
+    let note = call_log::board_note();
 
-    tokio::task::spawn_blocking(move || run_signal_exchange(&captures, &name, req))
+    tokio::task::spawn_blocking(move || {
+        note_signal_board(&note, &name);
+        run_signal_exchange(&captures, &name, req)
+    })
         .await
         .map_err(internal_err)?
         .map(Json)
@@ -1930,6 +1937,45 @@ fn signal_origin_core_state(link: &embarch_topology::hardware::SignalLink) -> cr
         },
         crate::live::read_dhcsr,
     )
+}
+
+/// Names an enrolled board in the call log: its role, probe and chip.
+pub(crate) fn note_board(note: &call_log::BoardNote, board: &embarch_topology::hardware::EnrolledBoard) {
+    note.set(Some(&board.role), board.probe_serial.as_deref(), Some(&board.chip));
+}
+
+/// Names the board a declared signal leaves: the origin's role or probe at once, and the
+/// enrolled row's role, probe and chip where one is enrolled now. An undeclared name leaves the
+/// entry's `board` null.
+fn note_signal_board(note: &call_log::BoardNote, name: &str) {
+    if let Ok(Some(link)) = embarch_topology::hardware::find_signal(name) {
+        note_link_board(note, &link);
+    }
+}
+
+fn note_link_board(note: &call_log::BoardNote, link: &embarch_topology::hardware::SignalLink) {
+    let board = embarch_topology::hardware::find_signal_origin_board(link).ok().flatten();
+    note_signal_origin(note, link.origin(), board.as_ref());
+}
+
+pub(crate) fn note_signal_origin(
+    note: &call_log::BoardNote,
+    origin: embarch_topology::hardware::SignalOrigin<'_>,
+    board: Option<&embarch_topology::hardware::EnrolledBoard>,
+) {
+    match origin {
+        embarch_topology::hardware::SignalOrigin::Role(role) => note.set(Some(role), None, None),
+        embarch_topology::hardware::SignalOrigin::Board { probe_serial } => note.set(None, Some(probe_serial), None),
+    }
+    if let Some(b) = board {
+        note_board(note, b);
+    }
+}
+
+/// [`note_signal_board`] off the async threads, for the capture routes that open no port.
+async fn note_signal_board_blocking(name: &str) {
+    let (note, name) = (call_log::board_note(), name.to_string());
+    let _ = tokio::task::spawn_blocking(move || note_signal_board(&note, &name)).await;
 }
 
 /// The exchange route's whole blocking body, with `hw_lock` already held by the caller: the
@@ -2140,10 +2186,12 @@ async fn start_capture_handler(
     crate::capture::check(req.max_s, req.max_bytes).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let captures = state.captures.clone();
     let taps = state.tap_ports.clone();
+    let note = call_log::board_note();
     tokio::task::spawn_blocking(move || {
         let link = embarch_topology::hardware::find_signal(&name)
             .map_err(internal_err)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no signal is declared under the name '{name}'")))?;
+        note_link_board(&note, &link);
         if matches!(link.route, embarch_topology::hardware::Route::ViaDevBench { .. }) {
             return Err((
                 StatusCode::CONFLICT,
@@ -2194,6 +2242,7 @@ async fn read_capture_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(q): Query<ReadCaptureQuery>,
 ) -> Result<Json<crate::capture::CaptureRead>, (StatusCode, String)> {
+    note_signal_board_blocking(&name).await;
     let cap = capture_for(&state, &name, q.id.as_deref())?;
     Ok(Json(cap.read(q.after, read_limit(&q))))
 }
@@ -2207,6 +2256,7 @@ async fn stop_capture_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(q): Query<ReadCaptureQuery>,
 ) -> Result<Json<crate::capture::CaptureRead>, (StatusCode, String)> {
+    note_signal_board_blocking(&name).await;
     let cap = capture_for(&state, &name, q.id.as_deref())?;
     cap.stop();
     for _ in 0..100 {
@@ -2494,16 +2544,22 @@ async fn validate_handler(
     validate_target(&req)?;
     let _guard = acquire_hw_lock(&state, "POST /validate").await?;
 
+    let note = call_log::board_note();
+    note.set(req.role.as_deref(), req.probe_serial.as_deref(), None);
     let result = tokio::task::spawn_blocking(move || match validate_target(&req)? {
         crate::live::Target::Role(role) => {
+            if let Ok(Some(row)) = embarch_topology::hardware::find_enrolled_by_role(role) {
+                note_board(&note, &row);
+            }
             Ok(crate::probe_hold::around_role(role, || embarch_topology::hardware::validate_role_timed(role)))
         }
         crate::live::Target::Probe(probe) => {
             // `validate_serial_timed` refuses an unenrolled probe as plain
             // text; ask first, so it is the same `404` a role answers.
-            if embarch_topology::hardware::find_enrolled_by_probe(probe).map_err(internal_err)?.is_none() {
+            let Some(row) = embarch_topology::hardware::find_enrolled_by_probe(probe).map_err(internal_err)? else {
                 return Err((StatusCode::NOT_FOUND, format!("no board is enrolled on probe '{probe}'")));
-            }
+            };
+            note_board(&note, &row);
             Ok(crate::probe_hold::around(probe, crate::probe_hold::Use::Core, || {
                 embarch_topology::hardware::validate_serial_timed(probe)
             }))
