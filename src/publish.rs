@@ -311,6 +311,8 @@ fn report_data(
     publisher: Scope,
 ) -> Result<(serde_json::Value, u64), Failure> {
     let run = publishable_run(lines, study_id)?;
+    // A study a Test run amended is bound by that run's entry, not by `run`'s (decision 146).
+    let record_sha256 = state.run_log.bound_record_sha256(study_id).map_err(internal)?;
     let dir = state.run_log.run_dir(study_id);
     require_run_files(&dir)?;
     let events: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("events.json")).map_err(internal)?).map_err(internal)?;
@@ -354,7 +356,7 @@ fn report_data(
         "observed": observed,
         "claimed": { "build": statement["predicate"]["claimed"]["build"] },
         "core": { "version": env!("CARGO_PKG_VERSION"), "keyid": state.sealer.key().keyid() },
-        "record_sha256": run["record_sha256"],
+        "record_sha256": record_sha256,
     });
     Ok((data, revision))
 }

@@ -298,12 +298,32 @@ impl RunLog {
     }
 
     /// The whole Test run, entered once: the hash of its signed record (`None` when signing
-    /// failed), how it ended, and every study run it made (decision 144).
-    pub fn test_run_entry(&self, run_id: &str, status: &str, record_sha256: Option<&str>, study_ids: &[String]) -> Result<serde_json::Value> {
+    /// failed), how it ended, and every study run it made (decision 144). `study_records` is each
+    /// study's `{study_id, record_sha256}` as the run's amend left the file, which binds that hash
+    /// in the chain (decision 146).
+    pub fn test_run_entry(&self, run_id: &str, status: &str, record_sha256: Option<&str>, study_records: &[serde_json::Value]) -> Result<serde_json::Value> {
+        let study_ids: Vec<&str> = study_records.iter().filter_map(|r| r["study_id"].as_str()).collect();
         self.append(serde_json::json!({
             "type": "test_run", "run_id": run_id, "status": status, "record_sha256": record_sha256,
-            "study_ids": study_ids, "at_utc_ms": now_ms(),
+            "study_ids": study_ids, "study_records": study_records, "at_utc_ms": now_ms(),
         }))
+    }
+
+    /// The hash the chain binds to a study's `record.dsse.json` (decision 146): the latest
+    /// `test_run` entry's `study_records` hash when a Test run amended the study, else its `run`
+    /// entry's. `None` when the study has no run entry or no signed record.
+    pub(crate) fn bound_record_sha256(&self, study_id: &str) -> Result<Option<String>> {
+        for l in self.lines()?.iter().rev() {
+            let e = &l["entry"];
+            if e["type"] != "test_run" {
+                continue;
+            }
+            let hit = e["study_records"].as_array().into_iter().flatten().find(|r| r["study_id"] == study_id);
+            if let Some(h) = hit.and_then(|r| r["record_sha256"].as_str()) {
+                return Ok(Some(h.to_string()));
+            }
+        }
+        Ok(self.latest(study_id, "run")?.and_then(|r| r["entry"]["record_sha256"].as_str().map(str::to_string)))
     }
 
     /// Records the hash of the manifest a run was published under.
@@ -560,6 +580,9 @@ pub async fn run_log_handler(State(state): State<AppState>) -> Result<Json<RunLo
 #[derive(Serialize)]
 pub struct StudyLogResponse {
     run: serde_json::Value,
+    /// The hash the chain binds to the study's record: the Test run's entry for a study a Test
+    /// run amended, else `run`'s (decision 146).
+    record_sha256: Option<String>,
     published: Option<serde_json::Value>,
     discarded: Option<serde_json::Value>,
     /// The log's head, which a publish records beside the manifest hash.
@@ -573,13 +596,14 @@ pub async fn study_log_handler(State(state): State<AppState>, UrlPath(study_id):
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let log = &state.run_log;
     let run = log.latest(&study_id, "run").map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("the run log has no run {study_id}")))?;
+    let record_sha256 = log.bound_record_sha256(&study_id).map_err(internal)?;
     let published = log.latest(&study_id, "published").map_err(internal)?;
     let discarded = log.latest(&study_id, "discarded").map_err(internal)?;
     let (head, length) = log
         .verify()
         .map_err(internal)?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the run log is broken at line {}: {}", e.line, e.reason)))?;
-    Ok(Json(StudyLogResponse { run, published, discarded, head, length }))
+    Ok(Json(StudyLogResponse { run, record_sha256, published, discarded, head, length }))
 }
 
 #[derive(Deserialize)]
@@ -886,8 +910,27 @@ mod tests {
         for id in studies {
             run_with(log, id, "completed", "Pass");
         }
-        let ids: Vec<String> = studies.iter().map(|s| s.to_string()).collect();
-        log.test_run_entry(run_id, "completed", Some("ab"), &ids).unwrap();
+        let recs: Vec<serde_json::Value> = studies.iter().map(|s| serde_json::json!({ "study_id": s, "record_sha256": null })).collect();
+        log.test_run_entry(run_id, "completed", Some("ab"), &recs).unwrap();
+    }
+
+    #[test]
+    fn a_plain_study_is_bound_by_its_run_entry_and_a_test_runs_by_the_test_run_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::at(dir.path().to_path_buf());
+        std::fs::create_dir_all(log.run_dir("plain")).unwrap();
+        std::fs::write(log.run_dir("plain").join(crate::signing::RECORD_FILE), b"sealed").unwrap();
+        run_with(&log, "plain", "completed", "Pass");
+        let sealed = crate::signing::sha256_of_file(&log.run_dir("plain").join(crate::signing::RECORD_FILE)).unwrap();
+        assert_eq!(log.bound_record_sha256("plain").unwrap().as_deref(), Some(sealed.as_str()));
+        assert_eq!(log.bound_record_sha256("nope").unwrap(), None);
+        // a Test run amends the file after the `run` entry; its entry binds the new hash
+        std::fs::write(log.run_dir("plain").join(crate::signing::RECORD_FILE), b"amended").unwrap();
+        let amended = crate::signing::sha256_of_file(&log.run_dir("plain").join(crate::signing::RECORD_FILE)).unwrap();
+        log.test_run_entry("r1", "completed", None, &[serde_json::json!({ "study_id": "plain", "record_sha256": amended })]).unwrap();
+        assert_ne!(sealed, amended);
+        assert_eq!(log.bound_record_sha256("plain").unwrap().as_deref(), Some(amended.as_str()));
+        assert!(log.verify().unwrap().is_ok());
     }
 
     #[test]

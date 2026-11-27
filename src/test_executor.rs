@@ -1416,6 +1416,14 @@ mod tests {
         let rp: Value = serde_json::from_slice(&crate::signing::tests::standard_dsse_check(&run_rec, &plain.key().public_key_hex()).unwrap()).unwrap();
         assert_eq!(rp["predicate"]["tests"][0]["study_records"][0]["record_sha256"].as_str(), Some(crate::signing::sha256_of_file(&dir.join(crate::signing::RECORD_FILE)).unwrap().as_str()));
         assert!(hash.is_some());
+        // the chain binds the amended file's hash, which is not the one the study's `run` entry
+        // (when it has one) would have held for the sealed record (decision 146)
+        let on_disk = crate::signing::sha256_of_file(&dir.join(crate::signing::RECORD_FILE)).unwrap();
+        let whole = entries_of(&log, "test_run");
+        assert_eq!(whole[0]["study_records"][0]["study_id"], "st");
+        assert_eq!(whole[0]["study_records"][0]["record_sha256"].as_str(), Some(on_disk.as_str()));
+        assert_eq!(log.bound_record_sha256("st").unwrap().as_deref(), Some(on_disk.as_str()));
+        assert!(log.verify().unwrap().is_ok());
     }
 
     #[test]

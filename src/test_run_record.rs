@@ -101,13 +101,13 @@ pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &
     let unit = unit_key(end.smoke);
     amend_studies(sealer, log, run, &run_hash, end);
     let mut tests = Vec::new();
-    let mut study_ids: Vec<String> = Vec::new();
+    let mut study_records: Vec<Value> = Vec::new();
     for t in &run.tests {
         let result = end.results.iter().find(|r| r.test_id == t.test_id);
         let studies: Vec<Value> = result
             .map(|r| r.study_ids.iter().map(|id| json!({ "study_id": id, "record_sha256": sha256_of_file(&log.run_dir(id).join(RECORD_FILE)).ok() })).collect())
             .unwrap_or_default();
-        study_ids.extend(result.into_iter().flat_map(|r| r.study_ids.iter().cloned()));
+        study_records.extend(studies.iter().cloned());
         let verdict = result.map(verdict_of);
         let reason = match result {
             Some(r) => r.judged.reason.and_then(|x| serde_json::to_value(x).ok()).unwrap_or(Value::Null),
@@ -146,7 +146,7 @@ pub fn seal(sealer: &Sealer, log: &RunLog, record: &Value, run: &RunJson, end: &
             tracing::error!(run_id = run.run_id, test = t.test_id, "could not enter the test in the run log: {e:#}");
         }
     }
-    if let Err(e) = log.test_run_entry(&run.run_id, end.status, hash.as_deref(), &study_ids) {
+    if let Err(e) = log.test_run_entry(&run.run_id, end.status, hash.as_deref(), &study_records) {
         tracing::error!(run_id = run.run_id, "could not enter the Test run in the run log: {e:#}");
     }
     hash
