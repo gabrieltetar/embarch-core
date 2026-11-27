@@ -91,7 +91,7 @@ fn agent_value(v: &Value) -> Value {
 }
 
 /// Whether `id` is safe as a file name.
-fn is_run_id(id: &str) -> bool {
+pub(crate) fn is_run_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_RUN_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 

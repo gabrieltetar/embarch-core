@@ -35,28 +35,28 @@ pub const CALL_LOG_SEGMENT_FILE: &str = "call-log-segment.jsonl";
 pub const MANIFEST_FILE: &str = "manifest.dsse.json";
 /// The files Core writes into a revision's directory, which a reader may fetch
 /// beside whatever the manifest names.
-const PUBLISH_FILES: [&str; 5] =
+pub(crate) const PUBLISH_FILES: [&str; 5] =
     [REPORT_DATA_FILE, REPORT_DATA_ENVELOPE_FILE, SEGMENT_FILE, CALL_LOG_SEGMENT_FILE, MANIFEST_FILE];
 
 /// The most text one adoption takes.
 const MAX_ADOPTED_BYTES: usize = 1 << 20;
 const MAX_NAME_BYTES: usize = 200;
 
-type Failure = (StatusCode, String);
+pub(crate) type Failure = (StatusCode, String);
 
 /// The stable `code` of the measurements route's `422` (core decision 141).
 const NO_MEASUREMENTS_CODE: &str = "no_measurements";
 
-fn internal(e: impl std::fmt::Display) -> Failure {
+pub(crate) fn internal(e: impl std::fmt::Display) -> Failure {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     crate::signing::hex(&Sha256::digest(bytes))
 }
 
-fn is_sha256_hex(s: &str) -> bool {
+pub(crate) fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -268,12 +268,26 @@ fn adoptions(lines: &[serde_json::Value], study_id: &str) -> Vec<serde_json::Val
     latest.into_values().collect()
 }
 
-/// The Statement of `record.dsse.json`, decoded. The envelope is Core's own
+/// The Statement of a DSSE envelope Core wrote, decoded. The envelope is Core's own
 /// file; one that does not read is a `500`.
-fn record_statement(dir: &std::path::Path) -> Result<serde_json::Value, Failure> {
-    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(RECORD_FILE)).map_err(internal)?).map_err(internal)?;
+pub(crate) fn statement_of(path: &std::path::Path) -> Result<serde_json::Value, Failure> {
+    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(internal)?).map_err(internal)?;
     let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
     serde_json::from_slice(&payload).map_err(internal)
+}
+
+/// The call-log claim of a record's `observed`, as `report-data.json` carries it: the head, the
+/// range and the entries in it. `None` when the record names no range.
+pub(crate) fn call_log_claim(observed: &serde_json::Value) -> Option<serde_json::Value> {
+    let range = &observed["call_log"];
+    if !range.is_object() {
+        return None;
+    }
+    let count = match (range["first_seq"].as_u64(), range["last_seq"].as_u64()) {
+        (Some(first), Some(last)) => last + 1 - first,
+        _ => 0,
+    };
+    Some(serde_json::json!({ "head": range["head"], "first_seq": range["first_seq"], "last_seq": range["last_seq"], "count": count }))
 }
 
 /// What an `events.json` step's outcome counts as.
@@ -293,7 +307,7 @@ fn count_outcomes(events: &serde_json::Value) -> serde_json::Value {
 /// What Core can say of who acted, as one label of the closed list in
 /// `notes/hil/06` that a milestone 1 Core can reach. Every Core is unattested
 /// in milestone 1, so a person's act is never "protected" (decision 119).
-fn attestation(person_acted: bool) -> serde_json::Value {
+pub(crate) fn attestation(person_acted: bool) -> serde_json::Value {
     let label = if person_acted { "person's acts not protected" } else { "agent-scoped only" };
     serde_json::json!({
         "label": label, "core_attested": false,
@@ -316,7 +330,7 @@ fn report_data(
     let dir = state.run_log.run_dir(study_id);
     require_run_files(&dir)?;
     let events: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("events.json")).map_err(internal)?).map_err(internal)?;
-    let statement = record_statement(&dir)?;
+    let statement = statement_of(&dir.join(RECORD_FILE))?;
     let counts = count_outcomes(&events);
     let adopted = adoptions(lines, study_id);
     let go_by = run["go_by"].as_str().unwrap_or("agent");
@@ -331,15 +345,8 @@ fn report_data(
         "declarations": declarations,
     });
     // The record's call-log claim, present exactly when the record carries one.
-    let range = &statement["predicate"]["observed"]["call_log"];
-    if range.is_object() {
-        let count = match (range["first_seq"].as_u64(), range["last_seq"].as_u64()) {
-            (Some(first), Some(last)) => last + 1 - first,
-            _ => 0,
-        };
-        observed["call_log"] = serde_json::json!({
-            "head": range["head"], "first_seq": range["first_seq"], "last_seq": range["last_seq"], "count": count,
-        });
+    if let Some(claim) = call_log_claim(&statement["predicate"]["observed"]) {
+        observed["call_log"] = claim;
     }
     let data = serde_json::json!({
         "schema": 1,
@@ -361,18 +368,18 @@ fn report_data(
     Ok((data, revision))
 }
 
-fn revision_dir(state: &AppState, study_id: &str, revision: u64) -> PathBuf {
+pub(crate) fn revision_dir(state: &AppState, study_id: &str, revision: u64) -> PathBuf {
     state.run_log.run_dir(study_id).join("publish").join(format!("r{revision}"))
 }
 
-fn statement_bytes(subject: Vec<serde_json::Value>, predicate_type: &str, predicate: serde_json::Value) -> Result<Vec<u8>, Failure> {
+pub(crate) fn statement_bytes(subject: Vec<serde_json::Value>, predicate_type: &str, predicate: serde_json::Value) -> Result<Vec<u8>, Failure> {
     serde_json::to_vec(&serde_json::json!({
         "_type": STATEMENT_TYPE, "subject": subject, "predicateType": predicate_type, "predicate": predicate,
     }))
     .map_err(internal)
 }
 
-fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure> {
+pub(crate) fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure> {
     std::fs::create_dir_all(path.parent().expect("a file has a parent")).map_err(internal)?;
     let tmp = path.with_extension("partial");
     std::fs::write(&tmp, bytes).map_err(internal)?;
@@ -409,8 +416,8 @@ pub async fn report_data_handler(State(state): State<AppState>, UrlPath(study_id
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiFile {
-    name: String,
-    sha256: String,
+    pub(crate) name: String,
+    pub(crate) sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -418,11 +425,11 @@ pub struct ApiFile {
 pub struct PublishRequest {
     /// Every file embarch-api made for the zip, with its hash.
     #[serde(default)]
-    files: Vec<ApiFile>,
+    pub(crate) files: Vec<ApiFile>,
 }
 
 /// The files of the run Core produced, by zip-relative name.
-fn core_run_files(dir: &std::path::Path) -> Result<Vec<String>, Failure> {
+pub(crate) fn core_run_files(dir: &std::path::Path) -> Result<Vec<String>, Failure> {
     let mut names: Vec<String> = ["events.json", "measurements.json", "study.json", RECORD_FILE]
         .iter()
         .filter(|n| dir.join(n).is_file())
@@ -444,9 +451,12 @@ fn core_run_files(dir: &std::path::Path) -> Result<Vec<String>, Failure> {
 /// record names. `None` for a run sealed with no call-log range (one recorded
 /// before the call log, or whose log could not be read at the time).
 fn call_log_segment(state: &AppState, dir: &std::path::Path) -> Result<Option<Vec<u8>>, Failure> {
-    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(RECORD_FILE)).map_err(internal)?).map_err(internal)?;
-    let payload = base64::engine::general_purpose::STANDARD.decode(env["payload"].as_str().unwrap_or("")).map_err(internal)?;
-    let statement: serde_json::Value = serde_json::from_slice(&payload).map_err(internal)?;
+    call_log_segment_of(state, &statement_of(&dir.join(RECORD_FILE))?)
+}
+
+/// The same, from the Statement of any record that names a range in `observed.call_log`: a
+/// study's or a Test run's (decision 148).
+pub(crate) fn call_log_segment_of(state: &AppState, statement: &serde_json::Value) -> Result<Option<Vec<u8>>, Failure> {
     let range = &statement["predicate"]["observed"]["call_log"];
     if range.is_null() {
         return Ok(None);
@@ -470,8 +480,14 @@ pub async fn publish_handler(
     scope: Scope,
     Json(req): Json<PublishRequest>,
 ) -> Result<Json<serde_json::Value>, Failure> {
+    check_files(&req.files)?;
+    tokio::task::spawn_blocking(move || publish(&state, &study_id, scope, req)).await.map_err(internal)?
+}
+
+/// embarch-api's files as a publish request lists them: each a safe name and a hash, none twice.
+pub(crate) fn check_files(files: &[ApiFile]) -> Result<(), Failure> {
     let mut seen = std::collections::HashSet::new();
-    for f in &req.files {
+    for f in files {
         if !safe_name(&f.name) || !is_sha256_hex(&f.sha256) {
             return Err((StatusCode::BAD_REQUEST, format!("`{}` needs a relative file name and a 64-hex sha256", f.name)));
         }
@@ -479,7 +495,81 @@ pub async fn publish_handler(
             return Err((StatusCode::BAD_REQUEST, format!("`{}` is listed twice", f.name)));
         }
     }
-    tokio::task::spawn_blocking(move || publish(&state, &study_id, scope, req)).await.map_err(internal)?
+    Ok(())
+}
+
+/// A name embarch-api lists must not be one Core produces.
+pub(crate) fn check_api_names(files: &[ApiFile], subjects: &[(String, String)]) -> Result<(), Failure> {
+    for f in files {
+        if subjects.iter().any(|(n, _)| *n == f.name) || f.name == SEGMENT_FILE || f.name == CALL_LOG_SEGMENT_FILE || f.name == MANIFEST_FILE {
+            return Err((StatusCode::BAD_REQUEST, format!("`{}` is a file Core produces; embarch-api lists only its own", f.name)));
+        }
+    }
+    Ok(())
+}
+
+/// What a manifest is signed over, for a study run or a Test run (decision 148).
+pub(crate) struct Manifest<'a> {
+    /// `study_id` or `run_id`: the key the manifest's predicate and the `published` entry name the run by.
+    pub id_key: &'static str,
+    pub id: &'a str,
+    pub revision: u64,
+    pub rdir: &'a std::path::Path,
+    /// Every file Core produced for the zip, by zip-relative name and hash.
+    pub subjects: &'a [(String, String)],
+    pub call_segment: Option<&'a [u8]>,
+    pub files: &'a [ApiFile],
+    pub scope: Scope,
+    pub record_sha256: &'a serde_json::Value,
+    pub report_data_sha256: &'a str,
+}
+
+/// Writes the run log's segment and the call log's, signs the manifest and answers the
+/// `published` entry to append. Called inside `RunLog::append_with`'s lock with the lines and head
+/// it hands over, so the head named is the entry's own `prev` (decision 118).
+pub(crate) fn sign_manifest(
+    state: &AppState,
+    m: &Manifest,
+    lines: &[serde_json::Value],
+    head: Option<&str>,
+    supersedes: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Failure> {
+    let mut segment = Vec::new();
+    for l in lines {
+        segment.extend(serde_json::to_vec(l).map_err(internal)?);
+        segment.push(b'\n');
+    }
+    write_file(&m.rdir.join(SEGMENT_FILE), &segment)?;
+    let mut all = m.subjects.to_vec();
+    all.push((SEGMENT_FILE.to_string(), sha256_hex(&segment)));
+    if let Some(c) = m.call_segment {
+        write_file(&m.rdir.join(CALL_LOG_SEGMENT_FILE), c)?;
+        all.push((CALL_LOG_SEGMENT_FILE.to_string(), sha256_hex(c)));
+    }
+    all.sort();
+    let subject: Vec<serde_json::Value> = all.iter().map(|(n, h)| serde_json::json!({ "name": n, "digest": { "sha256": h } })).collect();
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut listed: Vec<serde_json::Value> = m.files.iter().map(|f| serde_json::json!({ "name": f.name, "sha256": f.sha256 })).collect();
+    listed.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let mut predicate = serde_json::json!({
+        "schema": 1, "revision": m.revision, "supersedes": supersedes,
+        "published_by": m.scope.as_str(), "published_utc_ms": at,
+        "core": { "version": env!("CARGO_PKG_VERSION") },
+        "run_log": { "head": head, "length": lines.len() },
+        "record_sha256": m.record_sha256, "report_data_sha256": m.report_data_sha256,
+        "embarch_api_files": listed,
+    });
+    predicate[m.id_key] = m.id.into();
+    let statement = statement_bytes(subject, MANIFEST_PREDICATE_TYPE, predicate)?;
+    let envelope = state.sealer.sign_statement(&statement).map_err(internal)?;
+    write_file(&m.rdir.join(MANIFEST_FILE), &envelope)?;
+    let mut entry = serde_json::json!({
+        "type": "published", "manifest_sha256": sha256_hex(&envelope),
+        "scope": m.scope.as_str(), "at_utc_ms": at, "revision": m.revision, "log_head": head,
+        "report_data_sha256": m.report_data_sha256,
+    });
+    entry[m.id_key] = m.id.into();
+    Ok(entry)
 }
 
 fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) -> Result<Json<serde_json::Value>, Failure> {
@@ -506,11 +596,7 @@ fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) 
     for name in [REPORT_DATA_FILE, REPORT_DATA_ENVELOPE_FILE] {
         subjects.push((name.to_string(), sha256_of_file(&rdir.join(name)).map_err(internal)?));
     }
-    for f in &req.files {
-        if subjects.iter().any(|(n, _)| *n == f.name) || f.name == SEGMENT_FILE || f.name == CALL_LOG_SEGMENT_FILE || f.name == MANIFEST_FILE {
-            return Err((StatusCode::BAD_REQUEST, format!("`{}` is a file Core produces; embarch-api lists only its own", f.name)));
-        }
-    }
+    check_api_names(&req.files, &subjects)?;
     let call_segment = call_log_segment(state, &dir)?;
     let report_data_sha256 = sha256_hex(&bytes);
     let record_sha256 = data["record_sha256"].clone();
@@ -521,48 +607,15 @@ fn publish(state: &AppState, study_id: &str, scope: Scope, req: PublishRequest) 
         if revision_of(lines, study_id) != revision {
             return Err((StatusCode::CONFLICT, format!("revision {revision} was published meanwhile; ask for report-data again")));
         }
-        let mut segment = Vec::new();
-        for l in lines {
-            segment.extend(serde_json::to_vec(l).map_err(internal)?);
-            segment.push(b'\n');
-        }
-        write_file(&rdir.join(SEGMENT_FILE), &segment)?;
-        let mut all = subjects.clone();
-        all.push((SEGMENT_FILE.to_string(), sha256_hex(&segment)));
-        if let Some(c) = &call_segment {
-            write_file(&rdir.join(CALL_LOG_SEGMENT_FILE), c)?;
-            all.push((CALL_LOG_SEGMENT_FILE.to_string(), sha256_hex(c)));
-        }
-        all.sort();
-        let subject: Vec<serde_json::Value> =
-            all.iter().map(|(n, h)| serde_json::json!({ "name": n, "digest": { "sha256": h } })).collect();
         let supersedes = lines
             .iter()
             .rfind(|l| l["entry"]["type"] == "published" && l["entry"]["study_id"] == study_id)
             .map(|l| serde_json::json!({ "revision": revision - 1, "manifest_sha256": l["entry"]["manifest_sha256"] }));
-        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        let mut listed: Vec<serde_json::Value> =
-            req.files.iter().map(|f| serde_json::json!({ "name": f.name, "sha256": f.sha256 })).collect();
-        listed.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let statement = statement_bytes(
-            subject,
-            MANIFEST_PREDICATE_TYPE,
-            serde_json::json!({
-                "schema": 1, "study_id": study_id, "revision": revision, "supersedes": supersedes,
-                "published_by": scope.as_str(), "published_utc_ms": at,
-                "core": { "version": env!("CARGO_PKG_VERSION") },
-                "run_log": { "head": head, "length": lines.len() },
-                "record_sha256": record_sha256, "report_data_sha256": report_data_sha256,
-                "embarch_api_files": listed,
-            }),
-        )?;
-        let envelope = state.sealer.sign_statement(&statement).map_err(internal)?;
-        write_file(&rdir.join(MANIFEST_FILE), &envelope)?;
-        Ok(serde_json::json!({
-            "type": "published", "study_id": study_id, "manifest_sha256": sha256_hex(&envelope),
-            "scope": scope.as_str(), "at_utc_ms": at, "revision": revision, "log_head": head,
-            "report_data_sha256": report_data_sha256,
-        }))
+        let m = Manifest {
+            id_key: "study_id", id: study_id, revision, rdir: &rdir, subjects: &subjects, call_segment: call_segment.as_deref(),
+            files: &req.files, scope, record_sha256: &record_sha256, report_data_sha256: &report_data_sha256,
+        };
+        sign_manifest(state, &m, lines, head, supersedes)
     })?;
     Ok(Json(serde_json::json!({ "revision": revision, "entry": entry, "keyid": state.sealer.key().keyid() })))
 }

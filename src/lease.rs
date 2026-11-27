@@ -707,6 +707,8 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("POST", "/study/{study_id}/adopt"),
     ("POST", "/study/{study_id}/report-data"),
     ("POST", "/study/{study_id}/publish"),
+    ("POST", "/test-runs/{run_id}/report-data"),
+    ("POST", "/test-runs/{run_id}/publish"),
     ("PUT", "/study/{study_id}/restore/{*name}"),
     ("GET", "/study/{study_id}/publish/{revision}/files/{*name}"),
     ("GET", "/study/{study_id}/line-counts"),

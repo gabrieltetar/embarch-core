@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 
-use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, manual, publish, run_log, serial, study, test_runs};
+use crate::{bootload, call_log, chip_resolve, confirmations, hardware, host_study, lease, logs, manual, publish, run_log, serial, study, test_publish, test_runs};
 
 /// Shared state for every handler. `hw_lock` serializes access to the
 /// physical probe/serial connections so a CLI call and a Claude Code call
@@ -248,6 +248,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/test-runs/{run_id}/card", get(test_runs::card_handler))
         .route("/test-runs/{run_id}/go", post(test_runs::go_handler))
         .route("/test-runs/{run_id}/cancel", post(test_runs::cancel_handler))
+        .route("/test-runs/{run_id}/report-data", post(test_publish::test_report_data_handler))
+        .route("/test-runs/{run_id}/publish", post(test_publish::test_publish_handler))
         .route("/manual-verdicts", post(manual::manual_verdict_handler))
         .route("/units/{unit_key}", put(manual::put_unit_handler))
         .route("/units/{unit_key}", get(manual::get_unit_handler))
@@ -3282,6 +3284,8 @@ mod tests {
         ("GET", "/test-runs/{run_id}/card", "/test-runs/abc/card"),
         ("POST", "/test-runs/{run_id}/go", "/test-runs/abc/go"),
         ("POST", "/test-runs/{run_id}/cancel", "/test-runs/abc/cancel"),
+        ("POST", "/test-runs/{run_id}/report-data", "/test-runs/abc/report-data"),
+        ("POST", "/test-runs/{run_id}/publish", "/test-runs/abc/publish"),
         ("POST", "/manual-verdicts", "/manual-verdicts"),
         ("PUT", "/units/{unit_key}", "/units/DUT-1"),
         ("GET", "/units/{unit_key}", "/units/DUT-1"),
@@ -3345,7 +3349,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 69;
+    const DOCUMENTED_ROUTE_COUNT: usize = 71;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -3590,6 +3594,7 @@ mod tests {
         ) {
             _ if handler_name.starts_with("manual::") => (include_str!("manual.rs"), &handler_name["manual::".len()..]),
             _ if handler_name.starts_with("confirmations::") => (include_str!("confirmations.rs"), &handler_name["confirmations::".len()..]),
+            _ if handler_name.starts_with("test_publish::") => (include_str!("test_publish.rs"), &handler_name["test_publish::".len()..]),
             _ if handler_name.starts_with("test_runs::") => (include_str!("test_runs.rs"), &handler_name["test_runs::".len()..]),
             (Some(stripped), _, _, _) => (include_str!("study.rs"), stripped),
             (_, Some(stripped), _, _) => (include_str!("host_study.rs"), stripped),
@@ -4233,6 +4238,8 @@ mod tests {
         ("GET", "/test-runs/{run_id}"),
         ("GET", "/test-runs/{run_id}/card"),
         ("POST", "/test-runs/{run_id}/cancel"),
+        ("POST", "/test-runs/{run_id}/report-data"),
+        ("POST", "/test-runs/{run_id}/publish"),
         ("POST", "/manual-verdicts"),
         ("GET", "/units/{unit_key}"),
         ("GET", "/person"),

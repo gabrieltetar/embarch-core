@@ -36,6 +36,7 @@ mod readback;
 mod smoke_check;
 mod stream_store;
 mod test_executor;
+mod test_publish;
 mod test_run_record;
 mod test_runs;
 mod study;
