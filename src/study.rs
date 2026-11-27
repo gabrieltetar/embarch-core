@@ -394,7 +394,7 @@ pub enum StudyEvent {
     },
     /// A host study's `Prompt` step is waiting for a person (decision 105). Also readable as
     /// `pending_prompt` on `GET /study/{id}`, because this stream keeps no replay. A Test run's
-    /// prompt kind rides as `prompt_kind` here, since `kind` is this event's own tag (decision 143).
+    /// prompt kind rides as `prompt_kind` here, since `kind` is this event's own tag (decision 151).
     PromptPending {
         study_id: String,
         #[serde(flatten, serialize_with = "flatten_pending_prompt")]
