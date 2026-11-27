@@ -1468,6 +1468,8 @@ mod tests {
         let p = &st["predicate"];
         assert_eq!((p["status"].as_str(), p["unit_key"].as_str(), p["resumes"].as_str()), (Some("cancelled"), Some("DUT-1"), Some("earlier")));
         assert_eq!(p["selection"]["entries"][0]["test_id"], "a1");
+        assert_eq!(p["observed"]["mode"], crate::token_store::mode());
+        assert_eq!(p["observed"]["mode"], "development");
         let t = |i: usize| (p["tests"][i]["test_id"].as_str().unwrap(), p["tests"][i]["verdict"].as_str(), p["tests"][i]["reason"].as_str());
         assert_eq!([t(0), t(1), t(2), t(3)], [("a1", Some("pass"), None), ("b1", Some("cancelled"), None), ("b2", Some("cancelled"), None), ("loose", None, Some("not_run"))]);
         assert!(p["tests"][1]["note"].as_str().unwrap().contains("cancelled"));
