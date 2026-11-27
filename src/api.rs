@@ -237,6 +237,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/study/{study_id}/prompt", post(host_study::answer_prompt_handler))
         .route("/study/{study_id}/line-counts", get(host_study::line_counts_handler).post(host_study::line_counts_rerender_handler))
         .route("/call-log", get(call_log::call_log_handler))
+        .route("/call-log/quota", put(call_log::put_quota_handler))
         .route("/definitions", post(confirmations::post_definition_handler))
         .route("/definitions/{hash}", get(confirmations::get_definition_handler))
         .route("/suites", get(confirmations::suites_handler))
@@ -334,6 +335,10 @@ async fn person_middleware(
         // So are a unit's serial and the person's name (decision 147).
         if crate::token_store::is_declaration_route(req.method().as_str(), path) {
             return (StatusCode::FORBIDDEN, crate::token_store::DECLARATION_REFUSAL).into_response();
+        }
+        // So is the call log's quota (decision 161).
+        if crate::token_store::is_quota_route(req.method().as_str(), path) {
+            return (StatusCode::FORBIDDEN, crate::token_store::QUOTA_REFUSAL).into_response();
         }
         // The go is the person's on every Core too (decision 135).
         if crate::token_store::is_go_route(req.method().as_str(), path) {
@@ -3301,6 +3306,7 @@ mod tests {
         ("GET", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("POST", "/study/{study_id}/line-counts", "/study/abc/line-counts"),
         ("GET", "/call-log", "/call-log"),
+        ("PUT", "/call-log/quota", "/call-log/quota"),
         ("POST", "/definitions", "/definitions"),
         ("GET", "/definitions/{hash}", "/definitions/abc"),
         ("GET", "/suites", "/suites"),
@@ -3379,7 +3385,7 @@ mod tests {
     /// checked against the same source scan `AUTH_CASES` already relies on,
     /// catches the same drift `tasks/core/018` found without that cross-repo
     /// dependency.
-    const DOCUMENTED_ROUTE_COUNT: usize = 73;
+    const DOCUMENTED_ROUTE_COUNT: usize = 74;
 
     #[test]
     fn registered_route_count_matches_the_count_documented_in_interfaces_md() {
@@ -4298,9 +4304,9 @@ mod tests {
     /// `AUTH_CASES` row is in exactly one of `PERSON_ROUTES` / `AGENT_ROUTES`.
     #[test]
     fn every_route_is_either_the_persons_or_the_agents() {
-        use crate::token_store::{CONFIRMATION_ROUTES, DECLARATION_ROUTES, GO_ROUTES, PERSON_ROUTES};
+        use crate::token_store::{CONFIRMATION_ROUTES, DECLARATION_ROUTES, GO_ROUTES, PERSON_ROUTES, QUOTA_ROUTES};
         for (method, path, _) in AUTH_CASES {
-            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).any(|(m, p)| m == method && p == path);
+            let person = PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).chain(QUOTA_ROUTES).any(|(m, p)| m == method && p == path);
             let agent = AGENT_ROUTES.iter().any(|(m, p)| m == method && p == path);
             assert!(
                 person ^ agent,
@@ -4309,7 +4315,7 @@ mod tests {
                  Core takes it only from the person (decision 132)"
             );
         }
-        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).chain(AGENT_ROUTES) {
+        for (method, path) in PERSON_ROUTES.iter().chain(CONFIRMATION_ROUTES).chain(GO_ROUTES).chain(DECLARATION_ROUTES).chain(QUOTA_ROUTES).chain(AGENT_ROUTES) {
             assert!(
                 AUTH_CASES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is in a scope list but is not a registered route"

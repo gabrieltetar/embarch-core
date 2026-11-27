@@ -198,6 +198,18 @@ pub fn is_declaration_route(method: &str, path: &str) -> bool {
     DECLARATION_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
 }
 
+/// The call log's quota, which only the person sets, on every Core (decision 161): an agent that
+/// could raise it would raise it to keep filling the store.
+pub const QUOTA_ROUTES: &[(&str, &str)] = &[("PUT", "/call-log/quota")];
+
+/// The `403` body of a [`QUOTA_ROUTES`] refusal.
+pub const QUOTA_REFUSAL: &str = "the call log's quota is the person's to set, on every Core: raise it with the CLI under the person's token (EMBARCH_PERSON_TOKEN) or free the store; the agent's token may read the size and the quota in GET /call-log, never set it";
+
+/// Whether `method` on the registered path pattern `path` is in [`QUOTA_ROUTES`].
+pub fn is_quota_route(method: &str, path: &str) -> bool {
+    QUOTA_ROUTES.iter().any(|(m, p)| *m == method && *p == path)
+}
+
 /// The `403` body of a [`GO_ROUTES`] refusal.
 pub const GO_REFUSAL: &str = "the go is the person's act on every Core: start the run from embarch-ui, or with the CLI under the person's token (EMBARCH_PERSON_TOKEN); the agent's token may prepare a run and read its card, never go";
 

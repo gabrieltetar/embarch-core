@@ -22,6 +22,10 @@
 //! *cannot-log* state from an append that fails, or from free space below the reserved tail
 //! ([`CallLog::gate`]); the next append that succeeds with room left clears it. In it every gated
 //! route but a cancel answers `503`, and a study in flight starts no new step.
+//!
+//! **A quota (decision 161).** The file has a size limit, kept beside it in [`QUOTA_FILE`]: past
+//! 90 % of it the agent's gated calls answer `503`, past 100 % the person's too, and none of those
+//! refusals is entered. The reserved tail lies beyond the quota.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -35,6 +39,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::api::AppState;
@@ -74,6 +79,12 @@ pub const LAST_IMAGES_UNKNOWN: &str = "unknown";
 /// The bytes one reserved-tail entry is budgeted (decision 158). Assumed, not measured: a `safe_off`
 /// entry holds one declaration's line, reply and error, well under it.
 pub const ENTRY_RESERVE_BYTES: u64 = 8192;
+/// The quota's file name beside the log: `{"quota_bytes": n}`.
+pub const QUOTA_FILE: &str = "call-log-quota.json";
+/// The quota a log has until the person sets one. Chosen by the owner, not measured.
+pub const DEFAULT_QUOTA_BYTES: u64 = 1 << 30;
+/// The share of the quota at which the agent's gated calls are refused (decision 161). Chosen, not measured.
+pub const AGENT_REFUSED_PERCENT: u128 = 90;
 /// The one gated route that is served in the cannot-log state: a cancel always runs.
 const CANCEL_ROUTE: (&str, &str) = ("POST", "/study/{study_id}/cancel");
 
@@ -138,6 +149,8 @@ pub enum Gate {
     Open,
     /// Core cannot log: `probe` is whether the refusal's own entry is tried, to find out if writes work again.
     Refused { reason: String, probe: bool },
+    /// The log is at its quota for this scope (decision 161); the refusal is not entered.
+    OverQuota { reason: String },
 }
 
 /// What the graceful stop did before the safe-off, for the `stop` entry.
@@ -285,6 +298,8 @@ pub struct CallLog {
     store: Arc<dyn Store>,
     /// How big the reserved tail is, from the declarations; unset, it is a `start` and a `stop` entry.
     reserve_of: Arc<StdMutex<Option<ReserveFn>>>,
+    /// The quota in bytes, read from [`QUOTA_FILE`] at the start and rewritten by [`CallLog::set_quota`].
+    quota: Arc<AtomicU64>,
 }
 
 type ReserveFn = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -295,10 +310,61 @@ impl CallLog {
         Self::with_store(data_dir, Arc::new(FileStore))
     }
 
+    /// The quota kept in `dir`, or the default when there is none or it cannot be read.
+    fn kept_quota(dir: &Path) -> u64 {
+        let read = || -> Option<u64> { serde_json::from_slice::<serde_json::Value>(&std::fs::read(dir.join(QUOTA_FILE)).ok()?).ok()?["quota_bytes"].as_u64() };
+        read().filter(|q| *q > 0).unwrap_or(DEFAULT_QUOTA_BYTES)
+    }
+
     /// A call log in `data_dir` written through `store`.
     pub fn with_store(data_dir: PathBuf, store: Arc<dyn Store>) -> Self {
+        let quota = Self::kept_quota(&data_dir);
         let inner = Inner { chain: None, fold: None, cannot: None, reserve: 2 * ENTRY_RESERVE_BYTES };
-        Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(inner)), store, reserve_of: Arc::new(StdMutex::new(None)) }
+        Self { path: data_dir.join(CALL_LOG_FILE), inner: Arc::new(StdMutex::new(inner)), store, reserve_of: Arc::new(StdMutex::new(None)), quota: Arc::new(AtomicU64::new(quota)) }
+    }
+
+    fn quota_path(&self) -> PathBuf {
+        self.path.with_file_name(QUOTA_FILE)
+    }
+
+    /// The quota in bytes (decision 161).
+    pub fn quota_bytes(&self) -> u64 {
+        self.quota.load(Ordering::SeqCst)
+    }
+
+    /// The log file's size in bytes; 0 before the first entry.
+    pub fn size_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Whether the log is at its quota for `scope`: 90 % for the agent, 100 % for the person.
+    fn over_quota(&self, scope: Scope) -> Option<String> {
+        let (size, quota) = (self.size_bytes(), self.quota_bytes());
+        let percent = if scope == Scope::Agent { AGENT_REFUSED_PERCENT } else { 100 };
+        (u128::from(size) * 100 >= u128::from(quota) * percent).then(|| {
+            format!(
+                "Core's call log holds {size} of its {quota} B quota, so it refuses {} hardware calls; the person raises the quota with PUT /call-log/quota under the person's token (EMBARCH_PERSON_TOKEN), or frees the store; a study's cancel and Core's own safe-off still run",
+                if scope == Scope::Agent { "the agent's (at 90 %; the person's at 100 %)" } else { "every" },
+            )
+        })
+    }
+
+    /// Enters the quota change and then applies and keeps it (decision 161); returns the old quota.
+    /// The entry does not ask the gate, so the person can raise a full log's quota; it is the log's
+    /// only way out other than freeing the store.
+    pub fn set_quota(&self, scope: Scope, new: u64) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let old = self.quota_bytes();
+        self.flush_locked(&mut inner)?;
+        let body = serde_json::json!({
+            "type": "quota", "at_utc_ms": now_ms(), "scope": scope.as_str(), "from_bytes": old, "to_bytes": new,
+        });
+        self.append(&mut inner, body)?;
+        let tmp = self.path.with_file_name(format!("{QUOTA_FILE}.tmp"));
+        std::fs::write(&tmp, serde_json::json!({ "quota_bytes": new }).to_string()).context("could not write the quota")?;
+        std::fs::rename(&tmp, self.quota_path()).context("could not keep the quota")?;
+        self.quota.store(new, Ordering::SeqCst);
+        Ok(old)
     }
 
     /// Says how big the reserved tail is: room for one entry per declared output's safe-off plus a
@@ -321,6 +387,11 @@ impl CallLog {
     /// or free space is below the reserved tail; the space check is made afresh each time, so it
     /// clears when room returns.
     pub fn gate(&self) -> Gate {
+        self.gate_for(Scope::Person)
+    }
+
+    /// [`CallLog::gate`] for a call carrying `scope`'s token, which also asks the quota (decision 161).
+    pub fn gate_for(&self, scope: Scope) -> Gate {
         let tail = self.reserve_now();
         let mut inner = self.inner.lock().unwrap();
         inner.reserve = tail;
@@ -329,7 +400,7 @@ impl CallLog {
         }
         inner.cannot = self.low_space(tail);
         match &inner.cannot {
-            None => Gate::Open,
+            None => self.over_quota(scope).map_or(Gate::Open, |reason| Gate::OverQuota { reason }),
             Some(c) => Gate::Refused { reason: c.reason.clone(), probe: false },
         }
     }
@@ -338,7 +409,7 @@ impl CallLog {
     pub fn cannot_log(&self) -> Option<String> {
         match self.gate() {
             Gate::Open => None,
-            Gate::Refused { reason, .. } => Some(reason),
+            Gate::Refused { reason, .. } | Gate::OverQuota { reason } => Some(reason),
         }
     }
 
@@ -578,6 +649,11 @@ fn cannot_log_response(reason: &str) -> Response {
         .into_response()
 }
 
+/// The `503` of a call refused for the quota (decision 161); `reason` already names what to do.
+fn over_quota_response(reason: &str) -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, reason.to_string()).into_response()
+}
+
 fn too_large() -> Response {
     (StatusCode::PAYLOAD_TOO_LARGE, "request body too large for Core to log").into_response()
 }
@@ -596,7 +672,8 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
         Ok(p) => p.iter().map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string()))).collect(),
         Err(_) => Default::default(),
     };
-    let scope = parts.extensions.get::<Scope>().map(|s| s.as_str()).unwrap_or("unknown");
+    let scope_of = parts.extensions.get::<Scope>().copied();
+    let scope = scope_of.map(|s| s.as_str()).unwrap_or("unknown");
     let lease = state.lease.view().map(|l| serde_json::json!({ "holder": l.holder, "purpose": l.purpose }));
 
     let Ok(request_bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
@@ -608,12 +685,13 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
     let body_sha256 = sha256_hex(&request_bytes);
 
     // Fail closed (decision 158): a cancel always runs; every other gated call is refused while Core cannot log.
-    let refused = if (method.as_str(), route.as_str()) == CANCEL_ROUTE { Gate::Open } else { state.call_log.gate() };
+    let refused = if (method.as_str(), route.as_str()) == CANCEL_ROUTE { Gate::Open } else { state.call_log.gate_for(scope_of.unwrap_or(Scope::Agent)) };
     let note = BoardNote::default();
     let req = Request::from_parts(parts, Body::from(request_bytes));
     let response = match &refused {
         Gate::Open => NOTE.scope(note.clone(), next.run(req)).await,
         Gate::Refused { reason, .. } => cannot_log_response(reason),
+        Gate::OverQuota { reason } => over_quota_response(reason),
     };
 
     let (mut rparts, rbody) = response.into_parts();
@@ -647,8 +725,8 @@ pub async fn call_log_middleware(State(state): State<AppState>, req: Request, ne
         "body_sha256": body_sha256, "body": body_json, "scope": scope, "lease": lease,
         "status": status, "answer_sha256": answer_sha256, "board": board,
     });
-    // A refusal for want of space is not entered: the reserved tail is for the safe-off.
-    if matches!(refused, Gate::Refused { probe: false, .. }) {
+    // A refusal for want of space or for the quota is not entered: the reserved tail is for the safe-off.
+    if matches!(refused, Gate::Refused { probe: false, .. } | Gate::OverQuota { .. }) {
         return Response::from_parts(rparts, Body::from(answer));
     }
     let recorded = state.call_log.record(entry, key);
@@ -694,6 +772,33 @@ pub struct CallLogResponse {
     entries: Vec<serde_json::Value>,
     /// Repeats counted in memory and not yet chained: `{first_seq, repeats}`.
     pending_fold: Option<serde_json::Value>,
+    /// The log file's size and its quota, in bytes (decision 161).
+    size_bytes: u64,
+    quota_bytes: u64,
+}
+
+#[derive(Deserialize)]
+pub struct QuotaRequest {
+    quota_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct QuotaResponse {
+    quota_bytes: u64,
+    previous_bytes: u64,
+    size_bytes: u64,
+}
+
+/// Sets the call log's quota, in bytes, at least 1; the person's token only (the middleware
+/// answers the agent's `403`). The change is entered in the log (decision 161). Touches no hardware.
+// route: PUT /call-log/quota
+pub async fn put_quota_handler(State(state): State<AppState>, scope: Scope, Json(req): Json<QuotaRequest>) -> Result<Json<QuotaResponse>, (StatusCode, String)> {
+    if req.quota_bytes == 0 {
+        return Err((StatusCode::BAD_REQUEST, "quota_bytes must be at least 1".into()));
+    }
+    let log = state.call_log.clone();
+    let previous_bytes = log.set_quota(scope, req.quota_bytes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(QuotaResponse { quota_bytes: req.quota_bytes, previous_bytes, size_bytes: log.size_bytes() }))
 }
 
 /// A range of entries, `from` inclusive to `to` exclusive (the whole log by
@@ -723,7 +828,7 @@ pub async fn call_log_handler(
     let to = q.to.unwrap_or(length).clamp(from, length);
     let truncated = to - from > MAX_RANGE;
     let to = if truncated { from + MAX_RANGE } else { to };
-    Ok(Json(CallLogResponse { verified, error, length, head, from, to, truncated, entries: lines[from..to].to_vec(), pending_fold }))
+    Ok(Json(CallLogResponse { verified, error, length, head, from, to, truncated, entries: lines[from..to].to_vec(), pending_fold, size_bytes: log.size_bytes(), quota_bytes: log.quota_bytes() }))
 }
 
 #[cfg(test)]
@@ -1142,6 +1247,104 @@ mod tests {
         assert_eq!(st, StatusCode::CONFLICT);
         assert!(h.contains_key(SEQ_HEADER));
         assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    const PERSON: &str = "person-test-token";
+
+    /// `s` with a call log reopened over the same folder with `quota` kept, as a restarted Core would read it.
+    fn with_quota(s: &AppState, quota: u64) -> AppState {
+        let dir = s.call_log.path_dir();
+        std::fs::write(dir.join(QUOTA_FILE), serde_json::json!({ "quota_bytes": quota }).to_string()).unwrap();
+        AppState { call_log: CallLog::at(dir), ..s.clone() }
+    }
+
+    #[tokio::test]
+    async fn at_90_percent_the_agents_calls_are_refused_and_the_persons_served_and_at_100_both_are_refused() {
+        let s = state();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        let size = s.call_log.size_bytes();
+        assert!(size > 0);
+        // 90 % of this quota is at most the size, and the size is under the quota.
+        let s = with_quota(&s, size * 10 / 9);
+        let router = build_router(s.clone());
+        let (st, _, text) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(text.contains("quota") && text.contains("PUT /call-log/quota"), "{text}");
+        assert_eq!(s.call_log.size_bytes(), size, "a refusal for the quota is not entered");
+        let (st, h, _) = call(&router, PERSON, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT, "the person is still served");
+        assert!(h.contains_key(SEQ_HEADER));
+        let (st, _, _) = call(&router, TOKEN, "POST", CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a cancel is served at 90 % too");
+        // The entries those two calls made took the log to its quota.
+        assert!(s.call_log.size_bytes() >= s.call_log.quota_bytes());
+        let at_quota = s.call_log.size_bytes();
+        for bearer in [TOKEN, PERSON] {
+            let (st, _, _) = call(&router, bearer, "POST", NOT_CANCEL, None, Some("{}")).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{bearer}");
+        }
+        assert_eq!(s.call_log.size_bytes(), at_quota);
+        let (st, _, _) = call(&router, PERSON, "POST", CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a cancel is served");
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_safe_off_and_the_start_and_stop_land_past_the_quota() {
+        let s = state();
+        call(&build_router(s.clone()), TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        let s = with_quota(&s, 1);
+        assert!(matches!(s.call_log.gate_for(Scope::Person), Gate::OverQuota { .. }));
+        let result = crate::safe_off::SafeOffResult { kind: "signal", name: "load".into(), line: Some("off".into()), result: crate::safe_off::SENT, reply: None, error: None };
+        assert_eq!(s.call_log.record_safe_off("test", &[result.clone(), result.clone()]).unwrap(), 2);
+        s.call_log.record_start("development", std::slice::from_ref(&result)).unwrap();
+        s.call_log.record_stop("development", &StopNote::default(), &[result]).unwrap();
+        let types: Vec<_> = entries(&s).iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
+        assert_eq!(types, ["call", "safe_off", "safe_off", "start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn the_quota_is_the_persons_to_set_and_a_change_is_entered_kept_and_reported() {
+        let s = state();
+        let router = build_router(s.clone());
+        let (st, _, text) = call(&router, TOKEN, "PUT", "/call-log/quota", None, Some(r#"{"quota_bytes":5000}"#)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(s.call_log.quota_bytes(), DEFAULT_QUOTA_BYTES);
+        assert!(entries(&s).is_empty());
+        let (st, _, _) = call(&router, PERSON, "PUT", "/call-log/quota", None, Some(r#"{"quota_bytes":0}"#)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _, text) = call(&router, PERSON, "PUT", "/call-log/quota", None, Some(r#"{"quota_bytes":5000}"#)).await;
+        assert_eq!(st, StatusCode::OK, "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((v["quota_bytes"].as_u64(), v["previous_bytes"].as_u64()), (Some(5000), Some(DEFAULT_QUOTA_BYTES)));
+        let e = entries(&s);
+        assert_eq!(e.len(), 1);
+        assert_eq!((e[0]["type"].as_str(), e[0]["scope"].as_str(), e[0]["to_bytes"].as_u64()), (Some("quota"), Some("person"), Some(5000)));
+        assert_eq!(CallLog::at(s.call_log.path_dir()).quota_bytes(), 5000, "kept across a restart");
+        let (st, _, text) = call(&router, TOKEN, "GET", "/call-log", None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((v["quota_bytes"].as_u64(), v["size_bytes"].as_u64()), (Some(5000), Some(s.call_log.size_bytes())));
+        assert!(s.call_log.verify().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_person_raises_a_full_logs_quota_and_the_agent_is_served_again() {
+        let s = state();
+        let router = build_router(s.clone());
+        lease_held_elsewhere(&router).await;
+        call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        let s = with_quota(&s, 1);
+        let router = build_router(s.clone());
+        let (st, _, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        let (st, _, _) = call(&router, PERSON, "PUT", "/call-log/quota", None, Some(r#"{"quota_bytes":1000000}"#)).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, h, _) = call(&router, TOKEN, "POST", NOT_CANCEL, None, Some("{}")).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(h.contains_key(SEQ_HEADER));
     }
 
     #[test]

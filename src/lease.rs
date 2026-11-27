@@ -685,6 +685,8 @@ pub const LEASE_OPEN: &[(&str, &str)] = &[
     ("GET", "/run-log"),
     // Reads Core's own call log, never a port (decision 122).
     ("GET", "/call-log"),
+    // Sets the call log's quota, which must be reachable when the log is full; it enters itself (decision 161).
+    ("PUT", "/call-log/quota"),
     // Definitions, premade suites and confirmations are files and the run log (decision 133).
     ("POST", "/definitions"),
     ("GET", "/definitions/{hash}"),
