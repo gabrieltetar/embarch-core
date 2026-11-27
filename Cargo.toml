@@ -9,12 +9,12 @@ license = "MIT"
 [workspace]
 members = [".", "crates/embarch-core-wire"]
 # Plain `cargo build/test/clippy` reach the wire crate too; `cargo build --release`
-# still builds this package's binary at `target/release/embarch-core` (decision 194's task).
+# still builds this package's binary at `target/release/embarch-core` (decision 164).
 default-members = [".", "crates/embarch-core-wire"]
 
 [dependencies]
 # What Core serves that a client also reads: `StudyEvent`, `HelloAckInfo`, the outpost load
-# answer and `LEASE_GATED` (wire decision 1). A workspace member, built beside this package.
+# answer and `LEASE_GATED` (decision 164). A workspace member, built beside this package.
 embarch-core-wire = { path = "crates/embarch-core-wire" }
 anyhow = "1.0.103"
 axum = { version = "0.8.9", features = ["multipart"] }
